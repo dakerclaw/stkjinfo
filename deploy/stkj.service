@@ -10,7 +10,7 @@ Environment=NODE_ENV=production
 Environment=HOST=0.0.0.0
 Environment=PORT=5173
 Environment=LANG=zh_CN.UTF-8
-ExecStart=%h/apps/node-v22.22.2-linux-x64/bin/node --no-warnings server.js
+ExecStart=%h/apps/node/bin/node --no-warnings server.js
 Restart=always
 RestartSec=3
 StandardOutput=append:%h/apps/stkj/logs/app.log

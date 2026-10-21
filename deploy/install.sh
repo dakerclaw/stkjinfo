@@ -158,17 +158,17 @@ fi
 echo
 echo "==> [5/6] 安装 systemd 用户服务"
 mkdir -p "$UNIT_DIR"
-sed -e "s|%h/apps/stkj|$APP_DIR|g" \
-    -e "s|%h/apps/node-v22.22.2-linux-x64|$NODE_DIR|g" \
+sed -e "s|%h/apps/stkj/logs|$LOG_DIR|g" \
+    -e "s|%h/apps/stkj|$APP_DIR|g" \
+    -e "s|%h/apps/node|$NODE_DIR|g" \
     -e "s|Environment=PORT=5173|Environment=PORT=$PORT|" \
     -e "s|Environment=HOST=0.0.0.0|Environment=HOST=$HOST|" \
-    -e "s|%h/apps/stkj/logs|$LOG_DIR|g" \
     deploy/stkj.service > "$UNIT_DIR/stkj.service"
 
 if [ "$INSTALL_BACKUP" = "1" ]; then
-  sed -e "s|%h/apps/stkj|$APP_DIR|g" \
-      -e "s|%h/apps/node-v22.22.2-linux-x64|$NODE_DIR|g" \
-      -e "s|%h/apps/stkj/logs|$LOG_DIR|g" \
+  sed -e "s|%h/apps/stkj/logs|$LOG_DIR|g" \
+      -e "s|%h/apps/stkj|$APP_DIR|g" \
+      -e "s|%h/apps/node|$NODE_DIR|g" \
       deploy/stkj-backup.service > "$UNIT_DIR/stkj-backup.service"
   cp deploy/stkj-backup.timer "$UNIT_DIR/stkj-backup.timer"
 else
@@ -204,7 +204,7 @@ if [ "$LINGER" != "yes" ]; then
   else
     echo
     echo "  ! 未开启 linger：重启后需该用户登录才会拉起服务"
-    echo "    如需开机自启个执行：sudo loginctl enable-linger $(id -un)"
+    echo "    如需开机自启，可执行：sudo loginctl enable-linger $(id -un)"
   fi
 fi
 

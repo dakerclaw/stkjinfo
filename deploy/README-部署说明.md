@@ -1,142 +1,240 @@
-# mac mini 部署说明
+# 部署说明
 
-服务器：`192.168.1.139`（Debian 13 trixie / x86_64 / 15G 内存 / 220G 磁盘）
-主机名：`macmini`　账号：`mac`
+本文档说明本系统在 **Debian / Ubuntu 服务器**上的通用部署方式。所有示例用占位符，请按实际环境替换：
 
----
+| 占位符 | 含义 | 示例 |
+|---|---|---|
+| `<用户名>` | 运行服务的普通用户（**不要用 root**） | `appuser` |
+| `<服务器IP>` | 服务器地址 | `10.0.0.10` |
+| `<端口>` | 服务监听端口（默认 5173） | `5173` |
+| `~/apps/stkj` | 代码目录（可通过 `--dir` 改） | `$HOME/apps/stkj` |
+| `~/apps/node-*` | Node.js 运行时目录 | `$HOME/apps/node-v22.23.3-linux-x64` |
 
-## 当前部署状态
-
-| 项目 | 状态 |
-|---|---|
-| Node.js | v22.22.2，位于 `~/apps/node-v22.22.2-linux-x64`（免 sudo） |
-| 代码目录 | `~/apps/stkj` |
-| 数据库 | `~/apps/stkj/data/app.db` |
-| 服务 | systemd 用户服务 `stkj.service`，`enabled` + `active` |
-| 监听 | `0.0.0.0:5173` |
-| 开机自启 | 已开启 `loginctl enable-linger mac`，实测重启后 14 秒自动拉起 |
-| 日志 | `~/apps/stkj/logs/app.log` |
-| 访问地址 | http://192.168.1.139:5173 |
-
-> 已实测：整机重启后服务自动恢复，无需人工登录。
+> 逐步的安装 / 更新 / 卸载命令见根目录 `README.md` 的「Debian 服务器部署 / 更新 / 卸载」三节。
+> 本文档侧重**部署形态、目录约定、运维与故障排查**，补充 README 未展开的部分。
 
 ---
 
-## 一、数据安全加固（建议尽快执行）
+## 一、部署形态
 
-### 问题是什么
+采用 **systemd 用户服务**而非系统服务，理由：
 
-原代码有两个数据持久化缺陷，在**异常退出/重启**时可能丢数据：
+- 不需要 root 权限，日常更新、重启都不用 sudo
+- Node.js 装在用户目录（`~/apps/node-*`），不污染系统 PATH，不影响机器上其他项目
+- 通过 `loginctl enable-linger` 实现开机自启，行为与系统服务等价
 
-1. `seed.js` 末尾直接 `process.exit(0)`，没有关闭数据库。写入内容停留在 `app.db-wal`（曾出现 `app.db` 仅 4096 字节、WAL 却 1.7MB 的情况），重启后 WAL 失效，数据回退。
-2. WAL 模式下未设置 `synchronous`，默认较弱的同步策略在断电/强杀时可能丢失最后若干次提交。
+典型布局：
 
-### 修复内容（已在本地仓库完成）
-
-`db.js`：
-```js
-db.exec('PRAGMA synchronous = FULL;');          // 事务提交即 fsync
-db.exec('PRAGMA wal_autocheckpoint = 100;');    // 每 100 页自动合并
-db.exec('PRAGMA journal_size_limit = 67108864;');
-db.exec('PRAGMA busy_timeout = 5000;');
 ```
-
-`server.js`：新增 `SIGTERM`/`SIGINT` 处理，先关闭 HTTP 服务，再 `wal_checkpoint(TRUNCATE)` + `db.close()`。
-
-`seed.js`：退出前 checkpoint 并 `db.close()`，并解除对 `./server` 的依赖（原写法会连带启动 HTTP 服务、占用 5173 端口）。
-
-### 怎么应用到服务器
-
-在 mac mini 上执行：
-
-```bash
-cd ~
-# 1. 上传 stkj-deploy.tar.gz 到 ~ （见下方传输方式）
-tar -xzf stkj-deploy.tar.gz -C ~/apps/stkj
-# 2. 一键更新（自动备份 → 停服 → 覆盖 → 语法检查 → 启服）
-bash ~/apps/stkj/deploy/apply-update.sh ~/stkj-deploy.tar.gz
-# 3. 对现有库做一次 CHECKPOINT 加固
-bash ~/apps/stkj/deploy/harden-db.sh
+~/
+├── apps/
+│   ├── node-v22.23.3-linux-x64/      Node.js 运行时（免 sudo）
+│   ├── stkj/                         代码目录
+│   │   ├── server.js  db.js  ...
+│   │   ├── data/app.db               SQLite 数据库（含 -wal / -shm）
+│   │   ├── backups/                  每日自动备份
+│   │   ├── logs/app.log              运行日志
+│   │   └── deploy/                   部署脚本与 systemd 单元模板
+│   └── backups/code-<时间戳>.tar.gz  更新前的代码快照
+└── .config/systemd/user/
+    ├── stkj.service
+    ├── stkj-backup.service
+    └── stkj-backup.timer
 ```
-
-`apply-update.sh` 会自动把旧代码备份到 `~/apps/backups/code-<时间戳>.tar.gz`，**不会动 `data/` 数据库**。
 
 ---
 
-## 二、把部署包传到 mac mini
+## 二、前置条件
 
-三种方式任选：
+| 项目 | 要求 | 检查命令 |
+|---|---|---|
+| 系统 | Debian 11+ / Ubuntu 20.04+，x86_64 或 arm64 | `cat /etc/os-release`、`uname -m` |
+| Node.js | **≥ 22.13**（使用内置 `node:sqlite`） | `node -v` |
+| 基础工具 | `curl`、`xz-utils`、`ca-certificates` | `curl --version` |
+| 端口 | `<端口>` 未被占用 | `ss -tlnp \| grep <端口>` |
+| 磁盘 | 数据库大小 × 15 以上（自动备份保留 14 份） | `df -h ~` |
 
-**方式 A：从 Mac/PC 用 scp**
+补装基础工具：
+
 ```bash
-scp stkj-deploy.tar.gz mac@192.168.1.139:~/
+sudo apt update && sudo apt install -y curl xz-utils ca-certificates
 ```
 
-**方式 B：在 mac mini 上直接 git clone**（推荐，以后更新只需 `git pull`）
-```bash
-cd ~/apps
-git clone git@github.com:dakerclaw/stkjinfo.git stkj-src
-# 首次需要把 mac mini 的 SSH 公钥加到 GitHub
-```
-
-**方式 C：U 盘/共享目录** 拷贝过去。
+> Node.js **不要用 `apt install nodejs`**：Debian 仓库版本普遍低于 22，缺少 `node:sqlite`。
+> 用官方二进制包或 NodeSource 仓库，或直接跑 `deploy/install.sh`（会自动下载）。
 
 ---
 
-## 三、日常运维命令
+## 三、数据安全设计（重要）
+
+SQLite 在 WAL 模式下有几个容易丢数据的坑，本项目已针对性处理，**部署时无需额外操作**，但了解原因有助于排查问题。
+
+### 已做的处理
+
+| 环节 | 处理 | 位置 |
+|---|---|---|
+| 同步策略 | `PRAGMA synchronous = FULL`，事务提交即 fsync | `db.js` |
+| 自动合并 | `wal_autocheckpoint = 100`，每 100 页合并一次 | `db.js` |
+| WAL 体积 | `journal_size_limit = 67108864`（64 MB 上限） | `db.js` |
+| 锁等待 | `busy_timeout = 5000`，避免瞬时锁冲突直接报错 | `db.js` |
+| 优雅退出 | 收到 `SIGTERM`/`SIGINT` 先关 HTTP，再 `wal_checkpoint(TRUNCATE)` + `db.close()` | `server.js` |
+| 脚本退出 | `seed.js` / `backup.cjs` 结束前 checkpoint 并关库 | 对应文件 |
+
+### 曾经踩过的坑
+
+早期版本 `seed.js` 末尾直接 `process.exit(0)`，没有关闭数据库。写入停留在 `app.db-wal` 中（当时出现过 `app.db` 只有 4 KB、WAL 却有 1.7 MB 的情况），一旦进程被强杀或机器断电，WAL 未合并，重启后数据回退。**这类问题不会报错，只在重启后才发现数据少了**，所以务必保留优雅退出逻辑。
+
+### 备份策略
+
+- **每日自动**：`stkj-backup.timer` 每天 03:00 用 `VACUUM INTO` 生成在线一致性快照，不影响运行中的服务，默认保留 14 份
+- **手动触发**：`bash deploy/backup.cjs`（`--keep N` 调整保留份数）
+- **更新前**：`apply-update.sh` 自动备份**代码**，但**不备份数据**，重要更新前请手动跑一次 `backup.cjs`
+
+> `VACUUM INTO` 生成的是完整独立的 .db 文件，可直接拿来恢复，不像 `cp` 主库文件那样会漏掉 WAL 里的数据。
+
+---
+
+## 四、日常运维
 
 ```bash
-# 查看状态
-systemctl --user status stkj.service
+# 服务状态
+systemctl --user status stkj.service --no-pager
 
 # 重启 / 停止 / 启动
 systemctl --user restart stkj.service
 systemctl --user stop stkj.service
 systemctl --user start stkj.service
 
-# 实时看日志
+# 实时日志
 tail -f ~/apps/stkj/logs/app.log
 
-# 数据库健康检查
-~/apps/node-v22.22.2-linux-x64/bin/node -e "
-const {DatabaseSync}=require('node:sqlite');
-const db=new DatabaseSync('$HOME/apps/stkj/data/app.db');
-console.log('projects:',db.prepare('SELECT COUNT(*) c FROM projects').get().c);
-console.log('data:',db.prepare('SELECT COUNT(*) c FROM project_data').get().c);
-db.close();"
+# 备份定时器
+systemctl --user list-timers stkj-backup.timer
+tail -f ~/apps/stkj/logs/backup.log
 
-# 备份数据库（建议加进 crontab 每天跑）
-mkdir -p ~/backups
-sqlite3 ~/apps/stkj/data/app.db ".backup '$HOME/backups/app-$(date +%F).db'" \
-  || cp ~/apps/stkj/data/app.db ~/backups/app-$(date +%F).db
+# 端口监听
+ss -tlnp | grep <端口>
+```
+
+### 数据库健康检查
+
+```bash
+~/apps/node-v22.23.3-linux-x64/bin/node --no-warnings -e "
+const {DatabaseSync}=require('node:sqlite');
+const db=new DatabaseSync(process.env.HOME + '/apps/stkj/data/app.db', {readOnly:true});
+console.log('完整性:', db.prepare('PRAGMA integrity_check').get());
+console.log('项目  :', db.prepare('SELECT COUNT(*) c FROM projects').get().c);
+console.log('数据  :', db.prepare('SELECT COUNT(*) c FROM project_data').get().c);
+console.log('用户  :', db.prepare('SELECT COUNT(*) c FROM users').get().c);
+console.log('会话  :', db.prepare('SELECT COUNT(*) c FROM sessions').get().c);
+db.close();"
+```
+
+> 只读方式打开，检查过程中不会与线上服务争抢写锁。
+
+---
+
+## 五、安全配置建议
+
+1. **立即修改默认密码**：首次登录后右键菜单改掉 `admin` 的初始密码
+2. **限制监听范围**：默认 `0.0.0.0`，同网段均可访问。仅需本机或经跳板机访问时改为 `127.0.0.1`：
+   ```bash
+   # 改服务单元后重载
+   sed -i 's/Environment=HOST=0.0.0.0/Environment=HOST=127.0.0.1/' \
+     ~/.config/systemd/user/stkj.service
+   systemctl --user daemon-reload && systemctl --user restart stkj.service
+
+   # 本地通过 SSH 隧道访问
+   ssh -L <端口>:127.0.0.1:<端口> <用户名>@<服务器IP>
+   ```
+3. **不要直接暴露到公网**：应用本身不带 HTTPS，Cookie 未加 `Secure`。需要公网访问时，在前面加 Nginx / Caddy 做 TLS 终止
+4. **收紧文件权限**：
+   ```bash
+   chmod 700 ~/apps/stkj/data ~/apps/stkj/backups
+   chmod 600 ~/apps/stkj/data/app.db*
+   ```
+5. **会话机制**：会话持久化在数据库 `sessions` 表，重启服务不掉线，7 天不活跃失效；改密会注销该账号全部会话
+
+---
+
+## 六、系统服务方式（可选）
+
+如果机器由多人共用、需要严格的系统级管理，可以改用**系统服务**。把单元文件放到 `/etc/systemd/system/`，并在 `[Service]` 中显式指定用户：
+
+```ini
+[Unit]
+Description=stkj 项目管理系统
+After=network-online.target
+
+[Service]
+Type=simple
+User=<用户名>
+Group=<用户名>
+WorkingDirectory=/home/<用户名>/apps/stkj
+Environment=NODE_ENV=production
+Environment=HOST=0.0.0.0
+Environment=PORT=<端口>
+ExecStart=/home/<用户名>/apps/node-v22.23.3-linux-x64/bin/node --no-warnings server.js
+Restart=always
+RestartSec=3
+StandardOutput=append:/home/<用户名>/apps/stkj/logs/app.log
+StandardError=append:/home/<用户名>/apps/stkj/logs/app.log
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo cp stkj-system.service /etc/systemd/system/stkj.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now stkj.service
+```
+
+两种方式的区别：
+
+| | 用户服务（默认） | 系统服务 |
+|---|---|---|
+| 权限 | 普通用户即可管理 | 每次操作需 sudo |
+| 开机自启 | 需 `enable-linger` | 自动 |
+| 隔离性 | 仅影响该用户 | 影响整机 |
+| 适用 | 单人维护、专用机器 | 多人共用、需要审计 |
+
+---
+
+## 七、常见问题排查
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| 服务起不来，日志无内容 | `ExecStart` 里 Node 路径写错 | `systemctl --user cat stkj` 核对路径；`ls -l` 确认文件存在 |
+| `Cannot find module 'node:sqlite'` | Node 版本 < 22.13 | 升级 Node，并同步改单元文件里的路径 |
+| `Error: listen EADDRINUSE` | 端口被占用 | `ss -tlnp \| grep <端口>` 找到进程，改端口或停掉冲突服务 |
+| 重启后服务没起来 | 未开 linger，且用户未登录 | `sudo loginctl enable-linger <用户名>` |
+| 浏览器能开但接口全 401 | Cookie 被拦截 | 确认访问地址与 Cookie 域一致；跨域部署需额外配置 |
+| 导入 Excel 报「文件过大」 | 超过 20 MB 或解压后超 32 MB | 拆分文件分批导入 |
+| 数据库文件异常小（几 KB） | WAL 未合并 | 正常退出服务后查看 `app.db` 大小；必要时手动跑 `backup.cjs` |
+| 定时备份没执行 | timer 未启用，或机器当时关机 | `systemctl --user list-timers`；`Persistent=true` 会在开机后补跑 |
+
+### 查看完整堆栈
+
+```bash
+systemctl --user status stkj.service --no-pager -l
+journalctl --user -u stkj.service -n 100 --no-pager
 ```
 
 ---
 
-## 四、安全建议
-
-1. **立即修改 admin 密码**：首次登录后改掉默认的 `admin123`。
-2. 当前监听 `0.0.0.0:5173`，同网段任何人可访问。如只需自己用，把 `deploy/stkj.service` 里的
-   `Environment=HOST=0.0.0.0` 改为 `127.0.0.1`，然后通过 SSH 隧道访问：
-   ```bash
-   ssh -L 5173:127.0.0.1:5173 mac@192.168.1.139
-   ```
-3. 会话持久化在数据库 `sessions` 表中，重启服务不会掉线，7 天不活跃才失效。
-
-> 完整的安装 / 更新 / 卸载步骤见根目录 `README.md` 的「Debian 服务器部署 / 更新 / 卸载」三节；
-> 本文件保留早期的人工部署记录与故障排查背景供参考。
-
----
-
-## 五、这些文件是什么
+## 八、deploy/ 目录说明
 
 | 文件 | 用途 |
 |---|---|
-| `deploy/install.sh` | 全新安装：下载 Node.js → 铺代码 → 建库 → 装服务与备份定时器 |
-| `deploy/stkj.service` | systemd 用户服务单元（开机自启 + 崩溃自动重启） |
-| `deploy/apply-update.sh` | 一键更新：备份 → 停服 → 覆盖代码 → 语法检查 → 启服 |
-| `deploy/uninstall.sh` | 卸载：默认只摘服务；`--purge` / `--purge-all` 逐级删数据 |
-| `deploy/backup.cjs` | 数据库在线备份（`VACUUM INTO`，`--keep N` 控制保留份数） |
-| `deploy/stkj-backup.service` / `.timer` | 每日 03:00 自动备份 |
-| `deploy/harden-db.sh` | 对现有数据库做 CHECKPOINT 加固 + 健康检查 |
-| `deploy/clear-data.cjs` | 清空业务数据（保留账号与项目档案） |
+| `install.sh` | 全新安装：下载 Node.js → 铺代码 → 建库 → 装服务与备份定时器 |
+| `apply-update.sh` | 一键更新：备份代码 → 停服 → 覆盖 → 语法检查 → 启服；加 `--git` 可直接从仓库拉取 |
+| `uninstall.sh` | 卸载：默认只摘服务；`--purge` / `--purge-all` 逐级删数据 |
+| `backup.cjs` | 数据库在线备份（`VACUUM INTO`，`--keep N` 控制保留份数） |
+| `stkj.service` | systemd **用户**服务单元模板（`%h` 会自动替换为家目录） |
+| `stkj-backup.service` / `.timer` | 每日 03:00 自动备份 |
+| `harden-db.sh` | 对已有数据库做 CHECKPOINT 加固与健康检查 |
+| `clear-data.cjs` | 清空业务数据（保留账号与项目档案） |
+| `README-部署说明.md` | 本文件 |
+
+单元模板中的 `%h` 由 systemd 自动展开为当前用户家目录；`install.sh` 在安装时会把它替换成实际路径并写入 `~/.config/systemd/user/`。

@@ -228,7 +228,7 @@ deploy/            部署脚本与 systemd 单元（详见 deploy/README-部署�
 | 文件 | 用途 |
 |---|---|
 | `install.sh` | 全新安装：下载 Node.js → 铺代码 → 建库 → 装服务与定时器 |
-| `apply-update.sh` | 一键更新：备份代码 → 停服 → 覆盖 → 语法检查 → 启服 |
+| `apply-update.sh` | 一键更新：备份代码 → 停服 → 覆盖 → 语法检查 → 启服；加 `--git` 可直接从仓库拉取 |
 | `uninstall.sh` | 卸载：默认只摘服务；`--purge` / `--purge-all` 逐级删数据 |
 | `backup.cjs` | 数据库在线备份（`VACUUM INTO`，`--keep N` 控制保留份数） |
 | `harden-db.sh` | 对现有库做 CHECKPOINT 加固与健康检查 |
