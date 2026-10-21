@@ -514,8 +514,9 @@ async function loadData() {
         <thead>
           <tr>
             ${canDeleteData() ? '<th class="col-sticky" style="width:40px"><input type="checkbox" id="checkAll" style="accent-color:var(--primary)" /></th>' : ''}
-            <th class="${canDeleteData() ? '' : 'col-sticky'}">录入人</th>
-            ${F().map((f) => `<th class="sortable ${sorted === f.key ? 'sorted' : ''}" data-sort="${f.key}">${esc(f.label)}<span class="arrow">${arrow(f.key)}</span></th>`).join('')}
+            ${F().map((f, i) => `<th class="sortable ${i === 0 && !canDeleteData() ? 'col-sticky' : ''} ${sorted === f.key ? 'sorted' : ''}" data-sort="${f.key}">${esc(f.label)}<span class="arrow">${arrow(f.key)}</span></th>${
+              f.key === 'entry_date' ? `<th class="sortable ${sorted === 'created_by' ? 'sorted' : ''}" data-sort="created_by">录入人<span class="arrow">${arrow('created_by')}</span></th>` : ''
+            }`).join('')}
             <th style="position:sticky;right:0;background:var(--surface-2);z-index:3">操作</th>
           </tr>
         </thead>
@@ -524,14 +525,17 @@ async function loadData() {
             const mine = r.created_by_id === state.user.id;
             return `<tr>
             ${canDeleteData() ? `<td class="col-sticky"><input type="checkbox" class="rowChk" data-id="${r.id}" style="accent-color:var(--primary)" ${state.data.selected.has(r.id) ? 'checked' : ''} /></td>` : ''}
-            <td class="${canDeleteData() ? '' : 'col-sticky'}"><span class="owner-chip ${mine ? 'me' : ''}">${esc(r.created_by || '—')}${mine ? '（我）' : ''}</span></td>
-            ${F().map((f) => {
+            ${F().map((f, i) => {
               const v = r[f.key];
-              if (f.key === 'project_no') return `<td><span class="code-chip">${esc(v)}</span></td>`;
-              if (f.key === 'remark') return `<td class="wrap dim">${esc(v || '')}</td>`;
-              if (f.key === 'entry_date') return `<td class="dim">${esc(v || '—')}</td>`;
-              if (f.type === 'number') return `<td class="num">${fmtNum(v)}</td>`;
-              return `<td>${esc(v || '—')}</td>`;
+              const sticky = i === 0 && !canDeleteData() ? 'col-sticky' : '';
+              const ownerCell = f.key === 'entry_date'
+                ? `<td><span class="owner-chip ${mine ? 'me' : ''}">${esc(r.created_by || '—')}${mine ? '（我）' : ''}</span></td>`
+                : '';
+              if (f.key === 'project_no') return `<td class="${sticky}"><span class="code-chip">${esc(v)}</span></td>${ownerCell}`;
+              if (f.key === 'remark') return `<td class="wrap dim">${esc(v || '')}</td>${ownerCell}`;
+              if (f.key === 'entry_date') return `<td class="dim">${esc(v || '—')}</td>${ownerCell}`;
+              if (f.type === 'number') return `<td class="num">${fmtNum(v)}</td>${ownerCell}`;
+              return `<td>${esc(v || '—')}</td>${ownerCell}`;
             }).join('')}
             <td style="position:sticky;right:0;background:var(--surface);border-left:1px solid var(--border)">
               <div class="row-actions">

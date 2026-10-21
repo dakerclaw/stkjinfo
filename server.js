@@ -373,7 +373,8 @@ function buildOrder(params, defaultOrder) {
   const sort = params.get('sort');
   const dirRaw = (params.get('dir') || 'asc').toLowerCase();
   const dir = dirRaw === 'desc' ? 'DESC' : 'ASC';
-  const allowedSort = new Set([...FIELDS.map((f) => f.key), 'id', 'created_at', 'updated_at']);
+  // created_by / updated_by 为系统字段，允许按录入人排序（不参与导入导出）
+  const allowedSort = new Set([...FIELDS.map((f) => f.key), 'id', 'created_by', 'updated_by', 'created_at', 'updated_at']);
   if (sort && allowedSort.has(sort)) return ` ORDER BY ${sort} IS NULL, ${sort} ${dir}`;
   return defaultOrder;
 }

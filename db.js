@@ -98,8 +98,8 @@ CREATE TABLE IF NOT EXISTS project_data (
   efficiency    REAL,                                 -- 效率
   yield_rate    REAL,                                 -- 收率
   quantity      REAL,                                 -- 生产数量
+  remark        TEXT,                                 -- 备注
   entry_date    TEXT,                                 -- 录入日期
-  remark        TEXT,
   created_by    TEXT,                                 -- 录入人账号（数据归属）
   created_by_id INTEGER,                              -- 录入人用户 id
   updated_by    TEXT,                                 -- 最后修改人账号
@@ -195,8 +195,8 @@ const FIELDS = [
   { key: 'efficiency',     label: '效率',       type: 'number' },
   { key: 'yield_rate',     label: '收率',       type: 'number' },
   { key: 'quantity',       label: '生产数量',   type: 'number' },
-  { key: 'entry_date',     label: '录入日期',   type: 'date' },
   { key: 'remark',         label: '备注',       type: 'text' },
+  { key: 'entry_date',     label: '录入日期',   type: 'date' },
 ];
 
 module.exports = { db, DB_FILE, DATA_DIR, FIELDS };
