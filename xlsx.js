@@ -10,6 +10,14 @@
  */
 const zlib = require('node:zlib');
 
+/* ============================================================ 解压上限（防解压炸弹） */
+/** 单个 ZIP 条目解压后上限：32 MB */
+const MAX_ENTRY_BYTES = 32 * 1024 * 1024;
+/** 整个文件所有条目解压后合计上限：64 MB */
+const MAX_TOTAL_BYTES = 64 * 1024 * 1024;
+/** 条目数量上限（正常 xlsx 只有十几个） */
+const MAX_ZIP_ENTRIES = 256;
+
 /* ============================================================ CRC32 */
 const CRC_TABLE = (() => {
   const t = new Uint32Array(256);
@@ -43,18 +51,27 @@ function zipRead(buf) {
   if (eocd < 0) throw new Error('不是有效的 Excel 文件（.xlsx 结构损坏）');
 
   const count = buf.readUInt16LE(eocd + 10);
+  if (count > MAX_ZIP_ENTRIES) throw new Error('Excel 文件结构异常（条目过多）');
   let p = buf.readUInt32LE(eocd + 16);
   const out = Object.create(null);
+  let totalUncompressed = 0;
 
   for (let n = 0; n < count; n++) {
     if (p + 46 > buf.length || buf.readUInt32LE(p) !== 0x02014b50) break;
     const method = buf.readUInt16LE(p + 10);
     const compSize = buf.readUInt32LE(p + 20);
+    // 中央目录里记录的「解压后大小」——解压炸弹防御：先校验再解压。
+    // 记录值可能被伪造为 0，因此解压后还要再核一次实际长度。
+    const declaredSize = buf.readUInt32LE(p + 24);
     const nameLen = buf.readUInt16LE(p + 28);
     const extraLen = buf.readUInt16LE(p + 30);
     const commentLen = buf.readUInt16LE(p + 32);
     const localOff = buf.readUInt32LE(p + 42);
     const name = buf.slice(p + 46, p + 46 + nameLen).toString('utf8');
+
+    if (declaredSize > MAX_ENTRY_BYTES) {
+      throw new Error('Excel 文件过大，请拆分后分批导入（单个工作表解压后不得超过 32 MB）');
+    }
 
     if (localOff + 30 <= buf.length) {
       const lNameLen = buf.readUInt16LE(localOff + 26);
@@ -62,9 +79,21 @@ function zipRead(buf) {
       const start = localOff + 30 + lNameLen + lExtraLen;
       const raw = buf.slice(start, start + compSize);
       try {
-        out[name] = method === 0 ? raw : zlib.inflateRawSync(raw);
+        // maxOutputLength 是硬上限：即使头部记录值被伪造成 0，膨胀也会立即失败
+        const data = method === 0 ? raw
+          : zlib.inflateRawSync(raw, { maxOutputLength: MAX_ENTRY_BYTES });
+        totalUncompressed += data.length;
+        if (totalUncompressed > MAX_TOTAL_BYTES) {
+          throw new Error('Excel 文件过大，请拆分后分批导入');
+        }
+        out[name] = data;
       } catch (e) {
-        throw new Error(`Excel 文件解压失败（${name}）：${e.message}`);
+        if (/过大/.test(e.message)) throw e;
+        // 解压相关错误一律归一化，不把 Node 内部错误文本暴露给调用方/前端
+        if (e.code === 'ERR_BUFFER_TOO_LARGE' || /maxOutputLength|larger than/i.test(e.message)) {
+          throw new Error('Excel 文件过大，请拆分后分批导入（单个工作表解压后不得超过 32 MB）');
+        }
+        throw new Error(`Excel 文件解压失败（${name}），请确认文件未损坏且为标准 .xlsx 格式`);
       }
     }
     p += 46 + nameLen + extraLen + commentLen;

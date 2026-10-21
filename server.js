@@ -126,11 +126,22 @@ function ownerFilter(user, alias = '') {
   return { sql: `${alias}created_by_id = ?`, arg: user.id };
 }
 
+/* 全局安全响应头 */
+const SECURITY_HEADERS = {
+  'X-Content-Type-Options': 'nosniff',      // 禁止浏览器 MIME 嗅探
+  'X-Frame-Options': 'SAMEORIGIN',          // 防点击劫持（禁止被第三方页面内嵌）
+  'Referrer-Policy': 'same-origin',         // 跨站请求不带 Referer
+  'Content-Security-Policy':
+    "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; " +
+    "script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'self'; base-uri 'self'",
+};
+
 function send(res, status, data, headers = {}) {
   const body = JSON.stringify(data);
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
+    ...SECURITY_HEADERS,
     ...headers,
   });
   res.end(body);
@@ -168,16 +179,21 @@ function readRawBody(req, limitBytes = 20 * 1024 * 1024) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
+    let tooLarge = false;
     req.on('data', (chunk) => {
+      if (tooLarge) return;           // 已超限：丢弃后续数据，但继续排空以便正常回包
       size += chunk.length;
       if (size > limitBytes) {
-        reject(new Error('文件过大，请拆分后重试'));
-        req.destroy();
+        tooLarge = true;
+        chunks.length = 0;            // 立即释放已缓存的部分
         return;
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => {
+      if (tooLarge) reject(new Error('文件过大（上限 20 MB），请拆分后重试'));
+      else resolve(Buffer.concat(chunks));
+    });
     req.on('error', reject);
   });
 }
@@ -190,6 +206,7 @@ function sendXlsx(res, buffer, filename) {
       `attachment; filename="stkj.xlsx"; filename*=UTF-8''${encodeURIComponent(filename)}`,
     'Content-Length': buffer.length,
     'Cache-Control': 'no-store',
+    ...SECURITY_HEADERS,
   });
   res.end(buffer);
 }
@@ -302,7 +319,12 @@ function newImportToken(rows, user, kind = 'data') {
 
 /** 通用：解析上传的 Excel，按给定字段集合识别表头并转成 {字段key: 值} 行 */
 async function parseUpload(req, fields, requiredLabels) {
-  const buf = await readRawBody(req);
+  let buf;
+  try {
+    buf = await readRawBody(req);
+  } catch (e) {
+    return { error: e.message || '文件读取失败，请重试' };
+  }
   if (!buf.length) return { error: '没有收到文件内容' };
 
   let table;
@@ -647,7 +669,7 @@ function serveStatic(req, res, pathname) {
       // SPA 回退
       fs.readFile(path.join(PUBLIC_DIR, 'index.html'), (e2, html) => {
         if (e2) return send(res, 404, { success: false, message: '页面不存在' });
-        res.writeHead(200, { 'Content-Type': MIME['.html'] });
+        res.writeHead(200, { 'Content-Type': MIME['.html'], ...SECURITY_HEADERS });
         res.end(html);
       });
       return;
@@ -655,6 +677,7 @@ function serveStatic(req, res, pathname) {
     res.writeHead(200, {
       'Content-Type': MIME[path.extname(filePath).toLowerCase()] || 'application/octet-stream',
       'Cache-Control': 'no-cache',
+      ...SECURITY_HEADERS,
     });
     res.end(data);
   });
@@ -907,6 +930,10 @@ function createData(res, body, user) {
   }
 
   if (existing && action === 'overwrite') {
+    // 覆盖权限：与「修改」一致，普通用户只能覆盖自己录入的记录
+    if (!isAdmin(user) && existing.created_by_id !== user.id) {
+      return fail(res, 403, `该记录由「${existing.created_by || '他人'}」录入，无权覆盖；如需修改请联系管理员`);
+    }
     // 覆盖：仅更新本次提交的字段，保留 id 与录入人
     const patch = { ...row };
     delete patch.created_by;
@@ -1044,6 +1071,12 @@ function performImport(rows, user, action) {
         let existing = null;
         if (hasFullKey(row) && countByKey(row) > 0) existing = findDuplicate(row);
 
+        // 覆盖权限：与单条修改一致，普通用户只能覆盖自己录入的记录
+        if (existing && !isAdmin(user) && existing.created_by_id !== user.id) {
+          errors.push(`第 ${i + 2} 行：该记录由「${existing.created_by || '他人'}」录入，无权覆盖；如需修改请联系管理员`);
+          return;
+        }
+
         if (existing && !action) {
           // 先不写库，交给前端确认；继续收集其余重复行
           dupRows.push({
@@ -1054,6 +1087,7 @@ function performImport(rows, user, action) {
             work_order: row.work_order,
             existingId: existing.id,
             existingOwner: existing.created_by,
+            own: existing.created_by_id === user.id,
             key: describeKey(row),
           });
           return;
@@ -1310,7 +1344,7 @@ function me(res, user) {
 }
 
 /** 自助修改密码 */
-function changePassword(res, body, user) {
+function changePassword(res, body, user, req) {
   const oldPwd = String(body.old_password || '');
   const newPwd = String(body.new_password || '');
   if (!oldPwd || !newPwd) return fail(res, 400, '请填写原密码与新密码');
@@ -1325,7 +1359,13 @@ function changePassword(res, body, user) {
   db.prepare('UPDATE users SET password_hash = ?, salt = ?, pwd_changed = 1 WHERE id = ?').run(
     hashPassword(newPwd, salt), salt, user.id
   );
-  ok(res);
+  // 改密后使该账号已有的全部会话失效（防止密码泄露期间被他人长期持有登录态），
+  // 再为当前设备补发一个新会话，避免本机也被踢下线
+  destroyUserSessions(user.id);
+  const token = createSession(user.id, req);
+  send(res, 200, { success: true }, {
+    'Set-Cookie': `sid=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_TTL / 1000}`,
+  });
 }
 
 async function handleApi(req, res, url) {
@@ -1343,7 +1383,7 @@ async function handleApi(req, res, url) {
   if (!user) return fail(res, 401, '未登录或登录已失效，请重新登录');
 
   if (p === '/api/auth/me' && m === 'GET') return me(res, user);
-  if (p === '/api/auth/password' && m === 'POST') return changePassword(res, await readBody(req), user);
+  if (p === '/api/auth/password' && m === 'POST') return changePassword(res, await readBody(req), user, req);
 
   if (m === 'GET' && p === '/api/meta') return getMeta(res, user);
   if (m === 'GET' && p === '/api/stats') return getStats(res, user);
@@ -1429,7 +1469,8 @@ const server = http.createServer(async (req, res) => {
     }
   } catch (e) {
     console.error('[ERROR]', req.method, url.pathname, e);
-    if (!res.headersSent) fail(res, 500, e.message || '服务器内部错误');
+    // 只把错误细节写日志，不回传给客户端，避免泄露 SQL / 表结构 / 文件路径等信息
+    if (!res.headersSent) fail(res, 500, '服务器内部错误，请稍后重试或联系管理员');
     else res.end();
   }
 });
