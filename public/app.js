@@ -193,11 +193,11 @@ function barItem(name, value, max) {
 async function renderProjects() {
   const f = state.projects.filters;
   actions().innerHTML = `
-    <button class="btn" onclick="exportProjects()">导出 Excel</button>
-    ${canManageProjects() ? `<button class="btn" onclick="openProjectImport()">导入 Excel</button>
-    <button class="btn btn-primary" onclick="openProjectModal()">
+    ${canManageProjects() ? `<button class="btn btn-primary" onclick="openProjectModal()">
       <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>新增项目
-    </button>` : ''}`;
+    </button>
+    <button class="btn" onclick="openProjectImport()">导入 Excel</button>` : ''}
+    <button class="btn" onclick="exportProjects()">导出 Excel</button>`;
 
   content().innerHTML = `
     <div class="filters">
@@ -282,10 +282,11 @@ async function loadProjects() {
             <td><span class="status-tag ${r.status ? 'on' : 'off'}">${r.status ? '进行中' : '已归档'}</span></td>
             <td>
               <div class="row-actions">
+                <button class="btn btn-sm btn-ghost" onclick="gotoDataForProject('${esc(r.project_no)}')">查看数据</button>
                 ${canManageProjects()
                   ? `<button class="btn btn-sm btn-ghost" onclick="openProjectModal(${r.id})">编辑</button>
                      <button class="btn btn-sm btn-ghost" style="color:var(--danger)" onclick="confirmDeleteProject(${r.id}, '${esc(r.project_no)}', ${r.data_count})">删除</button>`
-                  : `<button class="btn btn-sm btn-ghost" onclick="gotoDataForProject('${esc(r.project_no)}')">查看数据</button>`}
+                  : ''}
               </div>
             </td>
           </tr>`).join('')}
@@ -304,9 +305,13 @@ async function loadProjects() {
   });
 }
 
+/** 从项目列表跳到「项目数据」，并按该项目编号筛选 */
 function gotoDataForProject(pno) {
+  // 只保留项目编号条件，避免上一次的其它筛选把结果过滤空
   state.data.filters = { project_no: pno };
   state.data.page = 1;
+  state.data.selected.clear();
+  state.data.onlySelected = false;
   navigate('data');
 }
 
@@ -404,14 +409,22 @@ const TEXT_FIELDS = () => F().filter((f) => f.type !== 'number');
 async function renderData() {
   const f = state.data.filters;
   const o = state.meta.options;
+  // 从项目列表跳转过来时，目标编号可能不在当前用户可见的下拉选项里，需临时补入
+  const pnoOpts = [...o.projectNos];
+  if (f.project_no && !pnoOpts.includes(f.project_no)) pnoOpts.unshift(f.project_no);
   actions().innerHTML = `
-    <button class="btn" onclick="openImport()">导入 Excel</button>
-    <button class="btn" onclick="exportData()">导出 Excel</button>
     <button class="btn btn-primary" onclick="openDataModal()">
       <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>新增数据
-    </button>`;
+    </button>
+    <button class="btn" onclick="openImport()">导入 Excel</button>
+    <button class="btn" onclick="exportData()">导出 Excel</button>`;
 
   content().innerHTML = `
+    ${f.project_no ? `<div class="perm-note" style="background:var(--primary-weak);border-color:#c7d8ff">
+      <svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+      <span>正在查看项目 <b>${esc(f.project_no)}</b> 的数据，
+        <a href="javascript:;" onclick="clearDataFilters()" style="color:var(--primary);font-weight:550">清除筛选</a> 查看全部</span>
+    </div>` : ''}
     ${seeAllData() ? '' : `<div class="perm-note">
       <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16.5v.01"/></svg>
       <span>你当前的角色为<b>普通用户</b>，仅显示<b>你自己录入</b>的数据。可新增与修改，删除需联系管理员。</span>
@@ -419,7 +432,7 @@ async function renderData() {
     <div class="filters">
       <div class="filter-row">
         <div class="field w-160"><label>项目编号</label>
-          <select class="select" id="dPno"><option value="">全部</option>${o.projectNos.map((v) => `<option ${f.project_no === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>
+          <select class="select" id="dPno"><option value="">全部</option>${pnoOpts.map((v) => `<option ${f.project_no === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>
         </div>
         <div class="field w-160"><label>产品代码</label>
           <select class="select" id="dPc"><option value="">全部</option>${o.productCodes.map((v) => `<option ${f.product_code === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>

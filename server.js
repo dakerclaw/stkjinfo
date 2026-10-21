@@ -705,7 +705,7 @@ function getMeta(res, user) {
 }
 
 /* ---------- 项目列表 ---------- */
-function listProjects(res, params) {
+function listProjects(res, params, user) {
   const { clause, args } = buildFilters(params, ['project_no', 'product_code', 'project_type']);
   const parts = [clause ? clause.replace(/^ WHERE /, '') : ''];
   const allArgs = [...args];
@@ -718,14 +718,19 @@ function listProjects(res, params) {
   }
   const where = parts.filter(Boolean).length ? ` WHERE ${parts.filter(Boolean).join(' AND ')}` : '';
 
+  // 数据条数 / 最近录入 与「查看数据」的口径保持一致：普通用户只统计自己录入的数据
+  const of = ownerFilter(user, 'd.');
+  const own = of ? ` AND ${of.sql}` : '';
+  const ownArgs = of ? [of.arg] : [];
+
   const rows = db
     .prepare(
       `SELECT p.*,
-              (SELECT COUNT(*) FROM project_data d WHERE d.project_no = p.project_no) AS data_count,
-              (SELECT MAX(d.entry_date) FROM project_data d WHERE d.project_no = p.project_no) AS last_entry
+              (SELECT COUNT(*) FROM project_data d WHERE d.project_no = p.project_no${own}) AS data_count,
+              (SELECT MAX(d.entry_date) FROM project_data d WHERE d.project_no = p.project_no${own}) AS last_entry
        FROM projects p${where}${buildOrder(params, ' ORDER BY p.id DESC')}`
     )
-    .all(...allArgs);
+    .all(...ownArgs, ...ownArgs, ...allArgs);
   ok(res, { rows, total: rows.length });
 }
 
@@ -1345,7 +1350,7 @@ async function handleApi(req, res, url) {
 
   // projects：全员可查看；增删改仅管理员
   if (p === '/api/projects') {
-    if (m === 'GET') return listProjects(res, q);
+    if (m === 'GET') return listProjects(res, q, user);
     if (m === 'POST') {
       if (!isAdmin(user)) return fail(res, 403, '仅管理员可新增项目');
       return createProject(res, await readBody(req));
