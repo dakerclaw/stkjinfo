@@ -2,6 +2,9 @@
   "name": "stkj-project-manager",
   "version": "1.0.0",
   "description": "项目管理应用 - 项目库与项目数据管理",
+  "author": "个人作者",
+  "license": "UNLICENSED",
+  "private": true,
   "main": "server.js",
   "scripts": {
     "start": "node --no-warnings server.js",
@@ -11,6 +14,5 @@
   },
   "engines": {
     "node": ">=22.13.0"
-  },
-  "private": true
+  }
 }

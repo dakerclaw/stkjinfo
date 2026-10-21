@@ -3,6 +3,8 @@
 基于 Node.js 的项目管理系统，用于管理项目库与项目检测/生产数据。
 **零第三方依赖**，后端仅使用 Node.js 内置模块（`node:http`、`node:crypto`、`node:zlib`、`node:sqlite`）。
 
+> **版权与授权**：本软件为个人私有作品，版权归作者个人所有，**保留一切权利**。未经作者书面许可，不得用于任何商业用途。详见下方「版权与许可」及 [LICENSE](LICENSE)。
+
 ## 快速开始
 
 双击 `start.bat`（首次自动初始化数据库并打开浏览器），或在终端执行：
@@ -216,7 +218,289 @@ public/index.html  页面骨架
 public/styles.css  样式
 public/app.js      前端逻辑（视图渲染、筛选、表单、Excel 导入导出）
 data/app.db        SQLite 数据库文件
+deploy/            部署脚本与 systemd 单元（详见 deploy/README-部署说明.md）
 ```
+
+`deploy/` 目录内容：
+
+| 文件 | 用途 |
+|---|---|
+| `install.sh` | 全新安装：下载 Node.js → 铺代码 → 建库 → 装服务与定时器 |
+| `apply-update.sh` | 一键更新：备份代码 → 停服 → 覆盖 → 语法检查 → 启服 |
+| `uninstall.sh` | 卸载：默认只摘服务；`--purge` / `--purge-all` 逐级删数据 |
+| `backup.cjs` | 数据库在线备份（`VACUUM INTO`，`--keep N` 控制保留份数） |
+| `harden-db.sh` | 对现有库做 CHECKPOINT 加固与健康检查 |
+| `clear-data.cjs` | 清空业务数据（保留账号与项目档案） |
+| `stkj.service` | systemd 用户服务单元（开机自启 + 崩溃自动重启） |
+| `stkj-backup.service` / `.timer` | 每日 03:00 自动备份 |
+
+## Debian 服务器部署
+
+适用于 **Debian 13 (trixie) / Debian 12 (bookworm)**，x86_64 与 arm64。全程**无需 root**，Node.js 装在用户目录，服务以 systemd **用户服务**运行。
+
+以下命令均以普通用户（示例为 `mac`）执行，`~` 指该用户家目录。
+
+### 一、环境准备
+
+Debian 最小化安装缺少 `curl`、`xz`，先补齐：
+
+```bash
+sudo apt update
+sudo apt install -y curl xz-utils ca-certificates
+```
+
+> `ca-certificates` 是 HTTPS 下载 Node.js 的必需依赖，缺失会报 `SSL certificate problem`。
+
+### 二、安装 Node.js（免 root）
+
+本应用需要 **Node.js ≥ 22.13**（使用内置 `node:sqlite`）。推荐 v22 LTS 最新补丁版：
+
+```bash
+NODE_VER=v22.23.3                                  # 按需改版本号
+NODE_ARCH=x64                                      # x86_64 用 x64；ARM 用 arm64
+mkdir -p ~/apps && cd ~/apps
+
+# 国内网络建议用镜像；不通时把 URL 换成 https://nodejs.org/dist/$NODE_VER/...
+curl -fL -o node.tar.xz \
+  https://npmmirror.com/mirrors/node/$NODE_VER/node-$NODE_VER-linux-$NODE_ARCH.tar.xz
+
+tar -xf node.tar.xz && rm -f node.tar.xz
+~/apps/node-$NODE_VER-linux-$NODE_ARCH/bin/node -v    # 应输出 v22.23.3
+```
+
+确认架构：`uname -m` 输出 `x86_64` 用 `x64`，输出 `aarch64` 用 `arm64`。
+
+### 三、获取代码
+
+**方式 A：git clone（推荐，后续更新最省事）**
+
+```bash
+cd ~/apps
+git clone git@github.com:dakerclaw/stkjinfo.git stkj
+```
+
+首次使用需要在服务器生成 SSH 密钥并加到 GitHub：
+
+```bash
+ssh-keygen -t ed25519 -C "stkj@$(hostname)" -N '' -f ~/.ssh/id_ed25519
+cat ~/.ssh/id_ed25519.pub        # 复制输出，加到 GitHub → Settings → SSH keys
+ssh -T git@github.com            # 出现 "successfully authenticated" 即可
+```
+
+**方式 B：从开发机 scp 代码包**
+
+```bash
+# 开发机上执行
+tar czf stkj-code.tar.gz --exclude=data --exclude=node_modules --exclude='*.db*' \
+    server.js db.js xlsx.js import-map.js seed.js package.json public deploy README.md
+scp stkj-code.tar.gz mac@<服务器IP>:~/
+
+# 服务器上执行
+mkdir -p ~/apps/stkj && tar -xzf ~/stkj-code.tar.gz -C ~/apps/stkj
+```
+
+### 四、初始化并安装服务
+
+一键脚本（推荐）：
+
+```bash
+cd ~/apps/stkj
+bash deploy/install.sh ~/apps/stkj          # 代码已在目标目录时传该目录
+# 或直接从仓库拉取：bash deploy/install.sh git@github.com:dakerclaw/stkjinfo.git
+```
+
+脚本会依次完成：下载 Node.js → 铺设代码 → 收紧数据目录权限 → 初始化数据库 → 安装并启动服务与备份定时器 → 自检。
+
+常用可选参数：
+
+| 参数 | 说明 |
+|---|---|
+| `--port=5173` | 监听端口 |
+| `--host=127.0.0.1` | 仅本机可访问（推荐配合 SSH 隧道） |
+| `--dir=~/apps/stkj` | 安装目录 |
+| `--node-version=v22.23.3` | 指定 Node 版本 |
+| `--no-backup-timer` | 不装每日备份定时器 |
+| `--with-linger` | 自动执行 `sudo loginctl enable-linger` |
+
+**手动安装**（想逐条确认时）：
+
+```bash
+cd ~/apps/stkj
+mkdir -p data backups logs
+chmod 700 data backups
+
+# 1. 首次初始化数据库（已有 app.db 会跳过；--reset 可重灌示例数据但保留用户）
+~/apps/node-v22.23.3-linux-x64/bin/node --no-warnings seed.js
+
+# 2. 安装 systemd 用户服务（把示例单元里的路径/端口替换成本机实际值）
+mkdir -p ~/.config/systemd/user
+sed -e "s|%h/apps/stkj|$HOME/apps/stkj|g" \
+    -e "s|%h/apps/node-v22.22.2-linux-x64|$HOME/apps/node-v22.23.3-linux-x64|g" \
+    deploy/stkj.service > ~/.config/systemd/user/stkj.service
+
+# 3. 安装每日备份定时器
+sed -e "s|%h/apps/stkj|$HOME/apps/stkj|g" \
+    -e "s|%h/apps/node-v22.22.2-linux-x64|$HOME/apps/node-v22.23.3-linux-x64|g" \
+    deploy/stkj-backup.service > ~/.config/systemd/user/stkj-backup.service
+cp deploy/stkj-backup.timer ~/.config/systemd/user/
+
+# 4. 生效并启动
+systemctl --user daemon-reload
+systemctl --user enable --now stkj.service
+systemctl --user enable --now stkj-backup.timer
+systemctl --user status stkj.service --no-pager
+```
+
+### 五、开机自启（linger）
+
+systemd **用户服务**默认只在用户登录后运行。要让服务器重启后无需登录自动拉起：
+
+```bash
+sudo loginctl enable-linger mac        # mac 换成实际用户名
+loginctl show-user mac --property=Linger   # 应显示 Linger=yes
+```
+
+### 六、验证安装
+
+```bash
+# 服务状态
+systemctl --user is-active stkj.service          # active
+# 端口监听
+ss -tlnp | grep 5173                             # 0.0.0.0:5173
+# HTTP 可达
+curl -I http://127.0.0.1:5173/                   # 200，且带 CSP 等安全响应头
+# 定时器下次执行时间
+systemctl --user list-timers stkj-backup.timer
+```
+
+浏览器打开 `http://<服务器IP>:5173`，用 `admin / admin123` 登录，**登录后立即在右上角修改密码**。
+
+## Debian 服务器更新
+
+### 方式一：git pull + 重启（最简单）
+
+```bash
+cd ~/apps/stkj
+git pull --ff-only
+~/apps/node-v22.23.3-linux-x64/bin/node --check server.js    # 语法自检
+systemctl --user restart stkj.service
+systemctl --user is-active stkj.service
+```
+
+> 数据库表结构与字段变更由 `db.js` 在启动时自动迁移（`CREATE TABLE IF NOT EXISTS` + 字段补齐 + 一次性数据修正），**不需要手动执行 SQL**。
+
+### 方式二：用更新脚本（自动备份当前代码再覆盖）
+
+```bash
+# 开发机打包并上传
+cd /path/to/stkj
+tar czf stkj-update.tar.gz --exclude=data --exclude=node_modules --exclude='*.db*' \
+    server.js db.js xlsx.js import-map.js seed.js package.json public deploy README.md
+scp stkj-update.tar.gz mac@<服务器IP>:~/
+
+# 服务器上执行：备份 → 停服 → 覆盖 → 语法检查 → 启服
+bash ~/apps/stkj/deploy/apply-update.sh ~/stkj-update.tar.gz
+```
+
+脚本会把旧代码备份到 `~/apps/backups/code-<时间戳>.tar.gz`，**不会改动 `data/` 数据库**。
+
+### 更新前请务必备份
+
+更新脚本只备份**代码**，不备份数据。执行更新前建议手动备份一次数据库：
+
+```bash
+~/apps/node-v22.23.3-linux-x64/bin/node --no-warnings ~/apps/stkj/deploy/backup.cjs
+# 生成 ~/apps/stkj/backups/app-<UTC时间>.db
+```
+
+### 回滚
+
+```bash
+systemctl --user stop stkj.service
+cd ~/apps/stkj
+tar -xzf ~/apps/backups/code-<时间戳>.tar.gz -C ~/apps/stkj
+systemctl --user start stkj.service
+```
+
+如果新版本已经改过数据结构、回滚后启动异常，再把数据库也回退（`data/` 里三个文件要一起换）：
+
+```bash
+systemctl --user stop stkj.service
+rm -f ~/apps/stkj/data/app.db ~/apps/stkj/data/app.db-shm ~/apps/stkj/data/app.db-wal
+cp ~/apps/stkj/backups/app-<时间戳>.db ~/apps/stkj/data/app.db
+systemctl --user start stkj.service
+```
+
+### 升级 Node.js
+
+```bash
+cd ~/apps
+curl -fL -o node.tar.xz https://npmmirror.com/mirrors/node/v22.23.3/node-v22.23.3-linux-x64.tar.xz
+tar -xf node.tar.xz && rm -f node.tar.xz
+
+# 改两个单元文件里的 ExecStart 路径后重启
+sed -i 's|node-v22.22.2-linux-x64|node-v22.23.3-linux-x64|g' ~/.config/systemd/user/stkj*.service
+systemctl --user daemon-reload
+systemctl --user restart stkj.service
+```
+
+## Debian 服务器卸载
+
+按需要选择三种粒度，**默认只摘服务、保留数据**。
+
+### 1. 仅移除服务（保留代码与数据库，可随时重装）
+
+```bash
+bash ~/apps/stkj/deploy/uninstall.sh
+```
+
+服务与定时器被移除，`~/apps/stkj` 原样保留。重装时直接跑 `install.sh` 即可继续用原有数据。
+
+### 2. 删除代码（数据和最近的备份单独存出）
+
+```bash
+bash ~/apps/stkj/deploy/uninstall.sh --purge
+```
+
+会先把 `data/` 和 `backups/` 复制到 `~/apps/stkj-uninstall-backup-<时间戳>/`，再删除 `data/` 与 `logs/`。
+
+### 3. 彻底删除（不可恢复）
+
+```bash
+bash ~/apps/stkj/deploy/uninstall.sh --purge-all
+```
+
+同样先备份到 `~/apps/stkj-uninstall-backup-<时间戳>/`，然后删除整个 `~/apps/stkj`。**确认备份文件已经拷走**，再手动删掉该备份目录。
+
+> 加 `--dry-run` 可先看脚本会做什么，不做任何修改。
+
+### 手动卸载步骤
+
+```bash
+# 1. 停服并禁用
+systemctl --user stop stkj.service stkj-backup.timer
+systemctl --user disable stkj.service stkj-backup.timer
+
+# 2. 删除单元文件
+rm -f ~/.config/systemd/user/stkj.service \
+      ~/.config/systemd/user/stkj-backup.service \
+      ~/.config/systemd/user/stkj-backup.timer
+systemctl --user daemon-reload
+systemctl --user reset-failed
+
+# 3.（可选）备份并删除数据
+cp -a ~/apps/stkj/data ~/stkj-data-backup
+rm -rf ~/apps/stkj
+
+# 4.（可选）删除 Node.js 运行时
+rm -rf ~/apps/node-*
+
+# 5.（可选）关闭 linger
+sudo loginctl disable-linger mac
+```
+
+卸载脚本**不会**删除 Node.js 运行时（`~/apps/node-*`），因为可能还有其他应用在用，需要时手动删（上面的第 4 步）。
+
 
 ## 已知限制
 
@@ -226,3 +510,43 @@ data/app.db        SQLite 数据库文件
 - 单次上传上限 20 MB、单个工作表解压后上限 32 MB，超出会提示拆分
 - 单进程部署，适用于内网或局域网环境的中小规模使用
 - **每日自动备份**：服务器上通过 systemd user 定时器（`deploy/stkj-backup.timer`）每天 03:00 用 `VACUUM INTO` 生成在线一致性快照到 `~/apps/stkj/backups/`，默认保留最近 14 份（`backup.cjs --keep N` 可调），不影响运行中的服务
+
+---
+
+## 版权与许可
+
+**Copyright © 2026 作者个人. All Rights Reserved.**
+
+本软件（含源代码、文档、界面设计及相关素材，以下统称「本作品」）为**个人私有作品**，著作权归作者个人所有。本作品受《中华人民共和国著作权法》及适用国际著作权公约保护。
+
+### 授权范围
+
+| 使用情形 | 是否允许 | 说明 |
+|---|:---:|---|
+| 个人学习、研究、自行部署使用 | ✅ 无需申请 | 可自行部署于自有环境 |
+| 公司/单位内部自用（非营利性质） | ⚠️ 需告知作者 | 建议书面告知使用范围与人数 |
+| 二次开发、修改、衍生作品 | ⚠️ 需取得许可 | 不得删除或隐藏版权声明 |
+| **任何商业用途** | ❌ **须事先取得作者书面许可** | 详见下方定义 |
+| 转售、租赁、按次收费、SaaS 对外提供服务 | ❌ **须事先取得作者书面许可** | 包括但不限于云托管、代运维收费 |
+| 去除、篡改、隐藏版权标识后分发 | ❌ 禁止 | 违反即构成侵权 |
+
+**「商业用途」包括但不限于**：将本作品或其衍生作品用于生产经营、对外提供收费服务、作为产品的一部分销售、嵌入商业软件交付客户、以本作品为基础承接付费项目、用于引流变现等直接或间接获取经济利益的行为。
+
+### 商业授权申请
+
+需商业授权时，请通过项目仓库（`git@github.com:dakerclaw/stkjinfo.git`）提交 Issue 或直接联系作者，说明：
+
+1. 使用主体（个人 / 公司名称）
+2. 使用场景与部署规模
+3. 是否涉及二次开发与对外分发
+
+获得书面许可后，按许可协议约定的范围使用；未获许可前，请勿将本作品用于任何商业目的。
+
+### 免责声明
+
+本作品按「现状」提供，不附带任何明示或暗示的担保，包括但不限于对适销性、特定用途适用性及不侵权的担保。在任何情况下，作者均不对因使用本作品而产生的任何直接、间接、偶然、特殊或后果性损害承担责任。**使用者应自行评估并承担数据安全、备份及合规责任**，生产环境使用前请务必做好数据备份。
+
+### 第三方组件
+
+本作品**不依赖任何第三方运行时库**（零 npm 依赖），后端仅使用 Node.js 标准库。Node.js 本身遵循其 MIT 许可证，与本作品的授权相互独立。
+

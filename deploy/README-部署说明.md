@@ -121,7 +121,10 @@ sqlite3 ~/apps/stkj/data/app.db ".backup '$HOME/backups/app-$(date +%F).db'" \
    ```bash
    ssh -L 5173:127.0.0.1:5173 mac@192.168.1.139
    ```
-3. 会话存在内存中，服务重启后所有人需重新登录（这是设计上的已知限制）。
+3. 会话持久化在数据库 `sessions` 表中，重启服务不会掉线，7 天不活跃才失效。
+
+> 完整的安装 / 更新 / 卸载步骤见根目录 `README.md` 的「Debian 服务器部署 / 更新 / 卸载」三节；
+> 本文件保留早期的人工部署记录与故障排查背景供参考。
 
 ---
 
@@ -129,7 +132,11 @@ sqlite3 ~/apps/stkj/data/app.db ".backup '$HOME/backups/app-$(date +%F).db'" \
 
 | 文件 | 用途 |
 |---|---|
+| `deploy/install.sh` | 全新安装：下载 Node.js → 铺代码 → 建库 → 装服务与备份定时器 |
 | `deploy/stkj.service` | systemd 用户服务单元（开机自启 + 崩溃自动重启） |
 | `deploy/apply-update.sh` | 一键更新：备份 → 停服 → 覆盖代码 → 语法检查 → 启服 |
+| `deploy/uninstall.sh` | 卸载：默认只摘服务；`--purge` / `--purge-all` 逐级删数据 |
+| `deploy/backup.cjs` | 数据库在线备份（`VACUUM INTO`，`--keep N` 控制保留份数） |
+| `deploy/stkj-backup.service` / `.timer` | 每日 03:00 自动备份 |
 | `deploy/harden-db.sh` | 对现有数据库做 CHECKPOINT 加固 + 健康检查 |
-| `deploy/stkj-deploy.tar.gz` | 上述内容的完整打包，便于整体传输 |
+| `deploy/clear-data.cjs` | 清空业务数据（保留账号与项目档案） |
