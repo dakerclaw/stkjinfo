@@ -5,9 +5,11 @@
 
 > **版权与授权**：本软件为个人私有作品，版权归作者个人所有，**保留一切权利**。未经作者书面许可，不得用于任何商业用途。详见下方「版权与许可」及 [LICENSE](LICENSE)。
 
+> **联系方式**：stkjinfo@hehudieyiqi.com
+
 ## 快速开始
 
-双击 `start.bat`（首次自动初始化数据库并打开浏览器），或在终端执行：
+在终端执行：
 
 ```bash
 npm start          # 启动服务，访问 http://127.0.0.1:5173
@@ -62,7 +64,7 @@ node seed.js --reset   # 清空项目与数据后重新灌入示例（保留用�
 
 ## 安全说明
 
-面向内网部署的单进程应用，已做的基础加固如下（均经实测验证）：
+面向内网部署的单进程应用，已做的基础加固如下：
 
 | 风险点 | 处理方式 |
 |---|---|
@@ -272,31 +274,9 @@ tar -xf node.tar.xz && rm -f node.tar.xz
 
 ### 三、获取代码
 
-**方式 A：git clone（推荐，后续更新最省事）**
-
 ```bash
 cd ~/apps
 git clone git@github.com:dakerclaw/stkjinfo.git stkj
-```
-
-首次使用需要在服务器生成 SSH 密钥并加到 GitHub：
-
-```bash
-ssh-keygen -t ed25519 -C "stkj@$(hostname)" -N '' -f ~/.ssh/id_ed25519
-cat ~/.ssh/id_ed25519.pub        # 复制输出，加到 GitHub → Settings → SSH keys
-ssh -T git@github.com            # 出现 "successfully authenticated" 即可
-```
-
-**方式 B：从开发机 scp 代码包**
-
-```bash
-# 开发机上执行
-tar czf stkj-code.tar.gz --exclude=data --exclude=node_modules --exclude='*.db*' \
-    server.js db.js xlsx.js import-map.js seed.js package.json public deploy README.md
-scp stkj-code.tar.gz mac@<服务器IP>:~/
-
-# 服务器上执行
-mkdir -p ~/apps/stkj && tar -xzf ~/stkj-code.tar.gz -C ~/apps/stkj
 ```
 
 ### 四、初始化并安装服务
@@ -356,8 +336,8 @@ systemctl --user status stkj.service --no-pager
 systemd **用户服务**默认只在用户登录后运行。要让服务器重启后无需登录自动拉起：
 
 ```bash
-sudo loginctl enable-linger mac        # mac 换成实际用户名
-loginctl show-user mac --property=Linger   # 应显示 Linger=yes
+sudo loginctl enable-linger usrsktj        # usrsktj 换成实际用户名
+loginctl show-user usrsktj --property=Linger   # 应显示 Linger=yes
 ```
 
 ### 六、验证安装
@@ -396,7 +376,7 @@ systemctl --user is-active stkj.service
 cd /path/to/stkj
 tar czf stkj-update.tar.gz --exclude=data --exclude=node_modules --exclude='*.db*' \
     server.js db.js xlsx.js import-map.js seed.js package.json public deploy README.md
-scp stkj-update.tar.gz mac@<服务器IP>:~/
+scp stkj-update.tar.gz usrsktj@<服务器IP>:~/
 
 # 服务器上执行：备份 → 停服 → 覆盖 → 语法检查 → 启服
 bash ~/apps/stkj/deploy/apply-update.sh ~/stkj-update.tar.gz
@@ -496,7 +476,7 @@ rm -rf ~/apps/stkj
 rm -rf ~/apps/node-*
 
 # 5.（可选）关闭 linger
-sudo loginctl disable-linger mac
+sudo loginctl disable-linger usrsktj
 ```
 
 卸载脚本**不会**删除 Node.js 运行时（`~/apps/node-*`），因为可能还有其他应用在用，需要时手动删（上面的第 4 步）。
@@ -508,7 +488,7 @@ sudo loginctl disable-linger mac
 - Excel **仅支持 .xlsx**（Excel 2007 及以上）。旧版 `.xls` 或 `.csv` 请先用 Excel / WPS 另存为 `.xlsx` 再导入
 - 导入只读取工作簿中的**第一个工作表**
 - 单次上传上限 20 MB、单个工作表解压后上限 32 MB，超出会提示拆分
-- 单进程部署，适用于内网或局域网环境的中小规模使用
+- 单进程部署，适用于中小规模使用
 - **每日自动备份**：服务器上通过 systemd user 定时器（`deploy/stkj-backup.timer`）每天 03:00 用 `VACUUM INTO` 生成在线一致性快照到 `~/apps/stkj/backups/`，默认保留最近 14 份（`backup.cjs --keep N` 可调），不影响运行中的服务
 
 ---
@@ -534,7 +514,7 @@ sudo loginctl disable-linger mac
 
 ### 商业授权申请
 
-需商业授权时，请通过项目仓库（`git@github.com:dakerclaw/stkjinfo.git`）提交 Issue 或直接联系作者，说明：
+需商业授权时，请通过项目仓库（`git@github.com:dakerclaw/stkjinfo.git`）提交 Issue 或直接联系作者(stkjinfo@hehudieyiqi.com)，说明：
 
 1. 使用主体（个人 / 公司名称）
 2. 使用场景与部署规模
