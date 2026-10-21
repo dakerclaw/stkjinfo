@@ -8,6 +8,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { db, DB_FILE, FIELDS } = require('./db');
+const xlsx = require('./xlsx');
+const { normHeader, buildHeaderMap, isBlank } = require('./import-map');
 
 const PORT = Number(process.env.PORT || 5173);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -132,7 +134,227 @@ function readBody(req) {
   });
 }
 
-/** 把 query 参数转成 WHERE 条件（多选支持逗号分隔） */
+/** 读取二进制请求体（Excel 文件上传） */
+function readRawBody(req, limitBytes = 20 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > limitBytes) {
+        reject(new Error('文件过大，请拆分后重试'));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+/** 输出 Excel 文件下载 */
+function sendXlsx(res, buffer, filename) {
+  res.writeHead(200, {
+    'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'Content-Disposition':
+      `attachment; filename="stkj.xlsx"; filename*=UTF-8''${encodeURIComponent(filename)}`,
+    'Content-Length': buffer.length,
+    'Cache-Control': 'no-store',
+  });
+  res.end(buffer);
+}
+
+const todayStr = () => new Date().toISOString().slice(0, 10);
+const cell = (v) => (v === null || v === undefined ? '' : v);
+
+/** 把查询条件构建从分页列表里抽出来，供导出复用 */
+function buildDataWhere(params, user) {
+  const { clause, args } = buildFilters(params, DATA_FILTERS);
+  const where = clause ? [clause.replace(/^ WHERE /, '')] : [];
+
+  const from = params.get('date_from');
+  const to = params.get('date_to');
+  if (from) { where.push("IFNULL(entry_date,'') >= ?"); args.push(from); }
+  if (to) { where.push("IFNULL(entry_date,'') <= ?"); args.push(to); }
+
+  const kw = params.get('q');
+  if (kw && kw.trim()) {
+    const like = `%${kw.trim()}%`;
+    where.push(`(project_no LIKE ? OR product_code LIKE ? OR IFNULL(base,'') LIKE ? OR IFNULL(process_code,'') LIKE ? OR IFNULL(work_order,'') LIKE ? OR IFNULL(coke_type,'') LIKE ? OR IFNULL(remark,'') LIKE ?)`);
+    args.push(like, like, like, like, like, like, like);
+  }
+
+  const of = ownerFilter(user);
+  if (of) { where.push(of.sql); args.push(of.arg); }
+
+  return { w: where.length ? ` WHERE ${where.join(' AND ')}` : '', args };
+}
+
+/** 导出检测数据为 Excel（按当前筛选条件） */
+function exportDataXlsx(res, params, user) {
+  const { w, args } = buildDataWhere(params, user);
+  const rows = db.prepare(`SELECT * FROM project_data${w} ORDER BY id DESC`).all(...args);
+  const table = [FIELDS.map((f) => f.label), ...rows.map((r) => FIELDS.map((f) => cell(r[f.key])))];
+  sendXlsx(res, xlsx.build(table, '项目数据'), `项目数据_${todayStr()}.xlsx`);
+}
+
+/** 导出项目档案为 Excel */
+function exportProjectsXlsx(res, params) {
+  const { clause, args } = buildFilters(params, ['project_no', 'product_code', 'project_type']);
+  const parts = [clause ? clause.replace(/^ WHERE /, '') : ''];
+  const allArgs = [...args];
+  const q = params.get('q');
+  if (q && q.trim()) {
+    parts.push("(project_no LIKE ? OR product_code LIKE ? OR project_type LIKE ? OR IFNULL(description,'') LIKE ?)");
+    const like = `%${q.trim()}%`;
+    allArgs.push(like, like, like, like);
+  }
+  const where = parts.filter(Boolean).length ? ` WHERE ${parts.filter(Boolean).join(' AND ')}` : '';
+  const rows = db
+    .prepare(
+      `SELECT p.*,
+              (SELECT COUNT(*) FROM project_data d WHERE d.project_no = p.project_no) AS data_count,
+              (SELECT MAX(d.entry_date) FROM project_data d WHERE d.project_no = p.project_no) AS last_entry
+       FROM projects p${where} ORDER BY p.id DESC`
+    )
+    .all(...allArgs);
+  const header = ['项目编号', '产品代码', '项目类型', '项目简介', '数据量', '最新录入日期', '状态'];
+  const table = [
+    header,
+    ...rows.map((r) => [
+      cell(r.project_no), cell(r.product_code), cell(r.project_type), cell(r.description),
+      Number(r.data_count || 0), cell(r.last_entry), r.status === 0 ? '停用' : '启用',
+    ]),
+  ];
+  sendXlsx(res, xlsx.build(table, '项目列表'), `项目列表_${todayStr()}.xlsx`);
+}
+
+/** 按勾选字段生成导入模板（Excel） */
+function exportTemplateXlsx(res, params) {
+  const wanted = (params.get('fields') || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const keySet = new Set(wanted);
+  const fields = wanted.length ? FIELDS.filter((f) => keySet.has(f.key)) : FIELDS;
+  if (!fields.length) return fail(res, 400, '未选择任何字段');
+  const sample = (k, f) => {
+    if (k === 'project_no') return 'PJ-2026-001';
+    if (k === 'product_code') return 'GC-A1';
+    if (k === 'base') return '江西紫宸科技有限公司';
+    if (k === 'process_code') return 'PR-10';
+    if (k === 'work_order') return 'WO-20260101';
+    if (k === 'coke_type') return '针状焦';
+    if (k === 'entry_date') return todayStr();
+    return f.type === 'number' ? '' : '';
+  };
+  const table = [fields.map((f) => f.label), fields.map((f) => sample(f.key, f))];
+  sendXlsx(res, xlsx.build(table, '导入模板'), `项目数据导入模板_${todayStr()}.xlsx`);
+}
+
+/* ---------- Excel 导入：解析后缓存待确认批次 ---------- */
+const importTokens = new Map(); // token -> { rows, user, at }
+const IMPORT_TTL = 30 * 60 * 1000;
+
+function newImportToken(rows, user) {
+  // 清理过期批次
+  const now = Date.now();
+  for (const [k, v] of importTokens) if (now - v.at > IMPORT_TTL) importTokens.delete(k);
+  // 上限保护：超过 100 个批次时淘汰最旧的
+  if (importTokens.size >= 100) {
+    const oldest = [...importTokens.entries()].sort((a, b) => a[1].at - b[1].at)[0];
+    if (oldest) importTokens.delete(oldest[0]);
+  }
+  const token = crypto.randomBytes(16).toString('hex');
+  importTokens.set(token, { rows, user: user.username, at: now });
+  return token;
+}
+
+/** 上传 Excel → 解析、识别表头、返回预览统计与批次 token */
+async function previewImportFile(res, req, user) {
+  const buf = await readRawBody(req);
+  if (!buf.length) return fail(res, 400, '没有收到文件内容');
+
+  let table;
+  try {
+    table = xlsx.parse(buf);
+  } catch (e) {
+    return fail(res, 400, e.message || '无法解析该 Excel 文件');
+  }
+  if (table.length < 2) return fail(res, 400, 'Excel 文件为空或只有表头，请检查内容');
+
+  const headers = table[0];
+  const headerMap = buildHeaderMap();
+  const matched = [];
+  const unknown = [];
+  headers.forEach((h) => {
+    if (!String(h).trim()) return;
+    const key = headerMap.get(normHeader(h));
+    if (key) matched.push({ col: String(h), key });
+    else unknown.push(String(h));
+  });
+
+  const keyOf = (label) => (FIELDS.find((f) => f.label === label) || {}).key;
+  const missingRequired = ['项目编号', '产品代码'].filter(
+    (label) => !matched.some((m) => m.key === keyOf(label))
+  );
+
+  const dataRows = table.slice(1).filter((r) => r.some((c) => !isBlank(c)));
+  const rows = dataRows
+    .map((r) => {
+      const raw = {};
+      headers.forEach((h, i) => { raw[h] = r[i] === undefined ? '' : r[i]; });
+      return raw;
+    })
+    .map((raw) => {
+      const out = {};
+      for (const [col, val] of Object.entries(raw)) {
+        const key = headerMap.get(normHeader(col));
+        if (!key || isBlank(val)) continue;
+        out[key] = val;
+      }
+      return out;
+    })
+    .filter((o) => o.project_no || o.product_code);
+
+  // 缺必填表头时仍返回预览（行数为 0），让界面明确提示缺少哪些列
+  if (!rows.length && !missingRequired.length) return fail(res, 400, '没有可导入的有效数据行');
+
+  const token = newImportToken(rows, user);
+  ok(res, {
+    token,
+    rowCount: rows.length,
+    dataRows: dataRows.length,
+    matched,
+    unknown,
+    missingRequired,
+    blankLabels: FIELDS.filter((f) => !matched.some((m) => m.key === f.key)).map((f) => f.label),
+  });
+}
+
+/** 确认导入：按 token 取出已解析的批次写入数据库 */
+function importByToken(res, body, user) {
+  const token = String(body.token || '');
+  const item = importTokens.get(token);
+  if (!item) return fail(res, 400, '导入批次已过期，请重新选择 Excel 文件');
+  if (item.user !== user.username) return fail(res, 403, '无权导入该批次数据');
+
+  const out = performImport(item.rows, user, String(body.duplicate_action || '').toLowerCase());
+  if (out.dup) {
+    // 重复待确认，保留批次，等用户选择覆盖/追加
+    return send(res, 409, {
+      success: false,
+      code: 'DUPLICATE_KEY',
+      message: `有 ${out.dup.count} 行数据与系统已有记录重复`,
+      duplicate: out.dup,
+    });
+  }
+  importTokens.delete(token);
+  return ok(res, out.result);
+}
+
+/** 把查询参数转成 WHERE 条件（多选支持逗号分隔） */
 function buildFilters(params, allowed) {
   const where = [];
   const args = [];
@@ -359,26 +581,7 @@ function deleteProject(res, id) {
 
 /* ---------- 项目数据 ---------- */
 function listData(res, params, user) {
-  const { clause, args } = buildFilters(params, DATA_FILTERS);
-  const where = clause ? [clause.replace(/^ WHERE /, '')] : [];
-
-  const from = params.get('date_from');
-  const to = params.get('date_to');
-  if (from) { where.push('IFNULL(entry_date,\'\') >= ?'); args.push(from); }
-  if (to) { where.push('IFNULL(entry_date,\'\') <= ?'); args.push(to); }
-
-  const kw = params.get('q');
-  if (kw && kw.trim()) {
-    const like = `%${kw.trim()}%`;
-    where.push(`(project_no LIKE ? OR product_code LIKE ? OR IFNULL(base,'') LIKE ? OR IFNULL(process_code,'') LIKE ? OR IFNULL(work_order,'') LIKE ? OR IFNULL(coke_type,'') LIKE ? OR IFNULL(remark,'') LIKE ?)`);
-    args.push(like, like, like, like, like, like, like);
-  }
-
-  // 普通用户只能看到自己录入的数据
-  const of = ownerFilter(user);
-  if (of) { where.push(of.sql); args.push(of.arg); }
-
-  const w = where.length ? ` WHERE ${where.join(' AND ')}` : '';
+  const { w, args } = buildDataWhere(params, user);
 
   const page = Math.max(1, Number(params.get('page') || 1));
   const pageSize = Math.min(500, Math.max(10, Number(params.get('pageSize') || 50)));
@@ -591,13 +794,9 @@ function normalizeImportValue(key, value) {
  * duplicate_action：
  *   'overwrite' 覆盖已有记录；'append' 全部追加；未指定时若命中重复则返回 409 让前端询问
  */
-function importData(res, body, user) {
-  const rows = Array.isArray(body.rows) ? body.rows : [];
-  if (rows.length === 0) return fail(res, 400, '没有可导入的数据');
-
+function performImport(rows, user, action) {
   const labelMap = new Map(FIELDS.map((f) => [f.label, f.key]));
   const keySet = new Set(DATA_KEYS);
-  const action = String(body.duplicate_action || '').toLowerCase();
   let inserted = 0;
   let overwritten = 0;
   const errors = [];
@@ -675,11 +874,8 @@ function importData(res, body, user) {
     // 命中重复且用户尚未选择处理方式 → 整体回滚，只回报冲突信息
     if (dupRows.length > 0) {
       db.exec('ROLLBACK');
-      return send(res, 409, {
-        success: false,
-        code: 'DUPLICATE_KEY',
-        message: `有 ${dupRows.length} 行数据与系统已有记录重复`,
-        duplicate: {
+      return {
+        dup: {
           mode: 'batch',
           count: dupRows.length,
           total: rows.length,
@@ -687,7 +883,7 @@ function importData(res, body, user) {
           key: dupRows[0].key,
           sample: dupRows[0].key,
         },
-      });
+      };
     }
     db.exec('COMMIT');
   } catch (e) {
@@ -696,14 +892,37 @@ function importData(res, body, user) {
   }
 
   const blankFields = FIELDS.filter((f) => !filledCount[f.key]).map((f) => f.label);
-  ok(res, {
-    inserted,
-    overwritten,
-    failed: errors.length,
-    errors: errors.slice(0, 20),
-    blankCells: blankTotal,
-    blankFields,
-  });
+  return {
+    result: {
+      inserted,
+      overwritten,
+      failed: errors.length,
+      errors: errors.slice(0, 20),
+      blankCells: blankTotal,
+      blankFields,
+    },
+  };
+}
+
+/** JSON 导入入口：body.rows */
+function importData(res, body, user) {
+  const rows = Array.isArray(body.rows) ? body.rows : [];
+  if (rows.length === 0) return fail(res, 400, '没有可导入的数据');
+  return finishImport(res, rows, String(body.duplicate_action || '').toLowerCase(), user);
+}
+
+/** 统一的导入收尾：处理 409 冲突与成功响应 */
+function finishImport(res, rows, action, user) {
+  const out = performImport(rows, user, action);
+  if (out.dup) {
+    return send(res, 409, {
+      success: false,
+      code: 'DUPLICATE_KEY',
+      message: `有 ${out.dup.count} 行数据与系统已有记录重复`,
+      duplicate: out.dup,
+    });
+  }
+  return ok(res, out.result);
 }
 
 /* ---------- 统计 ---------- */
@@ -928,6 +1147,7 @@ async function handleApi(req, res, url) {
       return createProject(res, await readBody(req));
     }
   }
+  if (p === '/api/projects/export' && m === 'GET') return exportProjectsXlsx(res, q);
   if (seg[0] === 'projects' && seg[1]) {
     const id = Number(seg[1]);
     if (m === 'GET') return getProject(res, id);
@@ -946,9 +1166,16 @@ async function handleApi(req, res, url) {
     if (m === 'GET') return listData(res, q, user);
     if (m === 'POST') return createData(res, await readBody(req), user);
   }
+  // Excel 导出 / 上传解析（需登录，导出受归属过滤限制）
+  if (p === '/api/data/export' && m === 'GET') return exportDataXlsx(res, q, user);
+  if (p === '/api/data/template' && m === 'GET') return exportTemplateXlsx(res, q);
+  if (p === '/api/data/import-file' && m === 'POST') return previewImportFile(res, req, user);
+  if (p === '/api/data/import-confirm' && m === 'POST') {
+    return importByToken(res, await readBody(req), user);
+  }
   if (p === '/api/data/bulk-delete' && m === 'POST') return bulkDeleteData(res, await readBody(req), user);
   if (p === '/api/data/import' && m === 'POST') return importData(res, await readBody(req), user);
-  if (seg[0] === 'data' && seg[1] && seg[1] !== 'bulk-delete' && seg[1] !== 'import') {
+  if (seg[0] === 'data' && seg[1] && !['export', 'template', 'import-file', 'import-confirm', 'bulk-delete', 'import'].includes(seg[1])) {
     const id = Number(seg[1]);
     if (m === 'GET') return getData(res, id, user);
     if (m === 'PUT' || m === 'PATCH') return updateData(res, id, await readBody(req), user);

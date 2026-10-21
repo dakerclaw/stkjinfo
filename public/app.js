@@ -27,6 +27,29 @@ const API = {
     }
     return data;
   },
+  /** 上传二进制内容（Excel 文件） */
+  async postRaw(url, arrayBuffer) {
+    const res = await fetch(url, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: arrayBuffer,
+    });
+    let data = {};
+    try { data = await res.json(); } catch { /* ignore */ }
+    if (res.status === 401) {
+      showLogin('登录已失效，请重新登录');
+      throw new Error(data.message || '未登录');
+    }
+    if (!res.ok || data.success === false) {
+      const err = new Error(data.message || `请求失败 (${res.status})`);
+      err.status = res.status;
+      err.code = data.code;
+      err.payload = data;
+      throw err;
+    }
+    return data;
+  },
   get: (u) => API.req('GET', u),
   post: (u, b) => API.req('POST', u, b || {}),
   put: (u, b) => API.req('PUT', u, b),
@@ -169,7 +192,7 @@ function barItem(name, value, max) {
 async function renderProjects() {
   const f = state.projects.filters;
   actions().innerHTML = `
-    <button class="btn" onclick="exportProjects()">导出 CSV</button>
+    <button class="btn" onclick="exportProjects()">导出 Excel</button>
     ${canManageProjects() ? `<button class="btn btn-primary" onclick="openProjectModal()">
       <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>新增项目
     </button>` : ''}`;
@@ -286,14 +309,21 @@ function gotoDataForProject(pno) {
 }
 
 function exportProjects() {
-  const rows = [['项目编号', '产品代码', '项目类型', '项目简介', '状态', '创建时间']];
   const f = state.projects.filters;
   const qs = new URLSearchParams();
   Object.entries(f).forEach(([k, v]) => { if (v) qs.set(k, v); });
-  API.get('/api/projects?' + qs.toString()).then(({ rows: list }) => {
-    list.forEach((r) => rows.push([r.project_no, r.product_code, r.project_type, r.description || '', r.status ? '进行中' : '已归档', r.created_at]));
-    downloadCsv(rows, '项目列表');
-  });
+  downloadFile('/api/projects/export?' + qs.toString());
+  toast('项目列表已导出', 'ok');
+}
+
+/** 触发服务端文件下载 */
+function downloadFile(url) {
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = '';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
 }
 
 /* ---------- 项目弹窗 ---------- */
@@ -373,8 +403,8 @@ async function renderData() {
   const f = state.data.filters;
   const o = state.meta.options;
   actions().innerHTML = `
-    <button class="btn" onclick="openImport()">导入 CSV</button>
-    <button class="btn" onclick="exportData()">导出 CSV</button>
+    <button class="btn" onclick="openImport()">导入 Excel</button>
+    <button class="btn" onclick="exportData()">导出 Excel</button>
     <button class="btn btn-primary" onclick="openDataModal()">
       <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>新增数据
     </button>`;
@@ -783,148 +813,37 @@ function bulkDelete() {
   });
 }
 
-/* ---------- CSV 导出 / 导入 ---------- */
-function downloadCsv(rows, filename) {
-  const csv = rows.map((r) => r.map((c) => {
-    const s = c === null || c === undefined ? '' : String(c);
-    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-  }).join(',')).join('\r\n');
-  const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = `${filename}_${new Date().toISOString().slice(0, 10)}.csv`;
-  a.click();
-  URL.revokeObjectURL(a.href);
-}
+/* ---------- Excel 导出 ---------- */
 
 async function exportData() {
   const qs = new URLSearchParams();
   Object.entries(state.data.filters).forEach(([k, v]) => { if (v) qs.set(k, v); });
-  qs.set('pageSize', 500);
-  const all = [];
-  let page = 1;
-  while (true) {
-    qs.set('page', page);
-    const { rows, total } = await API.get('/api/data?' + qs.toString());
-    all.push(...rows);
-    if (all.length >= total || rows.length === 0) break;
-    page++;
-  }
-  const rows = [F().map((f) => f.label), ...all.map((r) => F().map((f) => r[f.key]))];
-  downloadCsv(rows, '项目数据');
-  toast(`已导出 ${all.length} 条记录`, 'ok');
+
+  // 先取总数用于提示，实际文件由服务端按同样条件生成
+  qs.set('pageSize', 10);
+  qs.set('page', 1);
+  const { total } = await API.get('/api/data?' + qs.toString());
+  if (!total) return toast('当前筛选条件下没有可导出的数据', 'err');
+  qs.delete('page');
+  qs.delete('pageSize');
+  downloadFile('/api/data/export?' + qs.toString());
+  toast(`已导出 ${total} 条记录`, 'ok');
 }
 
-/* ---------- 导入：列名识别与空值归一化 ---------- */
-
-/** 列名归一化：去空白、去括号及单位、统一小写，容错「振实密度(g/cm3)」「Dx（50）」等写法 */
-function normHeader(h) {
-  let s = String(h || '')
-    // 只转换全角标点，避免 ³、² 等字符被改写
-    .replace(/[\uFF01-\uFF5E]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
-    .replace(/\u3000/g, ' ')
-    // 去括号及括号内内容，仅当内容含「单位/字母/符号」时；纯数字括号（Dx(50)）保留
-    .replace(/[(\[{【](?=[^)\]}】]*[a-zA-Zµμ%\/])[^)\]}】]*[)\]}】]/g, '')
-    .replace(/\s+/g, '')
-    .replace(/[·•\-_]/g, '')
-    .replace(/[()（）\uFF08\uFF09]/g, '')
-    .toLowerCase();
-  // 去掉末尾游离的单位片段，如 振实密度g/cm3、容量mah/g、效率%、收率%
-  s = s.replace(/(g\/cm3|g\/cm2|mah\/g|m2\/g|g\/ml|cm3\/g|μm|um|nm|%)+$/g, '');
-  // 注意：不可去掉末尾数字，Dx(50) 的 50 是粒径标识
-  return s;
-}
-
-/** 建立「列名 → 字段 key」映射表 */
-function buildHeaderMap() {
-  const map = new Map();
-  for (const f of F()) {
-    map.set(normHeader(f.label), f.key);
-    map.set(normHeader(f.key), f.key);
-    // Dx(n) 精确形式额外登记：dx50 / DX(50) / dx_50
-    const m = /^dx(\d+)$/.exec(f.key);
-    if (m) {
-      const n = m[1];
-      map.set('dx' + n, f.key);
-      map.set('dx(' + n + ')', f.key);
-      map.set('dx（' + n + '）', f.key);
-      map.set('d' + n, f.key); // D50 简写
-    }
-  }
-  // 常见别名
-  const alias = {
-    所属公司: ['所属公司', '公司'],
-    工序: ['工序'],
-    工单号: ['工单号'],
-    焦种: ['焦种', '焦炭种类', '焦类型'],
-    振实密度: ['振实'],
-    比表国产: ['比表面积国产', '国产比表', 'bet国产'],
-    比表麦克: ['比表面积麦克', '麦克比表', 'bet麦克'],
-    石墨化度: ['石墨化'],
-    首次效率: ['首效', '首效率'],
-    磁性物质: ['磁性物', '磁性异物'],
-    ph值: ['ph'],
-    真密度: ['真比重'],
-    筛上物: ['筛余'],
-    成品水分: ['成品水份'],
-    水分: ['水份'],
-    硫分: ['硫份', '全硫'],
-    黏结指数: ['粘结指数', 'g值'],
-    吸油值: ['吸油量', '吸油率'],
-    结焦值: ['结焦'],
-    哈氏可磨指数: ['可磨指数', 'hgi'],
-    生产数量: ['数量', '产量'],
-    录入日期: ['日期', '检测日期'],
-    备注: ['说明', '备注信息'],
-  };
-  for (const [label, list] of Object.entries(alias)) {
-    const key = map.get(normHeader(label));
-    if (!key) continue;
-    for (const a of list) if (!map.has(normHeader(a))) map.set(normHeader(a), key);
-  }
-  return map;
-}
-
-/** 空值判定：空串、纯空格、-、/、N/A、null、未检、未测 等一律视为未提供 */
-const isBlank = (v) =>
-  v === null || v === undefined ||
-  /^(|\s*|-{1,2}|\/|—|n\/?a|null|nan|无|未检|未检测|未测|待检|\/\/)$/i.test(String(v).trim());
-
-/**
- * 把一行 CSV 对象按表头映射为字段对象。
- * 未出现的列、空值、非数字文本都不会写入 → 数据库中自动留空（NULL）。
- */
-function mapImportRow(raw, headerMap, fieldByLabel) {
-  const out = {};
-  const skipped = [];
-  for (const [col, val] of Object.entries(raw)) {
-    const key = headerMap.get(normHeader(col));
-    if (!key) continue;
-    if (isBlank(val)) continue; // 空值留空
-    const meta = fieldByLabel.get(key);
-    if (meta && meta.type === 'number') {
-      const n = Number(String(val).replace(/[,，\s%]/g, '').replace(/[<>≤≥]/g, ''));
-      if (!Number.isFinite(n)) { skipped.push(`${col}=${val}`); continue; } // 非数字留空
-      out[key] = n;
-    } else {
-      out[key] = String(val).trim();
-    }
-  }
-  return { out, skipped };
-}
+/* ---------- 导入：Excel 上传后由服务端解析与识别表头 ---------- */
 
 function openImport() {
-  const fieldByLabel = new Map(F().map((f) => [f.key, f]));
   openModal({
-    title: '导入 CSV 数据',
-    sub: '指标字段可只填一部分，未填写或未提供的指标将自动留空',
+    title: '导入 Excel 数据',
+    sub: '支持 .xlsx 文件，指标字段可只填一部分，未提供的指标将自动留空',
     body: `
       <div style="background:var(--primary-weak);border-radius:9px;padding:11px 13px;font-size:12.5px;color:#1e4fbf;line-height:1.75;margin-bottom:14px">
         <b>部分字段即可导入</b>：无需凑齐 ${F().length} 个字段，只要包含<b>项目编号</b>和<b>产品代码</b>，其余指标可任意缺省。<br>
-        表头可用中文列名或字段名，兼容 <code>Dx（50）</code>、<code>振实密度(g/cm³)</code>、<code>首效</code> 等写法；空格、<code>-</code>、<code>N/A</code> 视为未提供。
+        表头可用中文列名或字段名，兼容 <code>Dx（50）</code>、<code>振实密度(g/cm³)</code>、<code>首效</code> 等写法；空格、<code>-</code>、<code>N/A</code> 视为未提供。<br>
+        <b>仅支持 .xlsx</b>（Excel 2007 及以上）。若是 .xls 或 .csv，请先用 Excel 另存为 .xlsx。
       </div>
       <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
-        <input type="file" id="csvFile" accept=".csv,text/csv" class="input" style="height:auto;padding:8px;flex:1;min-width:220px" />
+        <input type="file" id="excelFile" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" class="input" style="height:auto;padding:8px;flex:1;min-width:220px" />
         <button class="btn btn-sm" onclick="openTemplatePicker()">选择字段生成模板</button>
       </div>
       <div id="importPreview"></div>`,
@@ -932,45 +851,38 @@ function openImport() {
       <button class="btn btn-primary" id="okImport" disabled>开始导入</button>`,
   });
 
-  let parsed = [];
-  el('#csvFile').addEventListener('change', async (e) => {
+  el('#excelFile').addEventListener('change', async (e) => {
     const file = e.target.files[0];
     const prev = el('#importPreview');
     if (!file) return;
-    const text = await file.text();
-    parsed = parseCsv(text.replace(/^\uFEFF/, ''));
-    // 去掉完全空白的尾部行
-    while (parsed.length && parsed[parsed.length - 1].every((c) => isBlank(c))) parsed.pop();
 
-    if (parsed.length < 2) {
-      prev.innerHTML = `<div style="color:var(--danger);font-size:12.5px">文件为空或只有表头，请检查内容。</div>`;
-      parsed = [];
+    if (!/\.xlsx$/i.test(file.name)) {
+      prev.innerHTML = `<div style="color:var(--danger);font-size:12.5px">
+        仅支持 .xlsx 格式。请先用 Excel / WPS 打开后「另存为」Excel 工作簿（.xlsx）再上传。
+      </div>`;
       el('#okImport').disabled = true;
       return;
     }
 
-    const headers = parsed[0];
-    const headerMap = buildHeaderMap();
-    const matched = [], unknown = [];
-    headers.forEach((h) => {
-      if (!String(h).trim()) return;
-      const key = headerMap.get(normHeader(h));
-      key ? matched.push({ col: h, key }) : unknown.push(h);
-    });
+    prev.innerHTML = `<div style="color:var(--text-3);font-size:12.5px">正在解析 ${esc(file.name)} …</div>`;
+    el('#okImport').disabled = true;
 
-    const missingRequired = ['项目编号', '产品代码'].filter(
-      (label) => !headers.some((h) => headerMap.get(normHeader(h)) === F().find((f) => f.label === label).key)
-    );
-    const dataRows = parsed.slice(1).filter((r) => r.some((c) => !isBlank(c)));
+    let info;
+    try {
+      const buf = await file.arrayBuffer();
+      info = await API.postRaw('/api/data/import-file', buf);
+    } catch (err) {
+      prev.innerHTML = `<div style="color:var(--danger);font-size:12.5px">${esc(err.message)}</div>`;
+      return;
+    }
 
-    // 列数校验提示
-    const badCols = dataRows.filter((r) => r.length !== headers.length).length;
+    const { matched = [], unknown = [], missingRequired = [], blankLabels = [] } = info;
 
     prev.innerHTML = `
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px">
         <div style="background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:9px 11px">
           <div style="font-size:11.5px;color:var(--text-3)">数据行</div>
-          <div style="font-size:19px;font-weight:650">${dataRows.length}</div>
+          <div style="font-size:19px;font-weight:650">${info.rowCount}</div>
         </div>
         <div style="background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:9px 11px">
           <div style="font-size:11.5px;color:var(--text-3)">识别到的指标字段</div>
@@ -978,37 +890,24 @@ function openImport() {
         </div>
       </div>
       <div style="font-size:12.5px;line-height:1.9;color:var(--text-2)">
-        <div><b style="color:var(--text)">将留空的指标（${F().length - matched.length} 项）：</b>
-          <span style="color:var(--text-3)">${F().filter((f) => !matched.some((m) => m.key === f.key)).map((f) => f.label).join('、') || '无'}</span>
+        <div><b style="color:var(--text)">将留空的指标（${blankLabels.length} 项）：</b>
+          <span style="color:var(--text-3)">${blankLabels.map(esc).join('、') || '无'}</span>
         </div>
         ${unknown.length ? `<div style="margin-top:6px"><b style="color:var(--warn)">无法识别的列（将被忽略）：</b> ${unknown.map(esc).join('、')}</div>` : ''}
-        ${badCols ? `<div style="margin-top:6px;color:var(--warn)"><b>注意：</b>${badCols} 行的列数与表头不一致，多出的列会被忽略，缺少的列将留空。</div>` : ''}
-        ${missingRequired.length ? `<div style="margin-top:8px;color:var(--danger);font-weight:600">缺少必填表头：${missingRequired.join('、')}，请补充后重新选择文件。</div>` : ''}
+        ${missingRequired.length ? `<div style="margin-top:8px;color:var(--danger);font-weight:600">缺少必填表头：${missingRequired.map(esc).join('、')}，请补充后重新选择文件。</div>` : ''}
       </div>`;
 
     el('#okImport').disabled = missingRequired.length > 0;
-    el('#okImport')._payload = { headers, rows: dataRows, headerMap, fieldByLabel };
+    el('#okImport')._token = info.token;
   });
 
   el('#okImport').addEventListener('click', async () => {
-    const p = el('#okImport')._payload;
-    if (!p) return toast('请先选择 CSV 文件', 'err');
-    const { headers, rows, headerMap, fieldByLabel } = p;
-
-    let skippedTotal = 0;
-    const rowsOut = rows.map((r) => {
-      const raw = {};
-      headers.forEach((h, i) => { raw[h] = r[i]; });
-      const { out, skipped } = mapImportRow(raw, headerMap, fieldByLabel);
-      skippedTotal += skipped.length;
-      return out;
-    }).filter((o) => o.project_no || o.product_code);
-
-    if (!rowsOut.length) return toast('没有可导入的有效数据行', 'err');
+    const token = el('#okImport')._token;
+    if (!token) return toast('请先选择 Excel 文件', 'err');
 
     const runImport = async (dupAction) => {
-      const payload = dupAction ? { rows: rowsOut, duplicate_action: dupAction } : { rows: rowsOut };
-      return API.post('/api/data/import', payload);
+      const payload = dupAction ? { token, duplicate_action: dupAction } : { token };
+      return API.post('/api/data/import-confirm', payload);
     };
 
     const done = async (r, note) => {
@@ -1016,7 +915,6 @@ function openImport() {
       let msg = note || `导入成功 ${r.inserted} 条`;
       if (r.overwritten && !note) msg = `导入完成：覆盖 ${r.overwritten} 条、新增 ${r.inserted} 条`;
       if (r.failed) msg += `，失败 ${r.failed} 条`;
-      if (skippedTotal) msg += `；${skippedTotal} 个非数值内容已留空`;
       toast(msg, r.failed ? 'err' : 'ok');
       if (r.blankFields && r.blankFields.length) {
         setTimeout(() => alert(
@@ -1038,7 +936,7 @@ function openImport() {
         const info = e.payload.duplicate || {};
         const rowsHtml = (info.rows || []).length
           ? `<div class="dup-rows"><table>
-              <thead><tr><th>CSV 行号</th><th>项目编号</th><th>所属公司</th><th>工序</th><th>工单号</th></tr></thead>
+              <thead><tr><th>Excel 行号</th><th>项目编号</th><th>所属公司</th><th>工序</th><th>工单号</th></tr></thead>
               <tbody>${(info.rows || []).slice(0, 8).map((d) => `<tr>
                 <td>${esc(d.line)}</td><td>${esc(d.project_no)}</td><td>${esc(d.base || '—')}</td>
                 <td>${esc(d.process_code || '—')}</td><td>${esc(d.work_order || '—')}</td></tr>`).join('')}
@@ -1049,7 +947,7 @@ function openImport() {
           title: `有 ${info.count || 0} 行数据重复`,
           key: '',
           count: info.count || 0,
-          extra: `本次共 ${info.total || rowsOut.length} 行待导入`,
+          extra: `本次共 ${info.total || info.count || 0} 行待导入`,
           rowsHtml,
           onChoice: async (choice) => {
             try {
@@ -1067,7 +965,7 @@ function openImport() {
   });
 }
 
-/** 按勾选字段生成 CSV 模板（含一行示例），用于部分指标导入 */
+/** 按勾选字段生成 Excel 导入模板（含一行示例），用于部分指标导入 */
 function openTemplatePicker() {
   const groups = [
     { title: '基础（必选）', keys: ['project_no', 'product_code', 'base', 'process_code', 'work_order'] },
@@ -1128,38 +1026,10 @@ function openTemplatePicker() {
   el('#tplGo').addEventListener('click', () => {
     const keys = [...document.querySelectorAll('.tplChk')].filter((c) => c.checked).map((c) => c.value);
     const order = F().map((f) => f.key).filter((k) => keys.includes(k));
-    const header = order.map((k) => fm.get(k).label);
-    const sample = order.map((k) => {
-      const f = fm.get(k);
-      if (k === 'project_no') return 'PJ-2026-001';
-      if (k === 'product_code') return 'GC-A1';
-      if (k === 'entry_date') return new Date().toISOString().slice(0, 10);
-      if (k === 'remark') return '';
-      return f.type === 'number' ? '0' : '';
-    });
-    downloadCsv([header, sample], '项目数据导入模板');
-    toast(`模板已生成，含 ${header.length} 个字段`, 'ok');
+    if (!order.length) return toast('请至少选择一个字段', 'err');
+    downloadFile('/api/data/template?fields=' + encodeURIComponent(order.join(',')));
+    toast(`模板已生成，含 ${order.length} 个字段`, 'ok');
   });
-}
-
-function parseCsv(text) {
-  const rows = [];
-  let row = [], cur = '', q = false;
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i];
-    if (q) {
-      if (c === '"') { if (text[i + 1] === '"') { cur += '"'; i++; } else q = false; }
-      else cur += c;
-    } else {
-      if (c === '"') q = true;
-      else if (c === ',') { row.push(cur); cur = ''; }
-      else if (c === '\n') { row.push(cur); rows.push(row); row = []; cur = ''; }
-      else if (c === '\r') { /* skip */ }
-      else cur += c;
-    }
-  }
-  if (cur !== '' || row.length) { row.push(cur); rows.push(row); }
-  return rows;
 }
 
 /* ============================================================
