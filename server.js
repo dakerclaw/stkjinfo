@@ -283,10 +283,10 @@ function exportTemplateXlsx(res, params) {
 }
 
 /* ---------- Excel 导入：解析后缓存待确认批次 ---------- */
-const importTokens = new Map(); // token -> { rows, user, at }
+const importTokens = new Map(); // token -> { kind:'data'|'project', rows, user, at }
 const IMPORT_TTL = 30 * 60 * 1000;
 
-function newImportToken(rows, user) {
+function newImportToken(rows, user, kind = 'data') {
   // 清理过期批次
   const now = Date.now();
   for (const [k, v] of importTokens) if (now - v.at > IMPORT_TTL) importTokens.delete(k);
@@ -296,25 +296,25 @@ function newImportToken(rows, user) {
     if (oldest) importTokens.delete(oldest[0]);
   }
   const token = crypto.randomBytes(16).toString('hex');
-  importTokens.set(token, { rows, user: user.username, at: now });
+  importTokens.set(token, { kind, rows, user: user.username, at: now });
   return token;
 }
 
-/** 上传 Excel → 解析、识别表头、返回预览统计与批次 token */
-async function previewImportFile(res, req, user) {
+/** 通用：解析上传的 Excel，按给定字段集合识别表头并转成 {字段key: 值} 行 */
+async function parseUpload(req, fields, requiredLabels) {
   const buf = await readRawBody(req);
-  if (!buf.length) return fail(res, 400, '没有收到文件内容');
+  if (!buf.length) return { error: '没有收到文件内容' };
 
   let table;
   try {
     table = xlsx.parse(buf);
   } catch (e) {
-    return fail(res, 400, e.message || '无法解析该 Excel 文件');
+    return { error: e.message || '无法解析该 Excel 文件' };
   }
-  if (table.length < 2) return fail(res, 400, 'Excel 文件为空或只有表头，请检查内容');
+  if (table.length < 2) return { error: 'Excel 文件为空或只有表头，请检查内容' };
 
   const headers = table[0];
-  const headerMap = buildHeaderMap();
+  const headerMap = buildHeaderMap(fields);
   const matched = [];
   const unknown = [];
   headers.forEach((h) => {
@@ -324,41 +324,51 @@ async function previewImportFile(res, req, user) {
     else unknown.push(String(h));
   });
 
-  const keyOf = (label) => (FIELDS.find((f) => f.label === label) || {}).key;
-  const missingRequired = ['项目编号', '产品代码'].filter(
-    (label) => !matched.some((m) => m.key === keyOf(label))
+  const missingRequired = requiredLabels.filter(
+    (label) => !matched.some((m) => m.key === (fields.find((f) => f.label === label) || {}).key)
   );
 
   const dataRows = table.slice(1).filter((r) => r.some((c) => !isBlank(c)));
   const rows = dataRows
     .map((r) => {
-      const raw = {};
-      headers.forEach((h, i) => { raw[h] = r[i] === undefined ? '' : r[i]; });
-      return raw;
-    })
-    .map((raw) => {
       const out = {};
-      for (const [col, val] of Object.entries(raw)) {
-        const key = headerMap.get(normHeader(col));
-        if (!key || isBlank(val)) continue;
-        out[key] = val;
-      }
+      headers.forEach((h, i) => {
+        const key = headerMap.get(normHeader(h));
+        if (!key || isBlank(r[i])) return;
+        out[key] = r[i] === undefined ? '' : r[i];
+      });
       return out;
     })
-    .filter((o) => o.project_no || o.product_code);
+    .filter((o) => Object.keys(o).length > 0);
 
-  // 缺必填表头时仍返回预览（行数为 0），让界面明确提示缺少哪些列
-  if (!rows.length && !missingRequired.length) return fail(res, 400, '没有可导入的有效数据行');
-
-  const token = newImportToken(rows, user);
-  ok(res, {
-    token,
-    rowCount: rows.length,
+  return {
     dataRows: dataRows.length,
+    rows,
     matched,
     unknown,
     missingRequired,
-    blankLabels: FIELDS.filter((f) => !matched.some((m) => m.key === f.key)).map((f) => f.label),
+    parsedKeys: new Set(matched.map((m) => m.key)),
+  };
+}
+
+/** 上传 Excel → 解析、识别表头、返回预览统计与批次 token */
+async function previewImportFile(res, req, user) {
+  const p = await parseUpload(req, FIELDS, ['项目编号', '产品代码']);
+  if (p.error) return fail(res, 400, p.error);
+
+  const rows = p.rows.filter((o) => o.project_no || o.product_code);
+  // 缺必填表头时仍返回预览（行数为 0），让界面明确提示缺少哪些列
+  if (!rows.length && !p.missingRequired.length) return fail(res, 400, '没有可导入的有效数据行');
+
+  const token = newImportToken(rows, user, 'data');
+  ok(res, {
+    token,
+    rowCount: rows.length,
+    dataRows: p.dataRows,
+    matched: p.matched,
+    unknown: p.unknown,
+    missingRequired: p.missingRequired,
+    blankLabels: FIELDS.filter((f) => !p.parsedKeys.has(f.key)).map((f) => f.label),
   });
 }
 
@@ -368,6 +378,19 @@ function importByToken(res, body, user) {
   const item = importTokens.get(token);
   if (!item) return fail(res, 400, '导入批次已过期，请重新选择 Excel 文件');
   if (item.user !== user.username) return fail(res, 403, '无权导入该批次数据');
+  if (item.kind === 'project') {
+    const out = performProjectImport(item.rows, String(body.duplicate_action || '').toLowerCase());
+    if (out.dup) {
+      return send(res, 409, {
+        success: false,
+        code: 'DUPLICATE_KEY',
+        message: `有 ${out.dup.count} 个项目编号已存在`,
+        duplicate: out.dup,
+      });
+    }
+    importTokens.delete(token);
+    return ok(res, out.result);
+  }
 
   const out = performImport(item.rows, user, String(body.duplicate_action || '').toLowerCase());
   if (out.dup) {
@@ -381,6 +404,156 @@ function importByToken(res, body, user) {
   }
   importTokens.delete(token);
   return ok(res, out.result);
+}
+
+/* ---------- 项目列表导入 ---------- */
+
+const PROJECT_IMPORT_FIELDS = [
+  { key: 'project_no', label: '项目编号', type: 'text' },
+  { key: 'product_code', label: '产品代码', type: 'text' },
+  { key: 'project_type', label: '项目类型', type: 'text' },
+  { key: 'description', label: '项目简介', type: 'text' },
+  { key: 'status', label: '状态', type: 'text' },
+];
+
+/** 项目导入模板 */
+function exportProjectTemplateXlsx(res) {
+  const table = [
+    PROJECT_IMPORT_FIELDS.map((f) => f.label),
+    ['PJ-2026-001', 'GC-A1', '量产', '示例：客户定制规格，按工单全程追溯', '启用'],
+  ];
+  sendXlsx(res, xlsx.build(table, '导入模板'), `项目列表导入模板_${todayStr()}.xlsx`);
+}
+
+/** 上传项目 Excel → 预览 */
+async function previewProjectImportFile(res, req, user) {
+  const p = await parseUpload(req, PROJECT_IMPORT_FIELDS, ['项目编号', '产品代码', '项目类型']);
+  if (p.error) return fail(res, 400, p.error);
+
+  const rows = p.rows.filter((o) => o.project_no);
+  if (!rows.length && !p.missingRequired.length) return fail(res, 400, '没有可导入的有效数据行');
+
+  // 与库中已有项目比对，预览即告知将新增 / 已存在各多少
+  const existSet = new Set(db.prepare('SELECT project_no FROM projects').all().map((r) => r.project_no));
+  let willInsert = 0;
+  let willDup = 0;
+  for (const r of rows) {
+    if (existSet.has(String(r.project_no).trim())) willDup++;
+    else willInsert++;
+  }
+
+  const token = newImportToken(rows, user, 'project');
+  ok(res, {
+    token,
+    kind: 'project',
+    rowCount: rows.length,
+    dataRows: p.dataRows,
+    matched: p.matched,
+    unknown: p.unknown,
+    missingRequired: p.missingRequired,
+    blankLabels: PROJECT_IMPORT_FIELDS.filter((f) => !p.parsedKeys.has(f.key)).map((f) => f.label),
+    willInsert,
+    willDup,
+  });
+}
+
+/** 状态文本 → 1/0 */
+function parseStatus(v) {
+  const s = String(v === null || v === undefined ? '' : v).trim();
+  if (!s) return 1;
+  if (/^(0|停用|已停|归档|已归档|关闭|否|no|false|n)$/i.test(s)) return 0;
+  return 1;
+}
+
+/**
+ * 项目导入落库：
+ *   duplicate_action = 'overwrite' 时覆盖同编号项目的其余字段；'skip' 跳过已存在的；
+ *   未指定且存在重复 → 返回 dup 让前端确认。
+ */
+function performProjectImport(rows, action) {
+  const existMap = new Map(db.prepare('SELECT id, project_no FROM projects').all().map((p) => [p.project_no, p.id]));
+  let inserted = 0;
+  let overwritten = 0;
+  let skipped = 0;
+  const errors = [];
+  const dupRows = [];
+  const seenInFile = new Set();
+
+  db.exec('BEGIN');
+  try {
+    rows.forEach((raw, i) => {
+      const line = i + 2;
+      const project_no = String(raw.project_no || '').trim();
+      if (!project_no) {
+        errors.push(`第 ${line} 行：缺少项目编号`);
+        return;
+      }
+      if (seenInFile.has(project_no)) {
+        errors.push(`第 ${line} 行：项目编号 ${project_no} 在文件中重复出现`);
+        return;
+      }
+      seenInFile.add(project_no);
+
+      const id = existMap.get(project_no);
+      if (id) {
+        if (!action) {
+          dupRows.push({ line, project_no, existingId: id });
+          return;
+        }
+        if (action === 'skip') {
+          skipped++;
+          return;
+        }
+        // overwrite：仅覆盖文件里实际提供的字段
+        const patch = {};
+        for (const k of ['product_code', 'project_type', 'description']) {
+          const v = raw[k];
+          if (v === null || v === undefined || String(v).trim() === '') continue;
+          patch[k] = String(v).trim();
+        }
+        if ('status' in raw && String(raw.status).trim() !== '') patch.status = parseStatus(raw.status);
+        patch.updated_at = nowStr();
+        if (Object.keys(patch).length > 1) {
+          update('projects', id, patch, { touch: false });
+          overwritten++;
+        } else {
+          skipped++;
+        }
+        return;
+      }
+
+      const row = {
+        project_no,
+        product_code: String(raw.product_code || '').trim(),
+        project_type: String(raw.project_type || '').trim(),
+        description: String(raw.description || '').trim() || null,
+        status: 'status' in raw ? parseStatus(raw.status) : 1,
+      };
+      const miss = [];
+      if (!row.product_code) miss.push('产品代码');
+      if (!row.project_type) miss.push('项目类型');
+      if (miss.length) {
+        errors.push(`第 ${line} 行：${miss.join('、')}不能为空`);
+        return;
+      }
+      insert('projects', row);
+      existMap.set(project_no, 1);
+      inserted++;
+    });
+
+    if (dupRows.length > 0) {
+      db.exec('ROLLBACK');
+      return {
+        dup: { mode: 'project', count: dupRows.length, total: rows.length, rows: dupRows.slice(0, 50) },
+      };
+    }
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+
+  return { result: { inserted, overwritten, skipped, failed: errors.length, errors: errors.slice(0, 20) } };
 }
 
 /** 把查询参数转成 WHERE 条件（多选支持逗号分隔） */
@@ -1179,6 +1352,19 @@ async function handleApi(req, res, url) {
     }
   }
   if (p === '/api/projects/export' && m === 'GET') return exportProjectsXlsx(res, q);
+  // 项目列表导入：与数据导入一致，仅管理员可操作（项目档案的增删改本来就是管理员权限）
+  if (p === '/api/projects/template' && m === 'GET') {
+    if (!isAdmin(user)) return fail(res, 403, '仅管理员可导入项目');
+    return exportProjectTemplateXlsx(res);
+  }
+  if (p === '/api/projects/import-file' && m === 'POST') {
+    if (!isAdmin(user)) return fail(res, 403, '仅管理员可导入项目');
+    return previewProjectImportFile(res, req, user);
+  }
+  if (p === '/api/projects/import-confirm' && m === 'POST') {
+    if (!isAdmin(user)) return fail(res, 403, '仅管理员可导入项目');
+    return importByToken(res, await readBody(req), user);
+  }
   if (seg[0] === 'projects' && seg[1]) {
     const id = Number(seg[1]);
     if (m === 'GET') return getProject(res, id);

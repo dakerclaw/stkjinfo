@@ -194,7 +194,8 @@ async function renderProjects() {
   const f = state.projects.filters;
   actions().innerHTML = `
     <button class="btn" onclick="exportProjects()">导出 Excel</button>
-    ${canManageProjects() ? `<button class="btn btn-primary" onclick="openProjectModal()">
+    ${canManageProjects() ? `<button class="btn" onclick="openProjectImport()">导入 Excel</button>
+    <button class="btn btn-primary" onclick="openProjectModal()">
       <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>新增项目
     </button>` : ''}`;
 
@@ -815,6 +816,151 @@ function bulkDelete() {
       state.data.selected.clear();
       closeModal(); toast(`已删除 ${r.deleted} 条记录`, 'ok'); loadData();
     } catch (e) { toast(e.message, 'err'); }
+  });
+}
+
+/** 项目列表导入：Excel 上传 → 服务端解析 → 预览 → 确认 */
+function openProjectImport() {
+  if (!canManageProjects()) return toast('仅管理员可导入项目', 'err');
+  openModal({
+    title: '导入项目列表',
+    sub: '支持 .xlsx 文件；项目编号、产品代码、项目类型为必填，项目简介与状态可选',
+    body: `
+      <div style="background:var(--primary-weak);border-radius:9px;padding:11px 13px;font-size:12.5px;color:#1e4fbf;line-height:1.75;margin-bottom:14px">
+        <b>三项必填</b>：项目编号、产品代码、项目类型。项目简介可留空，状态填「启用 / 停用」（留空视为启用）。<br>
+        项目编号在系统中唯一，重复时由你选择<b>覆盖已有项目</b>或<b>跳过</b>。<br>
+        <b>仅支持 .xlsx</b>（Excel 2007 及以上）。若是 .xls 或 .csv，请先用 Excel 另存为 .xlsx。
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+        <input type="file" id="excelFile" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" class="input" style="height:auto;padding:8px;flex:1;min-width:220px" />
+        <button class="btn btn-sm" onclick="downloadFile('/api/projects/template')">下载导入模板</button>
+      </div>
+      <div id="importPreview"></div>`,
+    footer: `<button class="btn" onclick="closeModal()">取消</button>
+      <button class="btn btn-primary" id="okImport" disabled>开始导入</button>`,
+  });
+
+  el('#excelFile').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    const prev = el('#importPreview');
+    if (!file) return;
+    if (!/\.xlsx$/i.test(file.name)) {
+      prev.innerHTML = `<div style="color:var(--danger);font-size:12.5px">
+        仅支持 .xlsx 格式。请先用 Excel / WPS 打开后「另存为」Excel 工作簿（.xlsx）再上传。
+      </div>`;
+      el('#okImport').disabled = true;
+      return;
+    }
+
+    prev.innerHTML = `<div style="color:var(--text-3);font-size:12.5px">正在解析 ${esc(file.name)} …</div>`;
+    el('#okImport').disabled = true;
+
+    let info;
+    try {
+      const buf = await file.arrayBuffer();
+      info = await API.postRaw('/api/projects/import-file', buf);
+    } catch (err) {
+      prev.innerHTML = `<div style="color:var(--danger);font-size:12.5px">${esc(err.message)}</div>`;
+      return;
+    }
+
+    const { matched = [], unknown = [], missingRequired = [], blankLabels = [] } = info;
+    prev.innerHTML = `
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px">
+        <div style="background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:9px 11px">
+          <div style="font-size:11.5px;color:var(--text-3)">数据行</div>
+          <div style="font-size:19px;font-weight:650">${info.rowCount}</div>
+        </div>
+        <div style="background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:9px 11px">
+          <div style="font-size:11.5px;color:var(--text-3)">新增</div>
+          <div style="font-size:19px;font-weight:650;color:var(--ok,#16a34a)">${info.willInsert}</div>
+        </div>
+        <div style="background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:9px 11px">
+          <div style="font-size:11.5px;color:var(--text-3)">编号已存在</div>
+          <div style="font-size:19px;font-weight:650;color:${info.willDup ? 'var(--warn)' : 'var(--text)'}">${info.willDup}</div>
+        </div>
+      </div>
+      <div style="font-size:12.5px;line-height:1.9;color:var(--text-2)">
+        <div><b style="color:var(--text)">识别到的列：</b>
+          <span style="color:var(--text-3)">${matched.map((m) => esc(m.col)).join('、') || '无'}</span></div>
+        ${blankLabels.length ? `<div><b style="color:var(--text)">未提供的列（将留空）：</b>
+          <span style="color:var(--text-3)">${blankLabels.map(esc).join('、')}</span></div>` : ''}
+        ${unknown.length ? `<div style="margin-top:6px"><b style="color:var(--warn)">无法识别的列（将被忽略）：</b> ${unknown.map(esc).join('、')}</div>` : ''}
+        ${missingRequired.length ? `<div style="margin-top:8px;color:var(--danger);font-weight:600">缺少必填表头：${missingRequired.map(esc).join('、')}，请补充后重新选择文件。</div>` : ''}
+      </div>`;
+
+    el('#okImport').disabled = missingRequired.length > 0 || info.rowCount === 0;
+    el('#okImport')._token = info.token;
+  });
+
+  el('#okImport').addEventListener('click', async () => {
+    const token = el('#okImport')._token;
+    if (!token) return toast('请先选择 Excel 文件', 'err');
+
+    const runImport = (dupAction) =>
+      API.post('/api/projects/import-confirm', dupAction ? { token, duplicate_action: dupAction } : { token });
+
+    const done = async (r, note) => {
+      closeModal();
+      let msg;
+      if (note) msg = note;
+      else {
+        const parts = [`新增 ${r.inserted} 个`];
+        if (r.overwritten) parts.push(`覆盖 ${r.overwritten} 个`);
+        if (r.skipped) parts.push(`跳过 ${r.skipped} 个`);
+        if (r.failed) parts.push(`失败 ${r.failed} 个`);
+        msg = `导入完成：${parts.join('、')}`;
+      }
+      toast(msg, r.failed ? 'err' : 'ok');
+      if (r.errors && r.errors.length) setTimeout(() => alert('部分行导入失败：\n' + r.errors.join('\n')), 300);
+      await refreshMeta();
+      loadProjects();
+    };
+
+    try {
+      await done(await runImport());
+    } catch (e) {
+      if (e.status === 409 && e.code === 'DUPLICATE_KEY') {
+        const info = e.payload.duplicate || {};
+        const rowsHtml = (info.rows || []).length
+          ? `<div class="dup-rows"><table>
+              <thead><tr><th>Excel 行号</th><th>项目编号</th></tr></thead>
+              <tbody>${(info.rows || []).slice(0, 8).map((d) => `<tr>
+                <td>${esc(d.line)}</td><td>${esc(d.project_no)}</td></tr>`).join('')}
+              </tbody></table>
+              ${info.count > 8 ? `<div class="dup-more">另有 ${info.count - 8} 行未列出</div>` : ''}</div>`
+          : '';
+        openModal({
+          title: `有 ${info.count || 0} 个项目编号已存在`,
+          narrow: true,
+          body: `
+            <div class="dup-box">
+              <div class="dup-icon">!</div>
+              <div class="dup-text">
+                <p class="dup-lead">以下项目编号在系统中已经存在（共 ${info.count || 1} 个，本次共 ${info.total || info.count || 0} 行待导入）。</p>
+                ${rowsHtml}
+              </div>
+            </div>
+            <p class="dup-hint">
+              <b>覆盖已有</b>：用本次文件中的内容更新已有项目（项目编号不变）<br />
+              <b>跳过已存在</b>：只导入新编号，已有的保持不变
+            </p>`,
+          footer: `<button class="btn" onclick="closeModal()">取消</button>
+            <button class="btn" id="dupSkip">跳过已存在</button>
+            <button class="btn btn-primary" id="dupOverwrite">覆盖已有</button>`,
+        });
+        const pick = (choice) => {
+          closeModal();
+          runImport(choice).then((r) => done(r, choice === 'overwrite'
+            ? `导入完成：覆盖 ${r.overwritten} 个、新增 ${r.inserted} 个`
+            : `导入完成：跳过 ${r.skipped} 个、新增 ${r.inserted} 个`)).catch((err) => toast(err.message, 'err'));
+        };
+        el('#dupOverwrite').addEventListener('click', () => pick('overwrite'));
+        el('#dupSkip').addEventListener('click', () => pick('skip'));
+        return;
+      }
+      toast(e.message, 'err');
+    }
   });
 }
 
