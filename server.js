@@ -250,19 +250,33 @@ function exportProjectsXlsx(res, params) {
   const { clause, args } = buildFilters(params, ['project_no', 'product_code', 'project_type']);
   const parts = [clause ? clause.replace(/^ WHERE /, '') : ''];
   const allArgs = [...args];
+  const st = (params.get('status') || '').trim();
+  if (st !== '') {
+    const vals = st.split(',').map((s) => s.trim()).filter((s) => s === '0' || s === '1');
+    if (vals.length) {
+      parts.push(`p.status IN (${vals.map(() => '?').join(',')})`);
+      allArgs.push(...vals.map(Number));
+    }
+  }
   const q = params.get('q');
   if (q && q.trim()) {
-    parts.push("(project_no LIKE ? OR product_code LIKE ? OR project_type LIKE ? OR IFNULL(description,'') LIKE ?)");
+    parts.push("(p.project_no LIKE ? OR p.product_code LIKE ? OR p.project_type LIKE ? OR IFNULL(p.description,'') LIKE ?)");
     const like = `%${q.trim()}%`;
     allArgs.push(like, like, like, like);
   }
   const where = parts.filter(Boolean).length ? ` WHERE ${parts.filter(Boolean).join(' AND ')}` : '';
+  // 导出与列表同口径：同样的筛选 + 排序
+  const sortable = new Set([
+    'project_no', 'product_code', 'project_type', 'description', 'status',
+    'id', 'created_at', 'updated_at', 'data_count', 'last_entry',
+  ]);
+  const aliasKeys = new Set(['data_count', 'last_entry']);
   const rows = db
     .prepare(
       `SELECT p.*,
               (SELECT COUNT(*) FROM project_data d WHERE d.project_no = p.project_no) AS data_count,
               (SELECT MAX(d.entry_date) FROM project_data d WHERE d.project_no = p.project_no) AS last_entry
-       FROM projects p${where} ORDER BY p.id DESC`
+       FROM projects p${where}${buildOrder(params, ' ORDER BY p.id DESC', sortable, 'p.', aliasKeys)}`
     )
     .all(...allArgs);
   const header = ['项目编号', '产品代码', '项目类型', '项目简介', '数据量', '最新录入日期', '状态'];
@@ -270,7 +284,7 @@ function exportProjectsXlsx(res, params) {
     header,
     ...rows.map((r) => [
       cell(r.project_no), cell(r.product_code), cell(r.project_type), cell(r.description),
-      Number(r.data_count || 0), cell(r.last_entry), r.status === 0 ? '停用' : '启用',
+      Number(r.data_count || 0), cell(r.last_entry), r.status === 0 ? '已归档' : '进行中',
     ]),
   ];
   sendXlsx(res, xlsx.build(table, '项目列表'), `项目列表_${todayStr()}.xlsx`);
@@ -463,7 +477,7 @@ const PROJECT_IMPORT_FIELDS = [
 function exportProjectTemplateXlsx(res) {
   const table = [
     PROJECT_IMPORT_FIELDS.map((f) => f.label),
-    ['PJ-2026-001', 'GC-A1', '量产', '示例：客户定制规格，按工单全程追溯', '启用'],
+    ['PJ-2026-001', 'GC-A1', '量产', '示例：客户定制规格，按工单全程追溯', '进行中'],
   ];
   sendXlsx(res, xlsx.build(table, '导入模板'), `项目列表导入模板_${todayStr()}.xlsx`);
 }
@@ -614,14 +628,31 @@ function buildFilters(params, allowed) {
   return { clause: where.length ? ` WHERE ${where.join(' AND ')}` : '', args };
 }
 
-function buildOrder(params, defaultOrder) {
+/**
+ * 生成 ORDER BY 子句。
+ *   allowed  ：允许排序的列（必须是白名单内的标识符，防注入）
+ *   defaultOrder：未指定或列不合法时的默认排序
+ * 处理三件事：
+ *   1. NULL 统一排最后，且不随方向翻转（`col IS NULL` 永为 0/1 升序）
+ *   2. 用 id 兜底，保证同值时顺序稳定、翻页不跳动
+ *   3. 数值列显式 CAST，避免字符串列按字典序排（"10" < "9"）
+ */
+function buildOrder(params, defaultOrder, allowed, prefix = '', aliasKeys = null) {
   const sort = params.get('sort');
-  const dirRaw = (params.get('dir') || 'asc').toLowerCase();
-  const dir = dirRaw === 'desc' ? 'DESC' : 'ASC';
-  // created_by / updated_by 为系统字段，允许按录入人排序（不参与导入导出）
-  const allowedSort = new Set([...FIELDS.map((f) => f.key), 'id', 'created_by', 'updated_by', 'created_at', 'updated_at']);
-  if (sort && allowedSort.has(sort)) return ` ORDER BY ${sort} IS NULL, ${sort} ${dir}`;
-  return defaultOrder;
+  const dir = (params.get('dir') || 'asc').toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+  const allow = allowed || new Set([...FIELDS.map((f) => f.key), 'id', 'created_by', 'updated_by', 'created_at', 'updated_at']);
+  if (!sort || !allow.has(sort)) return defaultOrder;
+
+  // 数值型列：status 是整型，其余按 FIELDS 声明判断
+  const numericKeys = new Set(['status', 'id']);
+  for (const f of FIELDS) if (f.type === 'number') numericKeys.add(f.key);
+  // 查询里定义的别名不能加表前缀（p.data_count 会找不到列）
+  const isAlias = !!(aliasKeys && aliasKeys.has(sort));
+  const col = isAlias ? sort : `${prefix}${sort}`;
+  const expr = numericKeys.has(sort) ? `CAST(${col} AS REAL)` : col;
+
+  // id 兜底方向与主排序一致，让「降序」看起来是整体倒序而不是每组内部正序
+  return ` ORDER BY ${col} IS NULL ASC, ${expr} ${dir}, ${prefix}id ${dir}`;
 }
 
 const DATA_KEYS = FIELDS.map((f) => f.key);
@@ -754,9 +785,19 @@ function listProjects(res, params, user) {
   const parts = [clause ? clause.replace(/^ WHERE /, '') : ''];
   const allArgs = [...args];
 
+  // 状态筛选：1 进行中 / 0 已归档，只接受这两个值
+  const st = (params.get('status') || '').trim();
+  if (st !== '') {
+    const vals = st.split(',').map((s) => s.trim()).filter((s) => s === '0' || s === '1');
+    if (vals.length) {
+      parts.push(`p.status IN (${vals.map(() => '?').join(',')})`);
+      allArgs.push(...vals.map(Number));
+    }
+  }
+
   const q = params.get('q');
   if (q && q.trim()) {
-    parts.push('(project_no LIKE ? OR product_code LIKE ? OR project_type LIKE ? OR IFNULL(description,\'\') LIKE ?)');
+    parts.push(`(p.project_no LIKE ? OR p.product_code LIKE ? OR p.project_type LIKE ? OR IFNULL(p.description,'') LIKE ?)`);
     const like = `%${q.trim()}%`;
     allArgs.push(like, like, like, like);
   }
@@ -767,12 +808,20 @@ function listProjects(res, params, user) {
   const own = of ? ` AND ${of.sql}` : '';
   const ownArgs = of ? [of.arg] : [];
 
+  // data_count / last_entry 是查询里定义的别名，同样允许排序
+  const sortable = new Set([
+    'project_no', 'product_code', 'project_type', 'description', 'status',
+    'id', 'created_at', 'updated_at',
+    'data_count', 'last_entry',
+  ]);
+  const aliasKeys = new Set(['data_count', 'last_entry']);
+
   const rows = db
     .prepare(
       `SELECT p.*,
               (SELECT COUNT(*) FROM project_data d WHERE d.project_no = p.project_no${own}) AS data_count,
               (SELECT MAX(d.entry_date) FROM project_data d WHERE d.project_no = p.project_no${own}) AS last_entry
-       FROM projects p${where}${buildOrder(params, ' ORDER BY p.id DESC')}`
+       FROM projects p${where}${buildOrder(params, ' ORDER BY p.id DESC', sortable, 'p.', aliasKeys)}`
     )
     .all(...ownArgs, ...ownArgs, ...allArgs);
   ok(res, { rows, total: rows.length });

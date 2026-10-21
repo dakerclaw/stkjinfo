@@ -113,7 +113,7 @@ function debounce(fn, ms = 260) {
 /* ------------------------------------------------------------ 导航 */
 const VIEWS = {
   dashboard: { title: '总览', sub: '项目库与检测数据概览', render: renderDashboard },
-  projects: { title: '项目列表', sub: '按项目编号、产品代码、项目类型筛选项目', render: renderProjects },
+  projects: { title: '项目列表', sub: '按项目编号、产品代码、项目类型、状态筛选项目', render: renderProjects },
   data: { title: '项目数据', sub: '按项目编号、产品代码、所属公司、工序、工单号、焦种筛选', render: renderData },
   users: { title: '用户管理', sub: '系统账号与权限信息', render: renderUsers },
 };
@@ -211,6 +211,13 @@ async function renderProjects() {
         <div class="field w-140"><label>项目类型</label>
           <select class="select" id="fType"><option value="">全部</option>${(state.meta.options.types || []).map((v) => `<option ${f.project_type === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>
         </div>
+        <div class="field w-120"><label>状态</label>
+          <select class="select" id="fStatus">
+            <option value="">全部</option>
+            <option value="1" ${f.status === '1' ? 'selected' : ''}>进行中</option>
+            <option value="0" ${f.status === '0' ? 'selected' : ''}>已归档</option>
+          </select>
+        </div>
         <div class="field w-220"><label>关键词</label>
           <input class="input" id="fKw" placeholder="搜索编号/代码/简介" value="${esc(f.q || '')}" />
         </div>
@@ -223,7 +230,7 @@ async function renderProjects() {
 
   const bind = () => {
     const run = debounce(() => { collectProjectFilters(); loadProjects(); }, 220);
-    ['fPno', 'fPc', 'fType'].forEach((id) => el('#' + id).addEventListener('change', () => { collectProjectFilters(); loadProjects(); }));
+    ['fPno', 'fPc', 'fType', 'fStatus'].forEach((id) => el('#' + id).addEventListener('change', () => { collectProjectFilters(); loadProjects(); }));
     el('#fKw').addEventListener('input', run);
   };
   bind();
@@ -235,6 +242,7 @@ function collectProjectFilters() {
     project_no: el('#fPno').value,
     product_code: el('#fPc').value,
     project_type: el('#fType').value,
+    status: el('#fStatus').value,
     q: el('#fKw').value.trim(),
   };
 }
@@ -262,13 +270,15 @@ async function loadProjects() {
     ['project_no', '项目编号'], ['product_code', '产品代码'], ['project_type', '项目类型'],
     ['description', '项目简介'], ['data_count', '数据条数'], ['last_entry', '最近录入'], ['status', '状态'], ['act', '操作'],
   ];
+  // 可排序列：编号 / 产品代码 / 数据条数 / 最近录入 / 状态
+  const SORTABLE = new Set(['project_no', 'product_code', 'data_count', 'last_entry', 'status']);
   const sorted = state.projects.sort;
   box.innerHTML = `
     <div class="table-wrap" style="max-height:calc(100vh - 340px)">
       <table class="data-table">
         <thead><tr>
-          ${cols.map(([k, label]) => k === 'data_count' || k === 'last_entry'
-            ? `<th class="sortable ${sorted === k ? 'sorted' : ''}" data-sort="${k}">${label}<span class="arrow">${sorted === k ? (state.projects.dir === 'asc' ? '▲' : '▼') : '↕'}</span></th>`
+          ${cols.map(([k, label]) => SORTABLE.has(k)
+            ? `<th class="sortable ${sorted === k ? 'sorted' : ''}" data-sort="${k}" title="点击切换升序 / 降序">${label}<span class="arrow">${sorted === k ? (state.projects.dir === 'asc' ? '▲' : '▼') : '↕'}</span></th>`
             : `<th>${label}</th>`).join('')}
         </tr></thead>
         <tbody>
@@ -298,8 +308,13 @@ async function loadProjects() {
   box.querySelectorAll('th.sortable').forEach((th) => {
     th.addEventListener('click', () => {
       const k = th.dataset.sort;
-      if (state.projects.sort === k) state.projects.dir = state.projects.dir === 'asc' ? 'desc' : 'asc';
-      else { state.projects.sort = k; state.projects.dir = 'desc'; }
+      if (state.projects.sort === k) {
+        state.projects.dir = state.projects.dir === 'asc' ? 'desc' : 'asc';
+      } else {
+        state.projects.sort = k;
+        // 文本列首次点击按升序（A→Z、编号从小到大），数值/日期列按降序（多的、近的在前）
+        state.projects.dir = /^(project_no|product_code)$/.test(k) ? 'asc' : 'desc';
+      }
       loadProjects();
     });
   });
@@ -319,6 +334,8 @@ function exportProjects() {
   const f = state.projects.filters;
   const qs = new URLSearchParams();
   Object.entries(f).forEach(([k, v]) => { if (v) qs.set(k, v); });
+  // 导出口径与当前列表一致：带上筛选 + 排序
+  if (state.projects.sort) { qs.set('sort', state.projects.sort); qs.set('dir', state.projects.dir); }
   downloadFile('/api/projects/export?' + qs.toString());
   toast('项目列表已导出', 'ok');
 }
@@ -840,7 +857,7 @@ function openProjectImport() {
     sub: '支持 .xlsx 文件；项目编号、产品代码、项目类型为必填，项目简介与状态可选',
     body: `
       <div style="background:var(--primary-weak);border-radius:9px;padding:11px 13px;font-size:12.5px;color:#1e4fbf;line-height:1.75;margin-bottom:14px">
-        <b>三项必填</b>：项目编号、产品代码、项目类型。项目简介可留空，状态填「启用 / 停用」（留空视为启用）。<br>
+        <b>三项必填</b>：项目编号、产品代码、项目类型。项目简介可留空，状态填「进行中 / 已归档」（留空视为进行中）。<br>
         项目编号在系统中唯一，重复时由你选择<b>覆盖已有项目</b>或<b>跳过</b>。<br>
         <b>仅支持 .xlsx</b>（Excel 2007 及以上）。若是 .xls 或 .csv，请先用 Excel 另存为 .xlsx。
       </div>
