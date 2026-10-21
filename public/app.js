@@ -1,0 +1,1513 @@
+'use strict';
+/* ============================================================
+   项目管理应用 - 前端逻辑
+   ============================================================ */
+
+const API = {
+  async req(method, url, body) {
+    const res = await fetch(url, {
+      method,
+      credentials: 'same-origin',
+      headers: body ? { 'Content-Type': 'application/json' } : {},
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    let data = {};
+    try { data = await res.json(); } catch { /* ignore */ }
+    // 会话失效：回到登录页
+    if (res.status === 401 && !url.startsWith('/api/auth/login')) {
+      showLogin('登录已失效，请重新登录');
+      throw new Error(data.message || '未登录');
+    }
+    if (!res.ok || data.success === false) {
+      const err = new Error(data.message || `请求失败 (${res.status})`);
+      err.status = res.status;
+      err.code = data.code;
+      err.payload = data;
+      throw err;
+    }
+    return data;
+  },
+  get: (u) => API.req('GET', u),
+  post: (u, b) => API.req('POST', u, b || {}),
+  put: (u, b) => API.req('PUT', u, b),
+  del: (u) => API.req('DELETE', u),
+};
+
+/* ------------------------------------------------------------ 全局状态 */
+const state = {
+  view: 'dashboard',
+  user: null,
+  meta: null,
+  projects: { filters: {}, sort: '', dir: 'asc' },
+  data: { filters: {}, sort: '', dir: 'asc', page: 1, pageSize: 20, selected: new Set() },
+  users: { rows: [] },
+};
+
+/** 权限判断（与后端 meta.permissions 保持一致） */
+const can = () => (state.meta && state.meta.permissions) || {};
+const canManageProjects = () => !!can().canManageProjects;
+const canDeleteData = () => !!can().canDeleteData;
+const canManageUsers = () => !!can().canManageUsers;
+const canManageAdmins = () => !!can().canManageAdmins;
+const seeAllData = () => !!can().seeAllData;
+
+const el = (sel) => document.querySelector(sel);
+const content = () => el('#content');
+const actions = () => el('#topbarActions');
+
+/* ------------------------------------------------------------ 工具 */
+function esc(s) {
+  if (s === null || s === undefined) return '';
+  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+function fmtNum(v, digits = 4) {
+  if (v === null || v === undefined || v === '') return '<span class="empty-num">—</span>';
+  const n = Number(v);
+  if (!Number.isFinite(n)) return esc(v);
+  const s = Math.abs(n) >= 1000 ? n.toLocaleString('zh-CN', { maximumFractionDigits: 2 }) : String(Number(n.toPrecision(8)));
+  return s;
+}
+function toast(msg, type = '') {
+  const root = el('#toastRoot');
+  const t = document.createElement('div');
+  t.className = 'toast ' + type;
+  t.textContent = msg;
+  root.appendChild(t);
+  setTimeout(() => { t.style.transition = 'opacity .25s'; t.style.opacity = '0'; setTimeout(() => t.remove(), 260); }, 2400);
+}
+function typeClass(t) {
+  const s = String(t || '');
+  if (/锂|负极|石墨|正极|材料/.test(s)) return '';
+  if (/中试|试验|研发/.test(s)) return 'green';
+  if (/量产|生产|工业/.test(s)) return 'amber';
+  return 'gray';
+}
+function debounce(fn, ms = 260) {
+  let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); };
+}
+
+/* ------------------------------------------------------------ 导航 */
+const VIEWS = {
+  dashboard: { title: '总览', sub: '项目库与检测数据概览', render: renderDashboard },
+  projects: { title: '项目列表', sub: '按项目编号、产品代码、项目类型筛选项目', render: renderProjects },
+  data: { title: '项目数据', sub: '按项目编号、产品代码、生产基地、工序代码、工单编号筛选', render: renderData },
+  users: { title: '用户管理', sub: '系统账号与权限信息', render: renderUsers },
+};
+
+function navigate(view) {
+  state.view = view;
+  document.querySelectorAll('.nav-item').forEach((n) => n.classList.toggle('active', n.dataset.view === view));
+  el('#viewTitle').textContent = VIEWS[view].title;
+  el('#viewSub').textContent = VIEWS[view].sub;
+  actions().innerHTML = '';
+  VIEWS[view].render();
+}
+
+/* ============================================================
+   总览
+   ============================================================ */
+async function renderDashboard() {
+  content().innerHTML = `<div class="stat-grid">${'<div class="stat"><div class="skeleton" style="height:60px"></div></div>'.repeat(4)}</div>`;
+  const { stats } = await API.get('/api/stats');
+
+  const maxType = Math.max(1, ...stats.byType.map((r) => r.value));
+  const maxBase = Math.max(1, ...stats.byBase.map((r) => r.value));
+
+  content().innerHTML = `
+    <div class="stat-grid">
+      ${statCard('项目总数', stats.projectCount, '个', '项目库中登记的项目')}
+      ${statCard('项目数据记录', stats.dataCount, '条', '所有检测/生产数据')}
+      ${statCard('项目类型', stats.typeCount, '类', '已覆盖的项目类型')}
+      ${statCard('累计生产数量', stats.qtySum.toLocaleString('zh-CN', { maximumFractionDigits: 2 }), '', `覆盖 ${stats.baseCount} 个生产基地`)}
+    </div>
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-head"><h3>最近录入的数据</h3><button class="btn btn-sm btn-ghost" onclick="navigate('data')">查看全部 →</button></div>
+        <div class="card-body" style="padding-top:6px;padding-bottom:6px">
+          ${stats.recent.length
+            ? stats.recent.map((r) => `
+              <div class="recent-item">
+                <div>
+                  <span class="code-chip">${esc(r.project_no)}</span>
+                  <span style="margin-left:8px;font-weight:550">${esc(r.product_code)}</span>
+                  ${r.work_order ? `<span class="meta" style="margin-left:8px">工单 ${esc(r.work_order)}</span>` : ''}
+                </div>
+                <div class="meta">${esc(r.entry_date || '')} · ${fmtNum(r.quantity)}</div>
+              </div>`).join('')
+            : `<div class="empty" style="padding:32px"><p>暂无数据记录</p><span>前往「项目数据」新增第一条记录</span></div>`}
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>项目类型分布</h3></div>
+        <div class="card-body">
+          ${stats.byType.length ? `<div class="bar-list">${stats.byType.map((r) => barItem(r.name, r.value, maxType)).join('')}</div>`
+            : `<div class="empty" style="padding:24px"><p>暂无项目</p></div>`}
+        </div>
+      </div>
+    </div>
+    <div class="card" style="margin-top:14px">
+      <div class="card-head"><h3>生产基地数据分布</h3></div>
+      <div class="card-body">
+        ${stats.byBase.length ? `<div class="bar-list">${stats.byBase.map((r) => barItem(r.name, r.value, maxBase)).join('')}</div>`
+          : `<div class="empty" style="padding:24px"><p>暂无生产基地数据</p></div>`}
+      </div>
+    </div>`;
+}
+function statCard(label, val, unit, hint) {
+  return `<div class="stat"><label>${label}</label><div class="val">${val}${unit ? `<small>${unit}</small>` : ''}</div><div class="hint">${esc(hint)}</div></div>`;
+}
+function barItem(name, value, max) {
+  return `<div class="bar-item">
+    <div class="bar-label"><span>${esc(name)}</span><b>${value}</b></div>
+    <div class="bar-track"><div class="bar-fill" style="width:${(value / max) * 100}%"></div></div>
+  </div>`;
+}
+
+/* ============================================================
+   项目列表
+   ============================================================ */
+async function renderProjects() {
+  const f = state.projects.filters;
+  actions().innerHTML = `
+    <button class="btn" onclick="exportProjects()">导出 CSV</button>
+    ${canManageProjects() ? `<button class="btn btn-primary" onclick="openProjectModal()">
+      <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>新增项目
+    </button>` : ''}`;
+
+  content().innerHTML = `
+    <div class="filters">
+      <div class="filter-row">
+        <div class="field w-160"><label>项目编号</label>
+          <select class="select" id="fPno"><option value="">全部</option>${(state.meta.options.projectNos || []).map((v) => `<option ${f.project_no === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>
+        </div>
+        <div class="field w-160"><label>产品代码</label>
+          <select class="select" id="fPc"><option value="">全部</option>${(state.meta.options.productCodes || []).map((v) => `<option ${f.product_code === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>
+        </div>
+        <div class="field w-140"><label>项目类型</label>
+          <select class="select" id="fType"><option value="">全部</option>${(state.meta.options.types || []).map((v) => `<option ${f.project_type === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>
+        </div>
+        <div class="field w-220"><label>关键词</label>
+          <input class="input" id="fKw" placeholder="搜索编号/代码/简介" value="${esc(f.q || '')}" />
+        </div>
+        <div class="filter-actions">
+          <button class="btn btn-ghost" onclick="clearProjectFilters()">重置</button>
+        </div>
+      </div>
+    </div>
+    <div class="card"><div id="projectTable"><div class="card-body"><div class="skeleton" style="height:200px"></div></div></div></div>`;
+
+  const bind = () => {
+    const run = debounce(() => { collectProjectFilters(); loadProjects(); }, 220);
+    ['fPno', 'fPc', 'fType'].forEach((id) => el('#' + id).addEventListener('change', () => { collectProjectFilters(); loadProjects(); }));
+    el('#fKw').addEventListener('input', run);
+  };
+  bind();
+  loadProjects();
+}
+
+function collectProjectFilters() {
+  state.projects.filters = {
+    project_no: el('#fPno').value,
+    product_code: el('#fPc').value,
+    project_type: el('#fType').value,
+    q: el('#fKw').value.trim(),
+  };
+}
+function clearProjectFilters() {
+  state.projects.filters = {};
+  state.projects.sort = '';
+  renderProjects();
+}
+
+async function loadProjects() {
+  const f = state.projects.filters;
+  const qs = new URLSearchParams();
+  Object.entries(f).forEach(([k, v]) => { if (v) qs.set(k, v); });
+  if (state.projects.sort) { qs.set('sort', state.projects.sort); qs.set('dir', state.projects.dir); }
+  const { rows, total } = await API.get('/api/projects?' + qs.toString());
+
+  const box = el('#projectTable');
+  if (!rows.length) {
+    box.innerHTML = `<div class="empty">
+      <div class="ico"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></div>
+      <p>没有符合条件的项目</p><span>调整筛选条件，或新增一个项目</span></div>`;
+    return;
+  }
+  const cols = [
+    ['project_no', '项目编号'], ['product_code', '产品代码'], ['project_type', '项目类型'],
+    ['description', '项目简介'], ['data_count', '数据条数'], ['last_entry', '最近录入'], ['status', '状态'], ['act', '操作'],
+  ];
+  const sorted = state.projects.sort;
+  box.innerHTML = `
+    <div class="table-wrap" style="max-height:calc(100vh - 340px)">
+      <table class="data-table">
+        <thead><tr>
+          ${cols.map(([k, label]) => k === 'data_count' || k === 'last_entry'
+            ? `<th class="sortable ${sorted === k ? 'sorted' : ''}" data-sort="${k}">${label}<span class="arrow">${sorted === k ? (state.projects.dir === 'asc' ? '▲' : '▼') : '↕'}</span></th>`
+            : `<th>${label}</th>`).join('')}
+        </tr></thead>
+        <tbody>
+          ${rows.map((r) => `<tr>
+            <td class="col-sticky"><span class="code-chip">${esc(r.project_no)}</span></td>
+            <td>${esc(r.product_code)}</td>
+            <td><span class="type-tag ${typeClass(r.project_type)}">${esc(r.project_type)}</span></td>
+            <td class="wrap dim">${esc(r.description || '')}</td>
+            <td class="num">${r.data_count ? `<a href="javascript:;" onclick="gotoDataForProject('${esc(r.project_no)}')" style="color:var(--primary);text-decoration:none;font-weight:550">${r.data_count}</a>` : '<span class="empty-num">0</span>'}</td>
+            <td class="dim">${esc(r.last_entry || '—')}</td>
+            <td><span class="status-tag ${r.status ? 'on' : 'off'}">${r.status ? '进行中' : '已归档'}</span></td>
+            <td>
+              <div class="row-actions">
+                ${canManageProjects()
+                  ? `<button class="btn btn-sm btn-ghost" onclick="openProjectModal(${r.id})">编辑</button>
+                     <button class="btn btn-sm btn-ghost" style="color:var(--danger)" onclick="confirmDeleteProject(${r.id}, '${esc(r.project_no)}', ${r.data_count})">删除</button>`
+                  : `<button class="btn btn-sm btn-ghost" onclick="gotoDataForProject('${esc(r.project_no)}')">查看数据</button>`}
+              </div>
+            </td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+    <div class="pagination"><span>共 <b>${total}</b> 个项目</span></div>`;
+
+  box.querySelectorAll('th.sortable').forEach((th) => {
+    th.addEventListener('click', () => {
+      const k = th.dataset.sort;
+      if (state.projects.sort === k) state.projects.dir = state.projects.dir === 'asc' ? 'desc' : 'asc';
+      else { state.projects.sort = k; state.projects.dir = 'desc'; }
+      loadProjects();
+    });
+  });
+}
+
+function gotoDataForProject(pno) {
+  state.data.filters = { project_no: pno };
+  state.data.page = 1;
+  navigate('data');
+}
+
+function exportProjects() {
+  const rows = [['项目编号', '产品代码', '项目类型', '项目简介', '状态', '创建时间']];
+  const f = state.projects.filters;
+  const qs = new URLSearchParams();
+  Object.entries(f).forEach(([k, v]) => { if (v) qs.set(k, v); });
+  API.get('/api/projects?' + qs.toString()).then(({ rows: list }) => {
+    list.forEach((r) => rows.push([r.project_no, r.product_code, r.project_type, r.description || '', r.status ? '进行中' : '已归档', r.created_at]));
+    downloadCsv(rows, '项目列表');
+  });
+}
+
+/* ---------- 项目弹窗 ---------- */
+function openProjectModal(id) {
+  const editing = !!id;
+  const load = editing ? API.get('/api/projects/' + id).then((r) => r.row) : Promise.resolve({ status: 1 });
+  load.then((row) => {
+    openModal({
+      title: editing ? '编辑项目' : '新增项目',
+      sub: editing ? `项目编号 ${row.project_no}` : '登记一个新的项目到项目库',
+      narrow: true,
+      body: `
+        <div class="form-grid" style="grid-template-columns:1fr 1fr">
+          <div class="field"><label class="req">项目编号</label><input class="input" id="pNo" value="${esc(row.project_no || '')}" placeholder="如 PJ-2026-001" /></div>
+          <div class="field"><label class="req">产品代码</label><input class="input" id="pCode" value="${esc(row.product_code || '')}" placeholder="如 PROD-A1" /></div>
+          <div class="field"><label class="req">项目类型</label><input class="input" id="pType" list="typeList" value="${esc(row.project_type || '')}" placeholder="如 研发/中试/量产" />
+            <datalist id="typeList">${(state.meta.options.types || []).map((t) => `<option value="${esc(t)}">`).join('')}</datalist>
+          </div>
+          <div class="field"><label>状态</label><select class="select" id="pStatus">
+            <option value="1" ${row.status ? 'selected' : ''}>进行中</option>
+            <option value="0" ${!row.status ? 'selected' : ''}>已归档</option>
+          </select></div>
+          <div class="field full" style="grid-column:1/-1"><label>项目简介</label>
+            <textarea class="input" id="pDesc" placeholder="简要描述项目背景、目标与范围">${esc(row.description || '')}</textarea>
+          </div>
+        </div>`,
+      footer: `<button class="btn" onclick="closeModal()">取消</button>
+        <button class="btn btn-primary" id="pSave">${editing ? '保存修改' : '创建项目'}</button>`,
+    });
+    el('#pSave').addEventListener('click', async () => {
+      const body = {
+        project_no: el('#pNo').value.trim(),
+        product_code: el('#pCode').value.trim(),
+        project_type: el('#pType').value.trim(),
+        description: el('#pDesc').value.trim(),
+        status: Number(el('#pStatus').value),
+      };
+      if (!body.project_no || !body.product_code || !body.project_type) return toast('请填写项目编号、产品代码、项目类型', 'err');
+      try {
+        if (editing) await API.put('/api/projects/' + id, body);
+        else await API.post('/api/projects', body);
+        closeModal();
+        toast(editing ? '项目已更新' : '项目已创建', 'ok');
+        await refreshMeta();
+        loadProjects();
+      } catch (e) { toast(e.message, 'err'); }
+    });
+  });
+}
+
+function confirmDeleteProject(id, pno, dataCount) {
+  openModal({
+    title: '删除项目', narrow: true,
+    body: `<p style="margin:0 0 8px">确定删除项目 <b>${esc(pno)}</b> 吗？</p>
+      ${dataCount ? `<p style="margin:0;color:var(--danger);font-size:13px">该项目下还有 <b>${dataCount}</b> 条数据记录，删除项目会同时删除这些记录，此操作不可恢复。</p>`
+        : `<p style="margin:0;color:var(--text-3);font-size:13px">该项目暂无数据记录。</p>`}`,
+    footer: `<button class="btn" onclick="closeModal()">取消</button>
+      <button class="btn btn-danger" id="okDel">确认删除</button>`,
+  });
+  el('#okDel').addEventListener('click', async () => {
+    try {
+      const r = await API.del('/api/projects/' + id);
+      closeModal(); toast(`已删除项目${r.removedData ? `及其 ${r.removedData} 条数据` : ''}`, 'ok');
+      await refreshMeta(); loadProjects();
+    } catch (e) { toast(e.message, 'err'); }
+  });
+}
+
+/* ============================================================
+   项目数据
+   ============================================================ */
+const F = () => state.meta.fields;
+const NUM_FIELDS = () => F().filter((f) => f.type === 'number');
+const TEXT_FIELDS = () => F().filter((f) => f.type !== 'number');
+
+async function renderData() {
+  const f = state.data.filters;
+  const o = state.meta.options;
+  actions().innerHTML = `
+    <button class="btn" onclick="openImport()">导入 CSV</button>
+    <button class="btn" onclick="exportData()">导出 CSV</button>
+    <button class="btn btn-primary" onclick="openDataModal()">
+      <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>新增数据
+    </button>`;
+
+  content().innerHTML = `
+    ${seeAllData() ? '' : `<div class="perm-note">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16.5v.01"/></svg>
+      <span>你当前的角色为<b>普通用户</b>，仅显示<b>你自己录入</b>的数据。可新增与修改，删除需联系管理员。</span>
+    </div>`}
+    <div class="filters">
+      <div class="filter-row">
+        <div class="field w-160"><label>项目编号</label>
+          <select class="select" id="dPno"><option value="">全部</option>${o.projectNos.map((v) => `<option ${f.project_no === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>
+        </div>
+        <div class="field w-160"><label>产品代码</label>
+          <select class="select" id="dPc"><option value="">全部</option>${o.productCodes.map((v) => `<option ${f.product_code === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>
+        </div>
+        <div class="field w-140"><label>生产基地</label>
+          <select class="select" id="dBase"><option value="">全部</option>${o.bases.map((v) => `<option ${f.base === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>
+        </div>
+        <div class="field w-140"><label>工序代码</label>
+          <select class="select" id="dProc"><option value="">全部</option>${o.processes.map((v) => `<option ${f.process_code === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>
+        </div>
+        <div class="field w-140"><label>工单编号</label>
+          <select class="select" id="dWo"><option value="">全部</option>${o.workOrders.map((v) => `<option ${f.work_order === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>
+        </div>
+        <div class="field w-160"><label>关键词</label>
+          <input class="input" id="dKw" placeholder="模糊搜索…" value="${esc(f.q || '')}" />
+        </div>
+        <div class="filter-actions">
+          <button class="btn btn-ghost" onclick="clearDataFilters()">重置</button>
+        </div>
+      </div>
+      <div class="filter-row" style="margin-top:10px">
+        <div class="field w-160"><label>录入日期 起</label><input class="input" type="date" id="dFrom" value="${esc(f.date_from || '')}" /></div>
+        <div class="field w-160"><label>录入日期 止</label><input class="input" type="date" id="dTo" value="${esc(f.date_to || '')}" /></div>
+        <div class="filter-actions">
+          <label style="display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--text-2);cursor:pointer">
+            <input type="checkbox" id="onlySel" style="accent-color:var(--primary)" ${state.data.onlySelected ? 'checked' : ''}/> 仅显示已选
+          </label>
+          <button class="btn btn-sm btn-danger" id="bulkDel" style="display:none" onclick="bulkDelete()">删除选中 (<span id="selCount">0</span>)</button>
+        </div>
+      </div>
+    </div>
+    <div class="card"><div id="dataTable"><div class="card-body"><div class="skeleton" style="height:240px"></div></div></div></div>`;
+
+  const collect = () => {
+    state.data.filters = {
+      project_no: el('#dPno').value,
+      product_code: el('#dPc').value,
+      base: el('#dBase').value,
+      process_code: el('#dProc').value,
+      work_order: el('#dWo').value,
+      q: el('#dKw').value.trim(),
+      date_from: el('#dFrom').value,
+      date_to: el('#dTo').value,
+    };
+    state.data.page = 1;
+  };
+  const reload = () => { collect(); loadData(); };
+  ['dPno', 'dPc', 'dBase', 'dProc', 'dWo', 'dFrom', 'dTo'].forEach((id) => el('#' + id).addEventListener('change', reload));
+  el('#dKw').addEventListener('input', debounce(reload, 240));
+  el('#onlySel').addEventListener('change', (e) => { state.data.onlySelected = e.target.checked; loadData(); });
+
+  loadData();
+}
+
+function clearDataFilters() {
+  state.data.filters = {};
+  state.data.page = 1;
+  state.data.selected.clear();
+  renderData();
+}
+
+async function loadData() {
+  const qs = new URLSearchParams();
+  Object.entries(state.data.filters).forEach(([k, v]) => { if (v) qs.set(k, v); });
+  qs.set('page', state.data.page);
+  qs.set('pageSize', state.data.pageSize);
+  if (state.data.sort) { qs.set('sort', state.data.sort); qs.set('dir', state.data.dir); }
+
+  const { rows: allRows, total, page, pageSize } = await API.get('/api/data?' + qs.toString());
+  const rows = state.data.onlySelected && state.data.selected.size
+    ? allRows.filter((r) => state.data.selected.has(r.id))
+    : allRows;
+
+  const box = el('#dataTable');
+  if (!box) return; // 视图尚未挂载（例如切换页面过程中）
+  if (!allRows.length) {
+    box.innerHTML = `<div class="empty">
+      <div class="ico"><svg viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg></div>
+      <p>没有符合条件的数据</p><span>调整筛选条件，或新增/导入数据</span></div>`;
+    return;
+  }
+
+  const cols = NUM_FIELDS().map((f) => f.key);
+  const sorted = state.data.sort;
+  const arrow = (k) => sorted === k ? (state.data.dir === 'asc' ? '▲' : '▼') : '↕';
+
+  box.innerHTML = `
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead>
+          <tr>
+            ${canDeleteData() ? '<th class="col-sticky" style="width:40px"><input type="checkbox" id="checkAll" style="accent-color:var(--primary)" /></th>' : ''}
+            <th class="${canDeleteData() ? '' : 'col-sticky'}">录入人</th>
+            ${F().map((f) => `<th class="sortable ${sorted === f.key ? 'sorted' : ''}" data-sort="${f.key}">${esc(f.label)}<span class="arrow">${arrow(f.key)}</span></th>`).join('')}
+            <th style="position:sticky;right:0;background:var(--surface-2);z-index:3">操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows.map((r) => {
+            const mine = r.created_by_id === state.user.id;
+            return `<tr>
+            ${canDeleteData() ? `<td class="col-sticky"><input type="checkbox" class="rowChk" data-id="${r.id}" style="accent-color:var(--primary)" ${state.data.selected.has(r.id) ? 'checked' : ''} /></td>` : ''}
+            <td class="${canDeleteData() ? '' : 'col-sticky'}"><span class="owner-chip ${mine ? 'me' : ''}">${esc(r.created_by || '—')}${mine ? '（我）' : ''}</span></td>
+            ${F().map((f) => {
+              const v = r[f.key];
+              if (f.key === 'project_no') return `<td><span class="code-chip">${esc(v)}</span></td>`;
+              if (f.key === 'remark') return `<td class="wrap dim">${esc(v || '')}</td>`;
+              if (f.key === 'entry_date') return `<td class="dim">${esc(v || '—')}</td>`;
+              if (f.type === 'number') return `<td class="num">${fmtNum(v)}</td>`;
+              return `<td>${esc(v || '—')}</td>`;
+            }).join('')}
+            <td style="position:sticky;right:0;background:var(--surface);border-left:1px solid var(--border)">
+              <div class="row-actions">
+                <button class="btn btn-sm btn-ghost" onclick="openDataModal(${r.id})">编辑</button>
+                ${canDeleteData() ? `<button class="btn btn-sm btn-ghost" style="color:var(--danger)" onclick="confirmDeleteData(${r.id})">删除</button>` : ''}
+              </div>
+            </td>
+          </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+    </div>
+    ${renderPagination(total, page, pageSize)}
+    <div style="padding:0 16px 12px"><span class="scroll-hint">↔ 表格可横向滚动查看全部 ${F().length} 个指标字段${canDeleteData() ? '' : ' · 删除操作需管理员权限'}</span></div>`;
+
+  // 排序
+  box.querySelectorAll('th.sortable').forEach((th) => {
+    th.addEventListener('click', () => {
+      const k = th.dataset.sort;
+      if (state.data.sort === k) state.data.dir = state.data.dir === 'asc' ? 'desc' : 'asc';
+      else { state.data.sort = k; state.data.dir = 'asc'; }
+      loadData();
+    });
+  });
+
+  // 选择
+  box.querySelectorAll('.rowChk').forEach((cb) => {
+    cb.addEventListener('change', () => {
+      const id = Number(cb.dataset.id);
+      cb.checked ? state.data.selected.add(id) : state.data.selected.delete(id);
+      updateSelCount();
+    });
+  });
+  el('#checkAll')?.addEventListener('change', (e) => {
+    box.querySelectorAll('.rowChk').forEach((cb) => {
+      cb.checked = e.target.checked;
+      const id = Number(cb.dataset.id);
+      e.target.checked ? state.data.selected.add(id) : state.data.selected.delete(id);
+    });
+    updateSelCount();
+  });
+  updateSelCount();
+
+  // 分页
+  box.querySelectorAll('.page-btn[data-page]').forEach((b) => {
+    b.addEventListener('click', () => { state.data.page = Number(b.dataset.page); loadData(); });
+  });
+}
+
+function updateSelCount() {
+  const n = state.data.selected.size;
+  const c = el('#selCount');
+  if (c) c.textContent = n;
+  const b = el('#bulkDel');
+  if (b) b.style.display = n && canDeleteData() ? 'inline-flex' : 'none';
+}
+
+function renderPagination(total, page, pageSize) {
+  const pages = Math.max(1, Math.ceil(total / pageSize));
+  const nums = [];
+  const push = (n) => { if (!nums.includes(n) && n >= 1 && n <= pages) nums.push(n); };
+  push(1); push(page - 1); push(page); push(page + 1); push(pages);
+  const list = [...new Set(nums)].sort((a, b) => a - b);
+  let html = '';
+  let prev = 0;
+  for (const n of list) {
+    if (prev && n - prev > 1) html += `<span style="color:var(--text-3);padding:0 2px">…</span>`;
+    html += `<button class="page-btn ${n === page ? 'active' : ''}" data-page="${n}">${n}</button>`;
+    prev = n;
+  }
+  return `<div class="pagination">
+    <span>共 <b>${total}</b> 条 · 第 ${page}/${pages} 页</span>
+    <div class="page-btns">
+      <button class="page-btn" data-page="${page - 1}" ${page <= 1 ? 'disabled' : ''}>上一页</button>
+      ${html}
+      <button class="page-btn" data-page="${page + 1}" ${page >= pages ? 'disabled' : ''}>下一页</button>
+    </div>
+  </div>`;
+}
+
+/* ---------- 数据录入弹窗 ---------- */
+function openDataModal(id) {
+  const editing = !!id;
+  const load = editing ? API.get('/api/data/' + id).then((r) => r.row) : Promise.resolve({ entry_date: new Date().toISOString().slice(0, 10) });
+  load.then((row) => {
+    const groups = [
+      { title: '基础信息', keys: ['project_no', 'product_code', 'base', 'process_code', 'work_order'] },
+      { title: '粒度分布 (μm)', keys: ['dx0', 'dx1', 'dx10', 'dx50', 'dx90', 'dx99', 'dx100', 'k_value'] },
+      { title: '物性指标', keys: ['tap_density', 'true_density', 'ssa_domestic', 'ssa_mic', 'graphitization', 'magnetic', 'ph_value', 'oversize', 'oil_absorption', 'hgi'] },
+      { title: '电化学性能', keys: ['capacity', 'lithium_inter', 'lithium_deint', 'first_eff'] },
+      { title: '粉压 (5点法)', keys: ['press_0_5t', 'press_1t', 'press_1_5t', 'press_2t', 'press_5t'] },
+      { title: '工业分析', keys: ['moisture_fp', 'ash', 'volatile', 'moisture', 'sulfur', 'caking_index', 'coking_value'] },
+      { title: '生产信息', keys: ['efficiency', 'yield_rate', 'quantity', 'entry_date', 'remark'] },
+    ];
+    const fieldMap = new Map(F().map((f) => [f.key, f]));
+    const used = new Set(groups.flatMap((g) => g.keys));
+    const others = F().filter((f) => !used.has(f.key));
+    if (others.length) groups.push({ title: '其他', keys: others.map((f) => f.key) });
+
+    const inputFor = (key) => {
+      const f = fieldMap.get(key);
+      if (!f) return '';
+      const v = row[key];
+      const val = v === null || v === undefined ? '' : v;
+      const required = key === 'project_no' ? ' req' : '';
+      if (key === 'remark') {
+        return `<div class="field" style="grid-column:1/-1"><label>${f.label}</label><textarea class="input" id="d_${key}" rows="2">${esc(val)}</textarea></div>`;
+      }
+      if (key === 'project_no') {
+        const opts = state.meta.options.projectNos.map((p) => `<option ${p === val ? 'selected' : ''}>${esc(p)}</option>`).join('');
+        return `<div class="field"><label class="req">${f.label}</label>
+          <input class="input" id="d_${key}" list="pnoList" value="${esc(val)}" placeholder="选择或输入项目编号" autocomplete="off" />
+          <datalist id="pnoList">${opts}</datalist>
+          <span id="pnoHint" style="font-size:11px;color:var(--text-3)"></span></div>`;
+      }
+      // 产品代码：由项目编号自动带出，只读
+      if (key === 'product_code') {
+        return `<div class="field"><label>${f.label}</label>
+          <input class="input" id="d_${key}" value="${esc(val)}" readonly
+            style="background:var(--surface-2);color:var(--text-2);cursor:not-allowed" placeholder="随项目编号自动带出" />
+          <span style="font-size:11px;color:var(--text-3)">自动同步</span></div>`;
+      }
+      const listId = { base: 'baseList', process_code: 'procList', work_order: 'woList' }[key];
+      const listOpts = listId
+        ? `<datalist id="${listId}">${(state.meta.options[{ base: 'bases', process_code: 'processes', work_order: 'workOrders' }[key]] || []).map((o) => `<option value="${esc(o)}">`).join('')}</datalist>`
+        : '';
+      const type = f.type === 'number' ? 'number' : f.type === 'date' ? 'date' : 'text';
+      const step = f.type === 'number' ? ' step="any"' : '';
+      return `<div class="field"><label class="${required.trim()}">${f.label}</label>
+        <input class="input" type="${type}"${step} id="d_${key}" value="${esc(val)}" placeholder="${f.type === 'number' ? '数值' : ''}" />${listOpts}</div>`;
+    };
+
+    openModal({
+      title: editing ? '编辑数据记录' : '新增数据记录',
+      sub: editing ? `工单 ${row.work_order || '—'} · 录入 ${row.entry_date || ''}` : '填写检测与生产数据，数值项留空表示未检测',
+      wide: true,
+      body: `<div class="form-grid" style="grid-template-columns:repeat(auto-fill,minmax(180px,1fr))">
+        ${groups.map((g) => `<div class="form-section-title">${g.title}</div>${g.keys.map(inputFor).join('')}`).join('')}
+      </div>`,
+      footer: `<div class="left">共 ${F().length} 个字段</div>
+        <button class="btn" onclick="closeModal()">取消</button>
+        <button class="btn btn-primary" id="dSave">${editing ? '保存修改' : '保存记录'}</button>`,
+    });
+
+    // 项目编号 → 产品代码 自动带出（以项目档案为准）
+    const pnoInput = el('#d_project_no');
+    const pcInput = el('#d_product_code');
+    const hint = el('#pnoHint');
+    const syncProduct = () => {
+      const pno = pnoInput.value.trim();
+      const map = state.meta.projectMap || [];
+      const hit = map.find((p) => p.project_no === pno);
+      if (hit) {
+        pcInput.value = hit.product_code;
+        pcInput.style.color = 'var(--text-2)';
+        if (hint) { hint.textContent = `已关联项目 ${pno}`; hint.style.color = 'var(--success)'; }
+      } else {
+        pcInput.value = '';
+        if (pno) {
+          if (hint) { hint.textContent = '项目不存在，请先在项目列表创建'; hint.style.color = 'var(--danger)'; }
+        } else if (hint) { hint.textContent = ''; }
+      }
+    };
+    pnoInput?.addEventListener('change', syncProduct);
+    pnoInput?.addEventListener('input', syncProduct);
+
+    el('#dSave').addEventListener('click', async () => {
+      const body = {};
+      for (const f of F()) {
+        const inp = el('#d_' + f.key);
+        if (!inp) continue;
+        body[f.key] = inp.value.trim();
+      }
+      if (!body.project_no) return toast('请填写项目编号', 'err');
+      if (!body.product_code) return toast('项目编号不存在，请选择项目列表中已有的项目', 'err');
+
+      const save = async (dupAction) => {
+        const payload = dupAction ? { ...body, duplicate_action: dupAction } : body;
+        return editing ? API.put('/api/data/' + id, payload) : API.post('/api/data', payload);
+      };
+
+      try {
+        await save();
+        closeModal();
+        toast(editing ? '记录已更新' : '记录已保存', 'ok');
+        await refreshMeta();
+        loadData();
+      } catch (e) {
+        if (e.status === 409 && e.code === 'DUPLICATE_KEY') {
+          // 五项全部相同 → 询问覆盖还是追加
+          const info = e.payload.duplicate || {};
+          askDuplicateAction({
+            title: '系统已有相同数据',
+            key: info.key || '',
+            count: info.count || 1,
+            extra: info.created_by ? `已有记录由「${info.created_by}」于 ${info.entry_date || '—'} 录入` : '',
+            onChoice: async (choice) => {
+              try {
+                const r = await save(choice);
+                toast(choice === 'overwrite' ? '已覆盖原有记录' : '已追加为新记录', 'ok');
+                await refreshMeta();
+                loadData();
+                return r;
+              } catch (err) { toast(err.message, 'err'); throw err; }
+            },
+          });
+          return;
+        }
+        toast(e.message, 'err');
+      }
+    });
+  });
+}
+
+/**
+ * 重复数据确认弹窗：覆盖导入 / 追加导入
+ * choice 回调收到 'overwrite' | 'append'
+ */
+function askDuplicateAction({ title, key, count, extra, rowsHtml, onChoice }) {
+  openModal({
+    title: title || '数据重复',
+    narrow: true,
+    body: `
+      <div class="dup-box">
+        <div class="dup-icon">!</div>
+        <div class="dup-text">
+          <p class="dup-lead">项目编号 + 产品代码 + 生产基地 + 工序代码 + 工单编号 五项完全相同，系统中已存在 ${count || 1} 条此类数据。</p>
+          ${key ? `<p class="dup-key">${esc(key)}</p>` : ''}
+          ${extra ? `<p class="dup-extra">${esc(extra)}</p>` : ''}
+          ${rowsHtml || ''}
+        </div>
+      </div>
+      <p class="dup-hint">
+        <b>覆盖导入</b>：用本次填写的数据更新已有记录（保留原录入人与记录编号）<br />
+        <b>追加导入</b>：作为一条新记录保存，已有记录不变
+      </p>`,
+    footer: `<button class="btn" onclick="closeModal()">取消</button>
+      <button class="btn" id="dupAppend">追加导入</button>
+      <button class="btn btn-primary" id="dupOverwrite">覆盖导入</button>`,
+  });
+
+  const pick = (choice) => {
+    closeModal();
+    onChoice(choice);
+  };
+  el('#dupOverwrite').addEventListener('click', () => pick('overwrite'));
+  el('#dupAppend').addEventListener('click', () => pick('append'));
+}
+
+function confirmDeleteData(id) {
+  openModal({
+    title: '删除数据记录', narrow: true,
+    body: `<p style="margin:0;color:var(--text-2)">确定删除这条数据记录吗？此操作不可恢复。</p>`,
+    footer: `<button class="btn" onclick="closeModal()">取消</button><button class="btn btn-danger" id="okDel">确认删除</button>`,
+  });
+  el('#okDel').addEventListener('click', async () => {
+    try {
+      await API.del('/api/data/' + id);
+      state.data.selected.delete(id);
+      closeModal(); toast('已删除', 'ok'); loadData();
+    } catch (e) { toast(e.message, 'err'); }
+  });
+}
+
+function bulkDelete() {
+  const ids = [...state.data.selected];
+  if (!ids.length) return;
+  openModal({
+    title: '批量删除', narrow: true,
+    body: `<p style="margin:0;color:var(--text-2)">确定删除选中的 <b>${ids.length}</b> 条数据记录吗？此操作不可恢复。</p>`,
+    footer: `<button class="btn" onclick="closeModal()">取消</button><button class="btn btn-danger" id="okDel">确认删除</button>`,
+  });
+  el('#okDel').addEventListener('click', async () => {
+    try {
+      const r = await API.post('/api/data/bulk-delete', { ids });
+      state.data.selected.clear();
+      closeModal(); toast(`已删除 ${r.deleted} 条记录`, 'ok'); loadData();
+    } catch (e) { toast(e.message, 'err'); }
+  });
+}
+
+/* ---------- CSV 导出 / 导入 ---------- */
+function downloadCsv(rows, filename) {
+  const csv = rows.map((r) => r.map((c) => {
+    const s = c === null || c === undefined ? '' : String(c);
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  }).join(',')).join('\r\n');
+  const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `${filename}_${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+async function exportData() {
+  const qs = new URLSearchParams();
+  Object.entries(state.data.filters).forEach(([k, v]) => { if (v) qs.set(k, v); });
+  qs.set('pageSize', 500);
+  const all = [];
+  let page = 1;
+  while (true) {
+    qs.set('page', page);
+    const { rows, total } = await API.get('/api/data?' + qs.toString());
+    all.push(...rows);
+    if (all.length >= total || rows.length === 0) break;
+    page++;
+  }
+  const rows = [F().map((f) => f.label), ...all.map((r) => F().map((f) => r[f.key]))];
+  downloadCsv(rows, '项目数据');
+  toast(`已导出 ${all.length} 条记录`, 'ok');
+}
+
+/* ---------- 导入：列名识别与空值归一化 ---------- */
+
+/** 列名归一化：去空白、去括号及单位、统一小写，容错「振实密度(g/cm3)」「Dx（50）」等写法 */
+function normHeader(h) {
+  let s = String(h || '')
+    // 只转换全角标点，避免 ³、² 等字符被改写
+    .replace(/[\uFF01-\uFF5E]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
+    .replace(/\u3000/g, ' ')
+    // 去括号及括号内内容，仅当内容含「单位/字母/符号」时；纯数字括号（Dx(50)）保留
+    .replace(/[(\[{【](?=[^)\]}】]*[a-zA-Zµμ%\/])[^)\]}】]*[)\]}】]/g, '')
+    .replace(/\s+/g, '')
+    .replace(/[·•\-_]/g, '')
+    .replace(/[()（）\uFF08\uFF09]/g, '')
+    .toLowerCase();
+  // 去掉末尾游离的单位片段，如 振实密度g/cm3、容量mah/g、效率%、收率%
+  s = s.replace(/(g\/cm3|g\/cm2|mah\/g|m2\/g|g\/ml|cm3\/g|μm|um|nm|%)+$/g, '');
+  // 注意：不可去掉末尾数字，Dx(50) 的 50 是粒径标识
+  return s;
+}
+
+/** 建立「列名 → 字段 key」映射表 */
+function buildHeaderMap() {
+  const map = new Map();
+  for (const f of F()) {
+    map.set(normHeader(f.label), f.key);
+    map.set(normHeader(f.key), f.key);
+    // Dx(n) 精确形式额外登记：dx50 / DX(50) / dx_50
+    const m = /^dx(\d+)$/.exec(f.key);
+    if (m) {
+      const n = m[1];
+      map.set('dx' + n, f.key);
+      map.set('dx(' + n + ')', f.key);
+      map.set('dx（' + n + '）', f.key);
+      map.set('d' + n, f.key); // D50 简写
+    }
+  }
+  // 常见别名
+  const alias = {
+    生产基地: ['基地', '工厂', '生产厂区'],
+    工序代码: ['工序'],
+    工单编号: ['工单号', '工单'],
+    振实密度: ['振实'],
+    比表国产: ['比表面积国产', '国产比表', 'bet国产'],
+    比表麦克: ['比表面积麦克', '麦克比表', 'bet麦克'],
+    石墨化度: ['石墨化'],
+    首次效率: ['首效', '首效率'],
+    磁性物质: ['磁性物', '磁性异物'],
+    ph值: ['ph'],
+    真密度: ['真比重'],
+    筛上物: ['筛余'],
+    成品水分: ['成品水份'],
+    水分: ['水份'],
+    硫分: ['硫份', '全硫'],
+    黏结指数: ['粘结指数', 'g值'],
+    吸油值: ['吸油量', '吸油率'],
+    结焦值: ['结焦'],
+    哈氏可磨指数: ['可磨指数', 'hgi'],
+    生产数量: ['数量', '产量'],
+    录入日期: ['日期', '检测日期'],
+    备注: ['说明', '备注信息'],
+  };
+  for (const [label, list] of Object.entries(alias)) {
+    const key = map.get(normHeader(label));
+    if (!key) continue;
+    for (const a of list) if (!map.has(normHeader(a))) map.set(normHeader(a), key);
+  }
+  return map;
+}
+
+/** 空值判定：空串、纯空格、-、/、N/A、null、未检、未测 等一律视为未提供 */
+const isBlank = (v) =>
+  v === null || v === undefined ||
+  /^(|\s*|-{1,2}|\/|—|n\/?a|null|nan|无|未检|未检测|未测|待检|\/\/)$/i.test(String(v).trim());
+
+/**
+ * 把一行 CSV 对象按表头映射为字段对象。
+ * 未出现的列、空值、非数字文本都不会写入 → 数据库中自动留空（NULL）。
+ */
+function mapImportRow(raw, headerMap, fieldByLabel) {
+  const out = {};
+  const skipped = [];
+  for (const [col, val] of Object.entries(raw)) {
+    const key = headerMap.get(normHeader(col));
+    if (!key) continue;
+    if (isBlank(val)) continue; // 空值留空
+    const meta = fieldByLabel.get(key);
+    if (meta && meta.type === 'number') {
+      const n = Number(String(val).replace(/[,，\s%]/g, '').replace(/[<>≤≥]/g, ''));
+      if (!Number.isFinite(n)) { skipped.push(`${col}=${val}`); continue; } // 非数字留空
+      out[key] = n;
+    } else {
+      out[key] = String(val).trim();
+    }
+  }
+  return { out, skipped };
+}
+
+function openImport() {
+  const fieldByLabel = new Map(F().map((f) => [f.key, f]));
+  openModal({
+    title: '导入 CSV 数据',
+    sub: '指标字段可只填一部分，未填写或未提供的指标将自动留空',
+    body: `
+      <div style="background:var(--primary-weak);border-radius:9px;padding:11px 13px;font-size:12.5px;color:#1e4fbf;line-height:1.75;margin-bottom:14px">
+        <b>部分字段即可导入</b>：无需凑齐 ${F().length} 个字段，只要包含<b>项目编号</b>和<b>产品代码</b>，其余指标可任意缺省。<br>
+        表头可用中文列名或字段名，兼容 <code>Dx（50）</code>、<code>振实密度(g/cm³)</code>、<code>首效</code> 等写法；空格、<code>-</code>、<code>N/A</code> 视为未提供。
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+        <input type="file" id="csvFile" accept=".csv,text/csv" class="input" style="height:auto;padding:8px;flex:1;min-width:220px" />
+        <button class="btn btn-sm" onclick="openTemplatePicker()">选择字段生成模板</button>
+      </div>
+      <div id="importPreview"></div>`,
+    footer: `<button class="btn" onclick="closeModal()">取消</button>
+      <button class="btn btn-primary" id="okImport" disabled>开始导入</button>`,
+  });
+
+  let parsed = [];
+  el('#csvFile').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    const prev = el('#importPreview');
+    if (!file) return;
+    const text = await file.text();
+    parsed = parseCsv(text.replace(/^\uFEFF/, ''));
+    // 去掉完全空白的尾部行
+    while (parsed.length && parsed[parsed.length - 1].every((c) => isBlank(c))) parsed.pop();
+
+    if (parsed.length < 2) {
+      prev.innerHTML = `<div style="color:var(--danger);font-size:12.5px">文件为空或只有表头，请检查内容。</div>`;
+      parsed = [];
+      el('#okImport').disabled = true;
+      return;
+    }
+
+    const headers = parsed[0];
+    const headerMap = buildHeaderMap();
+    const matched = [], unknown = [];
+    headers.forEach((h) => {
+      if (!String(h).trim()) return;
+      const key = headerMap.get(normHeader(h));
+      key ? matched.push({ col: h, key }) : unknown.push(h);
+    });
+
+    const missingRequired = ['项目编号', '产品代码'].filter(
+      (label) => !headers.some((h) => headerMap.get(normHeader(h)) === F().find((f) => f.label === label).key)
+    );
+    const dataRows = parsed.slice(1).filter((r) => r.some((c) => !isBlank(c)));
+
+    // 列数校验提示
+    const badCols = dataRows.filter((r) => r.length !== headers.length).length;
+
+    prev.innerHTML = `
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px">
+        <div style="background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:9px 11px">
+          <div style="font-size:11.5px;color:var(--text-3)">数据行</div>
+          <div style="font-size:19px;font-weight:650">${dataRows.length}</div>
+        </div>
+        <div style="background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:9px 11px">
+          <div style="font-size:11.5px;color:var(--text-3)">识别到的指标字段</div>
+          <div style="font-size:19px;font-weight:650">${matched.length} <span style="font-size:12px;color:var(--text-3);font-weight:400">/ ${F().length}</span></div>
+        </div>
+      </div>
+      <div style="font-size:12.5px;line-height:1.9;color:var(--text-2)">
+        <div><b style="color:var(--text)">将留空的指标（${F().length - matched.length} 项）：</b>
+          <span style="color:var(--text-3)">${F().filter((f) => !matched.some((m) => m.key === f.key)).map((f) => f.label).join('、') || '无'}</span>
+        </div>
+        ${unknown.length ? `<div style="margin-top:6px"><b style="color:var(--warn)">无法识别的列（将被忽略）：</b> ${unknown.map(esc).join('、')}</div>` : ''}
+        ${badCols ? `<div style="margin-top:6px;color:var(--warn)"><b>注意：</b>${badCols} 行的列数与表头不一致，多出的列会被忽略，缺少的列将留空。</div>` : ''}
+        ${missingRequired.length ? `<div style="margin-top:8px;color:var(--danger);font-weight:600">缺少必填表头：${missingRequired.join('、')}，请补充后重新选择文件。</div>` : ''}
+      </div>`;
+
+    el('#okImport').disabled = missingRequired.length > 0;
+    el('#okImport')._payload = { headers, rows: dataRows, headerMap, fieldByLabel };
+  });
+
+  el('#okImport').addEventListener('click', async () => {
+    const p = el('#okImport')._payload;
+    if (!p) return toast('请先选择 CSV 文件', 'err');
+    const { headers, rows, headerMap, fieldByLabel } = p;
+
+    let skippedTotal = 0;
+    const rowsOut = rows.map((r) => {
+      const raw = {};
+      headers.forEach((h, i) => { raw[h] = r[i]; });
+      const { out, skipped } = mapImportRow(raw, headerMap, fieldByLabel);
+      skippedTotal += skipped.length;
+      return out;
+    }).filter((o) => o.project_no || o.product_code);
+
+    if (!rowsOut.length) return toast('没有可导入的有效数据行', 'err');
+
+    const runImport = async (dupAction) => {
+      const payload = dupAction ? { rows: rowsOut, duplicate_action: dupAction } : { rows: rowsOut };
+      return API.post('/api/data/import', payload);
+    };
+
+    const done = async (r, note) => {
+      closeModal();
+      let msg = note || `导入成功 ${r.inserted} 条`;
+      if (r.overwritten && !note) msg = `导入完成：覆盖 ${r.overwritten} 条、新增 ${r.inserted} 条`;
+      if (r.failed) msg += `，失败 ${r.failed} 条`;
+      if (skippedTotal) msg += `；${skippedTotal} 个非数值内容已留空`;
+      toast(msg, r.failed ? 'err' : 'ok');
+      if (r.blankFields && r.blankFields.length) {
+        setTimeout(() => alert(
+          `导入完成：成功 ${r.inserted} 条${r.overwritten ? `，覆盖 ${r.overwritten} 条` : ''}${r.failed ? `，失败 ${r.failed} 条` : ''}\n\n` +
+          `以下 ${r.blankFields.length} 个字段在所有记录中均未提供，已自动留空：\n` +
+          r.blankFields.join('、')
+        ), 300);
+      }
+      if (r.errors && r.errors.length) setTimeout(() => alert('部分行导入失败：\n' + r.errors.join('\n')), 300);
+      await refreshMeta();
+      loadData();
+    };
+
+    try {
+      const r = await runImport();
+      await done(r);
+    } catch (e) {
+      if (e.status === 409 && e.code === 'DUPLICATE_KEY') {
+        const info = e.payload.duplicate || {};
+        const rowsHtml = (info.rows || []).length
+          ? `<div class="dup-rows"><table>
+              <thead><tr><th>CSV 行号</th><th>项目编号</th><th>生产基地</th><th>工序代码</th><th>工单编号</th></tr></thead>
+              <tbody>${(info.rows || []).slice(0, 8).map((d) => `<tr>
+                <td>${esc(d.line)}</td><td>${esc(d.project_no)}</td><td>${esc(d.base || '—')}</td>
+                <td>${esc(d.process_code || '—')}</td><td>${esc(d.work_order || '—')}</td></tr>`).join('')}
+              </tbody></table>
+              ${info.count > 8 ? `<div class="dup-more">另有 ${info.count - 8} 行重复未列出</div>` : ''}</div>`
+          : '';
+        askDuplicateAction({
+          title: `有 ${info.count || 0} 行数据重复`,
+          key: '',
+          count: info.count || 0,
+          extra: `本次共 ${info.total || rowsOut.length} 行待导入`,
+          rowsHtml,
+          onChoice: async (choice) => {
+            try {
+              const r = await runImport(choice);
+              await done(r, choice === 'overwrite'
+                ? `导入完成：覆盖 ${r.overwritten} 条、新增 ${r.inserted} 条`
+                : `导入完成：追加 ${r.inserted} 条（重复行已作为新记录保存）`);
+            } catch (err) { toast(err.message, 'err'); throw err; }
+          },
+        });
+        return;
+      }
+      toast(e.message, 'err');
+    }
+  });
+}
+
+/** 按勾选字段生成 CSV 模板（含一行示例），用于部分指标导入 */
+function openTemplatePicker() {
+  const groups = [
+    { title: '基础（必选）', keys: ['project_no', 'product_code', 'base', 'process_code', 'work_order'] },
+    { title: '粒度', keys: ['dx0', 'dx1', 'dx10', 'dx50', 'dx90', 'dx99', 'dx100', 'k_value'] },
+    { title: '物性', keys: ['tap_density', 'true_density', 'ssa_domestic', 'ssa_mic', 'graphitization', 'magnetic', 'ph_value', 'oversize', 'oil_absorption', 'hgi'] },
+    { title: '电化学', keys: ['capacity', 'lithium_inter', 'lithium_deint', 'first_eff'] },
+    { title: '粉压', keys: ['press_0_5t', 'press_1t', 'press_1_5t', 'press_2t', 'press_5t'] },
+    { title: '工业分析', keys: ['moisture_fp', 'ash', 'volatile', 'moisture', 'sulfur', 'caking_index', 'coking_value'] },
+    { title: '生产', keys: ['efficiency', 'yield_rate', 'quantity', 'entry_date', 'remark'] },
+  ];
+  const fm = new Map(F().map((f) => [f.key, f]));
+  const required = new Set(['project_no', 'product_code']);
+  const checked = new Set([...required, 'base', 'process_code', 'work_order', 'dx50', 'tap_density', 'capacity', 'first_eff', 'quantity', 'entry_date']);
+
+  openModal({
+    title: '生成导入模板', narrow: true,
+    sub: '勾选本次要填写的指标，未勾选的字段会在导入时自动留空',
+    body: `<div style="max-height:52vh;overflow:auto">
+      ${groups.map((g) => `
+        <div style="margin-bottom:14px">
+          <div style="font-size:11.5px;font-weight:650;color:var(--text-3);letter-spacing:.4px;margin-bottom:7px;display:flex;justify-content:space-between">
+            <span>${g.title}</span>
+            ${g.title.startsWith('基础') ? '<span style="font-weight:400;color:var(--text-3)">项目编号、产品代码必选</span>'
+              : `<a href="javascript:;" data-toggle-group="${g.title}" style="color:var(--primary);text-decoration:none;font-weight:500">全选/取消</a>`}
+          </div>
+          <div style="display:flex;flex-wrap:wrap;gap:6px 10px">
+            ${g.keys.filter((k) => fm.has(k)).map((k) => {
+              const f = fm.get(k);
+              const isReq = required.has(k);
+              return `<label style="display:flex;align-items:center;gap:5px;font-size:12.5px;color:var(--text-2);cursor:pointer;width:calc(50% - 5px)">
+                <input type="checkbox" class="tplChk" value="${k}" ${checked.has(k) ? 'checked' : ''} ${isReq ? 'disabled' : ''} style="accent-color:var(--primary)" />
+                ${esc(f.label)}
+              </label>`;
+            }).join('')}
+          </div>
+        </div>`).join('')}
+    </div>`,
+    footer: `<div class="left">已选 <b id="tplCount">${checked.size}</b> 个字段</div>
+      <button class="btn" onclick="closeModal()">取消</button>
+      <button class="btn btn-primary" id="tplGo">下载模板</button>`,
+  });
+
+  const refreshCount = () => {
+    const n = [...document.querySelectorAll('.tplChk')].filter((c) => c.checked).length;
+    el('#tplCount').textContent = n;
+  };
+  document.querySelectorAll('.tplChk').forEach((c) => c.addEventListener('change', refreshCount));
+  document.querySelectorAll('[data-toggle-group]').forEach((a) => {
+    a.addEventListener('click', () => {
+      const g = groups.find((x) => x.title === a.dataset.toggleGroup);
+      const items = g.keys.map((k) => document.querySelector(`.tplChk[value="${k}"]`)).filter((c) => c && !c.disabled);
+      const allOn = items.every((c) => c.checked);
+      items.forEach((c) => { c.checked = !allOn; });
+      refreshCount();
+    });
+  });
+
+  el('#tplGo').addEventListener('click', () => {
+    const keys = [...document.querySelectorAll('.tplChk')].filter((c) => c.checked).map((c) => c.value);
+    const order = F().map((f) => f.key).filter((k) => keys.includes(k));
+    const header = order.map((k) => fm.get(k).label);
+    const sample = order.map((k) => {
+      const f = fm.get(k);
+      if (k === 'project_no') return 'PJ-2026-001';
+      if (k === 'product_code') return 'GC-A1';
+      if (k === 'entry_date') return new Date().toISOString().slice(0, 10);
+      if (k === 'remark') return '';
+      return f.type === 'number' ? '0' : '';
+    });
+    downloadCsv([header, sample], '项目数据导入模板');
+    toast(`模板已生成，含 ${header.length} 个字段`, 'ok');
+  });
+}
+
+function parseCsv(text) {
+  const rows = [];
+  let row = [], cur = '', q = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) {
+      if (c === '"') { if (text[i + 1] === '"') { cur += '"'; i++; } else q = false; }
+      else cur += c;
+    } else {
+      if (c === '"') q = true;
+      else if (c === ',') { row.push(cur); cur = ''; }
+      else if (c === '\n') { row.push(cur); rows.push(row); row = []; cur = ''; }
+      else if (c === '\r') { /* skip */ }
+      else cur += c;
+    }
+  }
+  if (cur !== '' || row.length) { row.push(cur); rows.push(row); }
+  return rows;
+}
+
+/* ============================================================
+   用户管理（仅管理员可进入）
+   ============================================================ */
+const ROLE_TAG = (role) => {
+  const map = { sys_admin: '系统管理员', admin: '管理员', user: '普通用户' };
+  return `<span class="role-tag ${role}">${map[role] || role}</span>`;
+};
+
+async function renderUsers() {
+  if (!canManageUsers()) {
+    content().innerHTML = `<div class="card"><div class="card-body"><div class="empty">
+      <p>无权访问用户管理</p><span>请联系管理员</span></div></div></div>`;
+    return;
+  }
+  actions().innerHTML = `<button class="btn btn-primary" onclick="openUserModal()">
+    <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>新增用户</button>`;
+  const { rows } = await API.get('/api/users');
+  state.users.rows = rows;
+
+  const counts = rows.reduce((a, r) => { a[r.role] = (a[r.role] || 0) + 1; return a; }, {});
+
+  content().innerHTML = `
+    <div class="perm-note">
+      <svg viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
+      <span>${canManageAdmins()
+        ? '你是系统管理员，可管理系统内所有账号，包括管理员。'
+        : '你是管理员，可管理普通用户；管理员账号仅系统管理员可操作。'}</span>
+    </div>
+    <div class="card">
+      <div class="card-head"><h3>用户账号<span class="sub">
+        共 ${rows.length} 个 · 管理员 ${(counts.admin || 0) + (counts.sys_admin || 0)} · 普通用户 ${counts.user || 0}
+      </span></h3></div>
+      <div class="table-wrap" style="max-height:calc(100vh - 260px)">
+        <table class="data-table">
+          <thead><tr>
+            <th class="col-sticky">账号</th><th>姓名</th><th>角色</th><th>状态</th><th>密码</th>
+            <th>数据条数</th><th>备注</th><th>最近登录</th><th>操作</th>
+          </tr></thead>
+          <tbody>
+            ${rows.map((r) => {
+              const locked = r.role === 'sys_admin' || (r.role === 'admin' && !canManageAdmins());
+              return `<tr>
+              <td class="col-sticky"><b>${esc(r.username)}</b>${r.id === state.user.id ? ' <span style="color:var(--primary);font-size:11px">(我)</span>' : ''}</td>
+              <td>${esc(r.real_name || '—')}</td>
+              <td>${ROLE_TAG(r.role)}</td>
+              <td><span class="status-tag ${r.status ? 'on' : 'off'}">${r.status ? '启用' : '停用'}</span></td>
+              <td>${r.pwd_changed ? '<span class="dim" style="font-size:12px">已修改</span>'
+                : '<span style="color:var(--warn);font-size:12px;font-weight:550">初始密码</span>'}</td>
+              <td class="num dim">${esc(String(r.data_count ?? 0))}</td>
+              <td class="dim wrap">${esc(r.remark || '—')}</td>
+              <td class="dim">${esc(r.last_login || '—')}</td>
+              <td><div class="row-actions">
+                ${locked
+                  ? '<span class="dim" style="font-size:12px">—</span>'
+                  : `<button class="btn btn-sm btn-ghost" onclick="openUserModal(${r.id})">编辑</button>
+                     <button class="btn btn-sm btn-ghost" onclick="resetUserPwd(${r.id}, '${esc(r.username)}')">重置密码</button>
+                     ${r.id === state.user.id ? '' : `<button class="btn btn-sm btn-ghost" style="color:var(--danger)" onclick="confirmDeleteUser(${r.id}, '${esc(r.username)}', ${r.data_count ?? 0})">删除</button>`}`}
+              </div></td>
+            </tr>`;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>
+      <div class="pagination"><span>密码以 scrypt 加盐散列存储，不保存明文；新增用户默认密码为账号</span></div>
+    </div>`;
+}
+
+function openUserModal(id) {
+  const editing = !!id;
+  const row = editing ? state.users.rows.find((r) => r.id === id) || {} : { role: 'user', status: 1 };
+  const roleOptions = [
+    { v: 'user', t: '普通用户', d: '仅查看/维护自己录入的数据' },
+    { v: 'admin', t: '管理员', d: '查看全部数据，可增删改，可管理普通用户' },
+  ];
+  if (canManageAdmins()) roleOptions.push({ v: 'sys_admin', t: '系统管理员', d: '全部权限，含管理员管理（仅 admin 账号）' });
+
+  openModal({
+    title: editing ? '编辑用户' : '新增用户',
+    sub: editing ? `账号 ${row.username}` : '不填写密码时，默认密码即为账号',
+    narrow: true,
+    body: `<div class="form-grid" style="grid-template-columns:1fr 1fr">
+      ${editing ? '' : `<div class="field"><label class="req">账号</label><input class="input" id="uName" placeholder="2-32 位字母数字" autocomplete="off" /></div>`}
+      ${editing ? '' : `<div class="field"><label>初始密码</label><input class="input" id="uPwd" placeholder="留空 = 账号" autocomplete="new-password" /></div>`}
+      <div class="field"><label>姓名</label><input class="input" id="uReal" value="${esc(row.real_name || '')}" /></div>
+      <div class="field"><label>角色</label><select class="select" id="uRole" ${editing && row.role === 'sys_admin' ? 'disabled' : ''}>
+        ${roleOptions.map((o) => `<option value="${o.v}" ${row.role === o.v ? 'selected' : ''}>${o.t}</option>`).join('')}
+      </select><span id="roleHint" style="font-size:11px;color:var(--text-3)"></span></div>
+      <div class="field"><label>状态</label><select class="select" id="uStatus">
+        <option value="1" ${row.status ? 'selected' : ''}>启用</option>
+        <option value="0" ${!row.status ? 'selected' : ''}>停用</option>
+      </select></div>
+      <div class="field full" style="grid-column:1/-1"><label>备注</label><input class="input" id="uRemark" value="${esc(row.remark || '')}" /></div>
+    </div>`,
+    footer: `<button class="btn" onclick="closeModal()">取消</button>
+      <button class="btn btn-primary" id="uSave">${editing ? '保存' : '创建'}</button>`,
+  });
+
+  const hint = el('#roleHint');
+  const syncHint = () => {
+    const v = el('#uRole').value;
+    const o = roleOptions.find((x) => x.v === v);
+    if (hint) hint.textContent = o ? o.d : '';
+  };
+  el('#uRole').addEventListener('change', syncHint);
+  syncHint();
+
+  el('#uSave').addEventListener('click', async () => {
+    try {
+      if (editing) {
+        const body = {
+          real_name: el('#uReal').value.trim(),
+          status: Number(el('#uStatus').value),
+          remark: el('#uRemark').value.trim(),
+        };
+        const roleSel = el('#uRole');
+        if (roleSel && !roleSel.disabled && roleSel.value !== row.role) body.role = roleSel.value;
+        await API.put('/api/users/' + id, body);
+        closeModal(); toast('用户已更新', 'ok'); renderUsers();
+      } else {
+        const username = el('#uName').value.trim();
+        if (!username) return toast('请填写账号', 'err');
+        const pwd = el('#uPwd').value.trim();
+        const r = await API.post('/api/users', {
+          username,
+          password: pwd || undefined,
+          real_name: el('#uReal').value.trim(),
+          role: el('#uRole').value,
+          status: Number(el('#uStatus').value),
+          remark: el('#uRemark').value.trim(),
+        });
+        closeModal();
+        toast(r.defaultPassword ? `已创建，初始密码与账号相同（${username}）` : '用户已创建', 'ok');
+        renderUsers();
+      }
+    } catch (e) { toast(e.message, 'err'); }
+  });
+}
+
+function resetUserPwd(id, name) {
+  openModal({
+    title: '重置密码', narrow: true,
+    body: `<p style="margin:0 0 8px;color:var(--text-2)">将账号 <b>${esc(name)}</b> 的密码重置为初始密码（即账号本身）？</p>
+      <p style="margin:0;font-size:12.5px;color:var(--text-3)">重置后该用户所有登录会话将失效，需用新密码重新登录。</p>`,
+    footer: `<button class="btn" onclick="closeModal()">取消</button><button class="btn btn-primary" id="okReset">确认重置</button>`,
+  });
+  el('#okReset').addEventListener('click', async () => {
+    try {
+      await API.put('/api/users/' + id, { reset_password: true });
+      closeModal(); toast(`已将密码重置为 ${name}`, 'ok'); renderUsers();
+    } catch (e) { toast(e.message, 'err'); }
+  });
+}
+
+function confirmDeleteUser(id, name, dataCount) {
+  openModal({
+    title: '删除用户', narrow: true,
+    body: `<p style="margin:0 0 8px;color:var(--text-2)">确定删除账号 <b>${esc(name)}</b> 吗？</p>
+      ${dataCount ? `<p style="margin:0;font-size:12.5px;color:var(--warn)">该用户名下有 <b>${dataCount}</b> 条数据记录，删除后将失去归属人，仅管理员仍可见。</p>`
+        : `<p style="margin:0;font-size:12.5px;color:var(--text-3)">该用户暂无数据记录。</p>`}`,
+    footer: `<button class="btn" onclick="closeModal()">取消</button><button class="btn btn-danger" id="okDel">确认删除</button>`,
+  });
+  el('#okDel').addEventListener('click', async () => {
+    try { await API.del('/api/users/' + id); closeModal(); toast('已删除', 'ok'); renderUsers(); }
+    catch (e) { toast(e.message, 'err'); }
+  });
+}
+
+/* ============================================================
+   登录 / 账号
+   ============================================================ */
+function showLogin(message) {
+  el('#appShell').style.display = 'none';
+  const scr = el('#loginScreen');
+  scr.style.display = 'grid';
+  el('#loginErr').textContent = message || '';
+  el('#loginPwd').value = '';
+  setTimeout(() => el('#loginUser').focus(), 80);
+}
+
+function hideLogin() {
+  el('#loginScreen').style.display = 'none';
+  el('#appShell').style.display = 'flex';
+}
+
+function paintUser() {
+  const u = state.user;
+  el('#userName').textContent = u.real_name || u.username;
+  el('#userRole').textContent = u.roleLabel || u.role;
+  el('#userAvatar').textContent = (u.real_name || u.username).slice(0, 1);
+  // 用户管理入口仅管理员可见
+  document.querySelectorAll('[data-admin-only]').forEach((n) => {
+    n.style.display = canManageUsers() ? '' : 'none';
+  });
+}
+
+async function doLogin(e) {
+  if (e) e.preventDefault();
+  const username = el('#loginUser').value.trim();
+  const password = el('#loginPwd').value;
+  if (!username || !password) {
+    el('#loginErr').textContent = '请输入账号和密码';
+    return;
+  }
+  const btn = el('#loginBtn');
+  btn.disabled = true;
+  el('#loginErr').textContent = '';
+  try {
+    const r = await API.post('/api/auth/login', { username, password });
+    state.user = r.user;
+    await bootApp();
+  } catch (err) {
+    el('#loginErr').textContent = err.message;
+    el('#loginPwd').select();
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function doLogout() {
+  try { await API.post('/api/auth/logout'); } catch { /* 忽略 */ }
+  state.user = null;
+  state.meta = null;
+  el('#userMenu').classList.remove('open');
+  showLogin('');
+  el('#loginUser').value = '';
+  el('#loginPwd').value = '';
+}
+
+function openPasswordModal() {
+  el('#userMenu').classList.remove('open');
+  openModal({
+    title: '修改密码', narrow: true,
+    sub: `当前账号 ${state.user.username}`,
+    body: `<div class="form-grid" style="grid-template-columns:1fr">
+      <div class="field"><label class="req">原密码</label><input class="input" type="password" id="pOld" autocomplete="current-password" /></div>
+      <div class="field"><label class="req">新密码</label><input class="input" type="password" id="pNew" placeholder="至少 4 位" autocomplete="new-password" /></div>
+      <div class="field"><label class="req">确认新密码</label><input class="input" type="password" id="pNew2" autocomplete="new-password" /></div>
+    </div>`,
+    footer: `<button class="btn" onclick="closeModal()">取消</button>
+      <button class="btn btn-primary" id="pSave">保存新密码</button>`,
+  });
+  el('#pSave').addEventListener('click', async () => {
+    const oldPwd = el('#pOld').value;
+    const p1 = el('#pNew').value;
+    const p2 = el('#pNew2').value;
+    if (!oldPwd || !p1) return toast('请填写原密码与新密码', 'err');
+    if (p1 !== p2) return toast('两次输入的新密码不一致', 'err');
+    if (p1.length < 4) return toast('新密码至少 4 位', 'err');
+    try {
+      await API.post('/api/auth/password', { old_password: oldPwd, new_password: p1 });
+      state.user.pwd_changed = 1;
+      closeModal();
+      toast('密码已修改', 'ok');
+    } catch (e) { toast(e.message, 'err'); }
+  });
+}
+
+/* ============================================================
+   弹窗基础
+   ============================================================ */
+function openModal({ title, sub, body, footer, narrow, wide }) {
+  const root = el('#modalRoot');
+  root.innerHTML = `
+    <div class="modal-mask"></div>
+    <div class="modal ${narrow ? 'narrow' : ''} ${wide ? 'wide' : ''}">
+      <div class="modal-head">
+        <div><h2>${esc(title)}</h2>${sub ? `<p>${esc(sub)}</p>` : ''}</div>
+        <button class="btn btn-icon btn-ghost" onclick="closeModal()" title="关闭">
+          <svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <div class="modal-body">${body}</div>
+      <div class="modal-foot">${footer || ''}</div>
+    </div>`;
+  root.classList.add('open');
+  root.querySelector('.modal-mask').addEventListener('click', closeModal);
+  const first = root.querySelector('input, select, textarea');
+  if (first) setTimeout(() => first.focus(), 60);
+}
+function closeModal() {
+  const root = el('#modalRoot');
+  root.classList.remove('open');
+  root.innerHTML = '';
+}
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeModal();
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+    const btn = document.querySelector('.modal-foot .btn-primary');
+    if (btn) btn.click();
+  }
+});
+
+/* ============================================================
+   启动
+   ============================================================ */
+async function refreshMeta() {
+  state.meta = await API.get('/api/meta');
+}
+
+/** 登录成功后进入主应用 */
+async function bootApp() {
+  await refreshMeta();
+  hideLogin();
+  paintUser();
+  state.view = 'dashboard';
+  document.querySelectorAll('.nav-item').forEach((n) => {
+    n.classList.toggle('active', n.dataset.view === 'dashboard');
+  });
+  el('#viewTitle').textContent = VIEWS.dashboard.title;
+  el('#viewSub').textContent = VIEWS.dashboard.sub;
+  actions().innerHTML = '';
+  navigate('dashboard');
+}
+
+function bindAuthEvents() {
+  el('#loginForm').addEventListener('submit', doLogin);
+
+  // 密码可见切换
+  el('#pwdEye').addEventListener('click', () => {
+    const p = el('#loginPwd');
+    p.type = p.type === 'password' ? 'text' : 'password';
+    p.focus();
+  });
+
+  // 用户菜单
+  el('#userMenuBtn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    el('#userMenu').classList.toggle('open');
+  });
+  el('#userMenu').addEventListener('click', (e) => {
+    const a = e.target.closest('a[data-act]');
+    if (!a) return;
+    if (a.dataset.act === 'password') openPasswordModal();
+    if (a.dataset.act === 'logout') doLogout();
+  });
+  document.addEventListener('click', () => el('#userMenu').classList.remove('open'));
+
+  document.querySelectorAll('.nav-item').forEach((n) => {
+    n.addEventListener('click', () => navigate(n.dataset.view));
+  });
+}
+
+(async function boot() {
+  bindAuthEvents();
+  try {
+    // 已有有效会话则直接进入
+    const r = await API.get('/api/auth/me');
+    state.user = r.user;
+    await bootApp();
+  } catch {
+    showLogin('');
+  }
+})();

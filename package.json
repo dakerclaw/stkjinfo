@@ -1,0 +1,15 @@
+{
+  "name": "stkj-project-manager",
+  "version": "1.0.0",
+  "description": "项目管理应用 - 项目库与项目数据管理",
+  "main": "server.js",
+  "scripts": {
+    "start": "node --no-warnings server.js",
+    "seed": "node --no-warnings seed.js",
+    "reset": "node --no-warnings seed.js --reset"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "private": true
+}

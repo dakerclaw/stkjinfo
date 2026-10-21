@@ -1,0 +1,46 @@
+# 依赖与构建产物
+node_modules/
+dist/
+build/
+
+# 数据库（含示例账号与业务数据，不入库；首次运行 npm run seed 自动生成）
+data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# 日志与临时文件
+*.log
+logs/
+npm-debug.log*
+.npm/
+tmp/
+temp/
+
+# 导出文件
+exports/
+*.csv
+
+# 环境变量与密钥
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# WorkBuddy 本地工作目录（保留 memory 可选，此处整体忽略）
+.workbuddy/
+
+# 测试临时脚本
+.test-*.mjs

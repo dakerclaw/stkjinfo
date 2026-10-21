@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>项目管理 · 项目库与项目数据</title>
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+
+<!-- ===================== 登录页 ===================== -->
+<div class="login-screen" id="loginScreen">
+  <div class="login-visual">
+    <div class="login-brand">
+      <div class="logo lg">PM</div>
+      <div>
+        <strong>项目管理平台</strong>
+        <span>项目库 · 项目数据 · 质量指标</span>
+      </div>
+    </div>
+    <div class="login-points">
+      <div class="lp"><span class="lp-ico">◈</span><div><b>项目全生命周期</b><p>项目编号、产品代码、类型与简介统一建档</p></div></div>
+      <div class="lp"><span class="lp-ico">◈</span><div><b>44 项指标数据</b><p>粒度、物性、电化学、粉压、工业分析全维度记录</p></div></div>
+      <div class="lp"><span class="lp-ico">◈</span><div><b>按角色隔离</b><p>管理员总览全局，普通用户专注自己的数据</p></div></div>
+    </div>
+    <div class="login-foot">本地部署 · 数据存储于本机 SQLite</div>
+  </div>
+
+  <div class="login-panel">
+    <form class="login-card" id="loginForm" autocomplete="on">
+      <h2>账号登录</h2>
+      <p class="login-sub">请使用管理员分配的账号登录</p>
+
+      <label class="login-label">账号</label>
+      <input class="login-input" id="loginUser" name="username" autocomplete="username" placeholder="请输入账号" />
+
+      <label class="login-label">密码</label>
+      <div class="login-pwd">
+        <input class="login-input" id="loginPwd" name="password" type="password" autocomplete="current-password" placeholder="请输入密码" />
+        <button type="button" class="pwd-eye" id="pwdEye" tabindex="-1" title="显示密码">
+          <svg viewBox="0 0 24 24"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg>
+        </button>
+      </div>
+
+      <div class="login-err" id="loginErr"></div>
+      <button class="login-btn" id="loginBtn" type="submit">登 录</button>
+
+      <div class="login-hint">
+        首次登录请使用默认密码，登录后可在右上角修改密码
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- ===================== 主应用 ===================== -->
+<div class="app" id="appShell" style="display:none">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="logo">PM</div>
+      <div class="brand-text">
+        <strong>项目管理</strong>
+        <span>项目库 · 项目数据</span>
+      </div>
+    </div>
+    <nav class="nav">
+      <a class="nav-item active" data-view="dashboard">
+        <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>
+        <span>总览</span>
+      </a>
+      <a class="nav-item" data-view="projects">
+        <svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+        <span>项目列表</span>
+      </a>
+      <a class="nav-item" data-view="data">
+        <svg viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>
+        <span>项目数据</span>
+      </a>
+      <a class="nav-item" data-view="users" data-admin-only>
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-6 8-6s8 2 8 6"/></svg>
+        <span>用户管理</span>
+      </a>
+    </nav>
+
+    <div class="sidebar-foot">
+      <div class="user-card" id="userCard">
+        <div class="avatar" id="userAvatar">–</div>
+        <div class="user-meta">
+          <b id="userName">–</b>
+          <span id="userRole">–</span>
+        </div>
+        <button class="btn btn-icon btn-ghost" id="userMenuBtn" title="账号操作">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="5" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="12" cy="19" r="1.4"/></svg>
+        </button>
+        <div class="user-menu" id="userMenu">
+          <a data-act="password"><svg viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>修改密码</a>
+          <a data-act="logout" class="danger"><svg viewBox="0 0 24 24"><path d="M15 17l5-5-5-5"/><path d="M20 12H9"/><path d="M12 19H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h6"/></svg>退出登录</a>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="topbar-title">
+        <h1 id="viewTitle">总览</h1>
+        <p id="viewSub">项目库与检测数据概览</p>
+      </div>
+      <div class="topbar-actions" id="topbarActions"></div>
+    </header>
+    <div class="content" id="content"></div>
+  </main>
+</div>
+
+<div class="modal-root" id="modalRoot"></div>
+<div class="toast-root" id="toastRoot"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>
