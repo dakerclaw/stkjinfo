@@ -422,7 +422,8 @@ function pickData(body, { requireNo = true } = {}) {
     const meta = FIELDS.find((f) => f.key === key);
     if (meta.type === 'number') {
       const n = Number(v);
-      row[key] = Number.isFinite(n) ? n : null;
+      // 指标字段统一保留 2 位小数（四舍五入），见 db.js ROUND2_KEYS
+      row[key] = Number.isFinite(n) ? (meta.round2 ? Math.round(n * 100) / 100 : n) : null;
     } else {
       row[key] = String(v).trim();
     }

@@ -83,10 +83,11 @@ function esc(s) {
   if (s === null || s === undefined) return '';
   return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
-function fmtNum(v, digits = 4) {
+function fmtNum(v, digits) {
   if (v === null || v === undefined || v === '') return '<span class="empty-num">—</span>';
   const n = Number(v);
   if (!Number.isFinite(n)) return esc(v);
+  if (digits != null) return n.toFixed(digits);
   const s = Math.abs(n) >= 1000 ? n.toLocaleString('zh-CN', { maximumFractionDigits: 2 }) : String(Number(n.toPrecision(8)));
   return s;
 }
@@ -534,7 +535,7 @@ async function loadData() {
               if (f.key === 'project_no') return `<td class="${sticky}"><span class="code-chip">${esc(v)}</span></td>${ownerCell}`;
               if (f.key === 'remark') return `<td class="wrap dim">${esc(v || '')}</td>${ownerCell}`;
               if (f.key === 'entry_date') return `<td class="dim">${esc(v || '—')}</td>${ownerCell}`;
-              if (f.type === 'number') return `<td class="num">${fmtNum(v)}</td>${ownerCell}`;
+              if (f.type === 'number') return `<td class="num">${fmtNum(v, f.round2 ? 2 : undefined)}</td>${ownerCell}`;
               return `<td>${esc(v || '—')}</td>${ownerCell}`;
             }).join('')}
             <td style="position:sticky;right:0;background:var(--surface);border-left:1px solid var(--border)">

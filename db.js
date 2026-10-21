@@ -211,4 +211,18 @@ const FIELDS = [
   { key: 'entry_date',     label: '录入日期',   type: 'date' },
 ];
 
+// 指标字段统一保留 2 位小数（写入/导入时四舍五入）；生产数量不做限定
+const ROUND2_KEYS = new Set(
+  FIELDS.filter((f) => f.type === 'number' && f.key !== 'quantity').map((f) => f.key)
+);
+for (const f of FIELDS) if (ROUND2_KEYS.has(f.key)) f.round2 = true;
+
+// 存量数据一次性修正为 2 位小数（无差异时为空更新，幂等、开销可忽略）
+for (const key of ROUND2_KEYS) {
+  db.exec(
+    `UPDATE project_data SET ${key} = round(${key}, 2)
+     WHERE ${key} IS NOT NULL AND ${key} != round(${key}, 2)`
+  );
+}
+
 module.exports = { db, DB_FILE, DATA_DIR, FIELDS };

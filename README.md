@@ -92,6 +92,8 @@ node seed.js --reset   # 清空项目与数据后重新灌入示例（保留用�
 
 指标字段（共 45 个字段，其中数值型可为空表示未检测）：
 
+> **精度约定**：粒度、物性、电化学、粉压、工业分析及效率/收率等全部指标字段统一为**浮点数保留 2 位小数**。手工录入、编辑、Excel 导入时服务端自动四舍五入（如 `12.3456 → 12.35`、`-0.005 → 0`），列表页固定显示 2 位小数。仅**生产数量**（`quantity`）保留原始精度。
+
 - **粒度**：dx0、dx1、dx10、dx50、dx90、dx99、dx100、k_value
 - **物性**：tap_density 振实密度、true_density 真密度、ssa_domestic 比表-国产、ssa_mic 比表-麦克、graphitization 石墨化度、magnetic 磁性物质、ph_value、oversize 筛上物、oil_absorption 吸油值、hgi 哈氏可磨指数
 - **电化学**：capacity 容量、lithium_inter 嵌锂容量、lithium_deint 脱锂容量、first_eff 首次效率
