@@ -1,0 +1,8 @@
+[Unit]
+Description=stkj 数据库每日备份
+
+[Service]
+Type=oneshot
+ExecStart=%h/apps/node-v22.22.2-linux-x64/bin/node --no-warnings %h/apps/stkj/deploy/backup.cjs
+StandardOutput=append:%h/apps/stkj/logs/backup.log
+StandardError=append:%h/apps/stkj/logs/backup.log

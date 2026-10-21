@@ -1,0 +1,9 @@
+[Unit]
+Description=stkj 数据库每日自动备份（每天 03:00）
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

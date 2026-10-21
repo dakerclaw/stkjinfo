@@ -47,6 +47,15 @@ CREATE TABLE IF NOT EXISTS users (
   last_login    TEXT
 );
 
+CREATE TABLE IF NOT EXISTS sessions (
+  token       TEXT PRIMARY KEY,                       -- 随机会话令牌（Cookie sid 的值）
+  user_id     INTEGER NOT NULL,                       -- 关联 users.id
+  created_at  INTEGER NOT NULL,                       -- 创建时间（毫秒时间戳）
+  last_seen   INTEGER NOT NULL,                       -- 最后活跃时间（毫秒时间戳），用于闲置超时
+  user_agent  TEXT,                                   -- 登录时的浏览器标识（便于排查）
+  ip          TEXT                                    -- 登录时的来源地址
+);
+
 CREATE TABLE IF NOT EXISTS projects (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   project_no  TEXT NOT NULL UNIQUE,                   -- 项目编号
@@ -131,6 +140,9 @@ ensureColumn('project_data', 'updated_by', 'TEXT');
 ensureColumn('project_data', 'coke_type', 'TEXT');
 db.exec('CREATE INDEX IF NOT EXISTS idx_data_owner ON project_data(created_by_id)');
 db.exec('CREATE INDEX IF NOT EXISTS idx_data_coke ON project_data(coke_type)');
+// 会话按用户检索（踢下线、清理过期）与按最后活跃时间清理
+db.exec('CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)');
+db.exec('CREATE INDEX IF NOT EXISTS idx_sessions_seen ON sessions(last_seen)');
 
 // 角色规范化：用户名 admin 固定为系统管理员
 db.exec(`UPDATE users SET role = 'sys_admin' WHERE username = 'admin' AND role = 'admin'`);

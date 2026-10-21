@@ -49,16 +49,39 @@ const isAdmin = (u) => !!u && (u.role === 'admin' || u.role === 'sys_admin');
 const isSysAdmin = (u) => !!u && u.role === 'sys_admin';
 
 /* ============================================================ 会话管理 */
-const SESSION_TTL = 1000 * 60 * 60 * 12; // 12 小时
-const sessions = new Map(); // token -> { userId, createdAt, lastSeen }
+/* 会话持久化到数据库：重启服务 / 更新部署后登录状态不丢失。
+   超时规则：连续 7 天未活跃自动失效（每次请求都会刷新 last_seen）。 */
+const SESSION_TTL = 1000 * 60 * 60 * 24 * 7; // 7 天未活跃失效
+const SESSION_TOUCH_INTERVAL = 1000 * 60 * 10; // last_seen 写库节流：10 分钟内不重复写
 
-function createSession(userId) {
+const stmtSessionGet = db.prepare('SELECT user_id, created_at, last_seen FROM sessions WHERE token = ?');
+const stmtSessionInsert = db.prepare(
+  'INSERT INTO sessions (token, user_id, created_at, last_seen, user_agent, ip) VALUES (?, ?, ?, ?, ?, ?)'
+);
+const stmtSessionDelete = db.prepare('DELETE FROM sessions WHERE token = ?');
+const stmtSessionDeleteByUser = db.prepare('DELETE FROM sessions WHERE user_id = ?');
+const stmtSessionTouch = db.prepare('UPDATE sessions SET last_seen = ? WHERE token = ?');
+const stmtSessionCleanExpired = db.prepare('DELETE FROM sessions WHERE last_seen < ?');
+
+function createSession(userId, req) {
   const token = crypto.randomBytes(32).toString('hex');
-  sessions.set(token, { userId, createdAt: Date.now(), lastSeen: Date.now() });
+  const now = Date.now();
+  stmtSessionInsert.run(
+    token,
+    userId,
+    now,
+    now,
+    String((req && req.headers['user-agent']) || '').slice(0, 200) || null,
+    (req && req.socket && req.socket.remoteAddress) || null
+  );
   return token;
 }
 function destroySession(token) {
-  if (token) sessions.delete(token);
+  if (token) stmtSessionDelete.run(token);
+}
+/** 踢掉某用户的全部会话（停用 / 改密 / 删除账号时调用） */
+function destroyUserSessions(userId) {
+  stmtSessionDeleteByUser.run(userId);
 }
 function parseCookies(req) {
   const raw = req.headers.cookie || '';
@@ -76,19 +99,25 @@ function currentUser(req) {
   const auth = req.headers.authorization || '';
   if (!token && auth.startsWith('Bearer ')) token = auth.slice(7);
   if (!token) return null;
-  const s = sessions.get(token);
+  const s = stmtSessionGet.get(token);
   if (!s) return null;
-  if (Date.now() - s.lastSeen > SESSION_TTL) {
-    sessions.delete(token);
+  const now = Date.now();
+  if (now - s.last_seen > SESSION_TTL) {
+    stmtSessionDelete.run(token);
     return null;
   }
-  s.lastSeen = Date.now();
+  // 节流写入：只有距上次活跃超过 10 分钟才更新 last_seen，避免每个请求都写库
+  if (now - s.last_seen > SESSION_TOUCH_INTERVAL) {
+    stmtSessionTouch.run(now, token);
+  }
   const u = db
     .prepare('SELECT id, username, real_name, role, status, pwd_changed FROM users WHERE id = ?')
-    .get(s.userId);
+    .get(s.user_id);
   if (!u || u.status !== 1) return null;
   return u;
 }
+/* 启动时清理过期会话 */
+stmtSessionCleanExpired.run(Date.now() - SESSION_TTL);
 
 /* ============================================================ 审计字段 */
 /** 数据归属过滤：管理员看全部，普通用户只看自己 */
@@ -1019,7 +1048,7 @@ function updateUser(res, id, body, actor) {
   }
   update('users', id, row, { touch: false });
   // 停用或改密后，强制该用户重新登录
-  for (const [token, s] of sessions) if (s.userId === id) sessions.delete(token);
+  destroyUserSessions(id);
   ok(res);
 }
 
@@ -1032,7 +1061,7 @@ function deleteUser(res, id, actor) {
 
   const dataCount = db.prepare('SELECT COUNT(*) AS c FROM project_data WHERE created_by_id = ?').get(id).c;
   db.prepare('DELETE FROM users WHERE id = ?').run(id);
-  for (const [token, s] of sessions) if (s.userId === id) sessions.delete(token);
+  destroyUserSessions(id);
   ok(res, { removedUser: true, dataCount });
 }
 
@@ -1044,7 +1073,7 @@ const MAX_FAILS = 5;
 const LOCK_MS = 5 * 60 * 1000;
 const loginFails = new Map(); // username -> { count, firstAt, lockedUntil }
 
-function login(res, body) {
+function login(res, body, req) {
   const username = (body.username || '').trim();
   const password = String(body.password || '');
   if (!username || !password) return fail(res, 400, '请输入账号和密码');
@@ -1073,7 +1102,7 @@ function login(res, body) {
   if (u.status !== 1) return fail(res, 403, '该账号已停用，请联系管理员');
 
   db.prepare('UPDATE users SET last_login = ? WHERE id = ?').run(nowStr(), u.id);
-  const token = createSession(u.id);
+  const token = createSession(u.id, req);
   send(res, 200, {
     success: true,
     user: {
@@ -1127,7 +1156,7 @@ async function handleApi(req, res, url) {
   const seg = p.replace(/^\/api\/?/, '').split('/').filter(Boolean);
 
   /* ---- 免登录接口 ---- */
-  if (p === '/api/auth/login' && m === 'POST') return login(res, await readBody(req));
+  if (p === '/api/auth/login' && m === 'POST') return login(res, await readBody(req), req);
   if (p === '/api/auth/logout' && m === 'POST') return logout(req, res);
 
   /* ---- 以下接口均需登录 ---- */
