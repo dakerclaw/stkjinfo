@@ -90,7 +90,7 @@ function debounce(fn, ms = 260) {
 const VIEWS = {
   dashboard: { title: '总览', sub: '项目库与检测数据概览', render: renderDashboard },
   projects: { title: '项目列表', sub: '按项目编号、产品代码、项目类型筛选项目', render: renderProjects },
-  data: { title: '项目数据', sub: '按项目编号、产品代码、生产基地、工序代码、工单编号筛选', render: renderData },
+  data: { title: '项目数据', sub: '按项目编号、产品代码、所属公司、工序、工单号、焦种筛选', render: renderData },
   users: { title: '用户管理', sub: '系统账号与权限信息', render: renderUsers },
 };
 
@@ -118,7 +118,7 @@ async function renderDashboard() {
       ${statCard('项目总数', stats.projectCount, '个', '项目库中登记的项目')}
       ${statCard('项目数据记录', stats.dataCount, '条', '所有检测/生产数据')}
       ${statCard('项目类型', stats.typeCount, '类', '已覆盖的项目类型')}
-      ${statCard('累计生产数量', stats.qtySum.toLocaleString('zh-CN', { maximumFractionDigits: 2 }), '', `覆盖 ${stats.baseCount} 个生产基地`)}
+      ${statCard('累计生产数量', stats.qtySum.toLocaleString('zh-CN', { maximumFractionDigits: 2 }), '', `覆盖 ${stats.baseCount} 家所属公司`)}
     </div>
     <div class="grid-2">
       <div class="card">
@@ -146,10 +146,10 @@ async function renderDashboard() {
       </div>
     </div>
     <div class="card" style="margin-top:14px">
-      <div class="card-head"><h3>生产基地数据分布</h3></div>
+      <div class="card-head"><h3>所属公司数据分布</h3></div>
       <div class="card-body">
         ${stats.byBase.length ? `<div class="bar-list">${stats.byBase.map((r) => barItem(r.name, r.value, maxBase)).join('')}</div>`
-          : `<div class="empty" style="padding:24px"><p>暂无生产基地数据</p></div>`}
+          : `<div class="empty" style="padding:24px"><p>暂无所属公司数据</p></div>`}
       </div>
     </div>`;
 }
@@ -392,14 +392,17 @@ async function renderData() {
         <div class="field w-160"><label>产品代码</label>
           <select class="select" id="dPc"><option value="">全部</option>${o.productCodes.map((v) => `<option ${f.product_code === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>
         </div>
-        <div class="field w-140"><label>生产基地</label>
+        <div class="field w-160"><label>所属公司</label>
           <select class="select" id="dBase"><option value="">全部</option>${o.bases.map((v) => `<option ${f.base === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>
         </div>
-        <div class="field w-140"><label>工序代码</label>
+        <div class="field w-140"><label>工序</label>
           <select class="select" id="dProc"><option value="">全部</option>${o.processes.map((v) => `<option ${f.process_code === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>
         </div>
-        <div class="field w-140"><label>工单编号</label>
+        <div class="field w-140"><label>工单号</label>
           <select class="select" id="dWo"><option value="">全部</option>${o.workOrders.map((v) => `<option ${f.work_order === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>
+        </div>
+        <div class="field w-140"><label>焦种</label>
+          <select class="select" id="dCoke"><option value="">全部</option>${(o.cokeTypes || []).map((v) => `<option ${f.coke_type === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>
         </div>
         <div class="field w-160"><label>关键词</label>
           <input class="input" id="dKw" placeholder="模糊搜索…" value="${esc(f.q || '')}" />
@@ -428,6 +431,7 @@ async function renderData() {
       base: el('#dBase').value,
       process_code: el('#dProc').value,
       work_order: el('#dWo').value,
+      coke_type: el('#dCoke').value,
       q: el('#dKw').value.trim(),
       date_from: el('#dFrom').value,
       date_to: el('#dTo').value,
@@ -435,7 +439,7 @@ async function renderData() {
     state.data.page = 1;
   };
   const reload = () => { collect(); loadData(); };
-  ['dPno', 'dPc', 'dBase', 'dProc', 'dWo', 'dFrom', 'dTo'].forEach((id) => el('#' + id).addEventListener('change', reload));
+  ['dPno', 'dPc', 'dBase', 'dProc', 'dWo', 'dCoke', 'dFrom', 'dTo'].forEach((id) => el('#' + id).addEventListener('change', reload));
   el('#dKw').addEventListener('input', debounce(reload, 240));
   el('#onlySel').addEventListener('change', (e) => { state.data.onlySelected = e.target.checked; loadData(); });
 
@@ -620,9 +624,9 @@ function openDataModal(id) {
             style="background:var(--surface-2);color:var(--text-2);cursor:not-allowed" placeholder="随项目编号自动带出" />
           <span style="font-size:11px;color:var(--text-3)">自动同步</span></div>`;
       }
-      const listId = { base: 'baseList', process_code: 'procList', work_order: 'woList' }[key];
+      const listId = { base: 'baseList', process_code: 'procList', work_order: 'woList', coke_type: 'cokeList' }[key];
       const listOpts = listId
-        ? `<datalist id="${listId}">${(state.meta.options[{ base: 'bases', process_code: 'processes', work_order: 'workOrders' }[key]] || []).map((o) => `<option value="${esc(o)}">`).join('')}</datalist>`
+        ? `<datalist id="${listId}">${(state.meta.options[{ base: 'bases', process_code: 'processes', work_order: 'workOrders', coke_type: 'cokeTypes' }[key]] || []).map((o) => `<option value="${esc(o)}">`).join('')}</datalist>`
         : '';
       const type = f.type === 'number' ? 'number' : f.type === 'date' ? 'date' : 'text';
       const step = f.type === 'number' ? ' step="any"' : '';
@@ -724,7 +728,7 @@ function askDuplicateAction({ title, key, count, extra, rowsHtml, onChoice }) {
       <div class="dup-box">
         <div class="dup-icon">!</div>
         <div class="dup-text">
-          <p class="dup-lead">项目编号 + 产品代码 + 生产基地 + 工序代码 + 工单编号 五项完全相同，系统中已存在 ${count || 1} 条此类数据。</p>
+          <p class="dup-lead">项目编号 + 产品代码 + 所属公司 + 工序 + 工单号 五项完全相同，系统中已存在 ${count || 1} 条此类数据。</p>
           ${key ? `<p class="dup-key">${esc(key)}</p>` : ''}
           ${extra ? `<p class="dup-extra">${esc(extra)}</p>` : ''}
           ${rowsHtml || ''}
@@ -849,9 +853,10 @@ function buildHeaderMap() {
   }
   // 常见别名
   const alias = {
-    生产基地: ['基地', '工厂', '生产厂区'],
-    工序代码: ['工序'],
-    工单编号: ['工单号', '工单'],
+    所属公司: ['所属公司', '公司', '生产基地', '基地', '工厂', '生产厂区'],
+    工序: ['工序', '工序代码'],
+    工单号: ['工单号', '工单编号', '工单'],
+    焦种: ['焦种', '焦炭种类', '焦类型'],
     振实密度: ['振实'],
     比表国产: ['比表面积国产', '国产比表', 'bet国产'],
     比表麦克: ['比表面积麦克', '麦克比表', 'bet麦克'],
@@ -1033,7 +1038,7 @@ function openImport() {
         const info = e.payload.duplicate || {};
         const rowsHtml = (info.rows || []).length
           ? `<div class="dup-rows"><table>
-              <thead><tr><th>CSV 行号</th><th>项目编号</th><th>生产基地</th><th>工序代码</th><th>工单编号</th></tr></thead>
+              <thead><tr><th>CSV 行号</th><th>项目编号</th><th>所属公司</th><th>工序</th><th>工单号</th></tr></thead>
               <tbody>${(info.rows || []).slice(0, 8).map((d) => `<tr>
                 <td>${esc(d.line)}</td><td>${esc(d.project_no)}</td><td>${esc(d.base || '—')}</td>
                 <td>${esc(d.process_code || '—')}</td><td>${esc(d.work_order || '—')}</td></tr>`).join('')}

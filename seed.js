@@ -50,21 +50,23 @@ const PROJECTS = [
   ['PJ-2026-002', 'GC-B2', '中试', '快充型负极材料中试放大，验证 5C 倍率下的粉压与循环性能。', 1],
   ['PJ-2026-003', 'SC-C1', '量产', '储能用人造石墨量产项目，稳定收率与灰分控制。', 1],
   ['PJ-2026-004', 'GC-A3', '研发', '低比表面积高首次效率配方研究，降低磁性物质含量。', 1],
-  ['PJ-2026-005', 'SC-D5', '量产', '动力电池负极二期产线认证，覆盖两个生产基地数据比对。', 1],
+  ['PJ-2026-005', 'SC-D5', '量产', '动力电池负极二期产线认证，覆盖两个所属公司的数据比对。', 1],
   ['PJ-2025-018', 'GC-Z9', '研发', '上一代高功率石墨项目，已完成结题归档。', 0],
   ['PJ-2026-006', 'AC-E1', '中试', '硬碳负极材料预研，关注吸油值与振实密度。', 1],
   ['PJ-2026-007', 'GC-B7', '量产', '海外客户定制规格量产项目，按工单全程追溯。', 1],
 ];
 
 /* ---------- 示例数据 ---------- */
-const BASES = ['江西基地', '广东基地', '四川基地'];
+const BASES = ['江西紫宸科技有限公司', '广东凯金新能源科技股份有限公司', '四川长虹新材料有限公司'];
 const PROCS = ['PR-10', 'PR-20', 'PR-30', 'PR-40'];
+const COKES = ['针状焦', '石油焦', '沥青焦', '混合焦'];
 const rnd = (min, max, d = 2) => Number((min + Math.random() * (max - min)).toFixed(d));
 let woSeq = 1;
 
 function makeRow(pno, pcode, i) {
   const base = BASES[i % BASES.length];
   const proc = PROCS[i % PROCS.length];
+  const coke = COKES[i % COKES.length];
   const wo = `WO-2026${String(100 + woSeq++).padStart(4, '0')}`;
   const dx10 = rnd(4, 9);
   const dx50 = rnd(12, 20);
@@ -72,6 +74,7 @@ function makeRow(pno, pcode, i) {
   const date = new Date(Date.now() - Math.floor(Math.random() * 120) * 86400000).toISOString().slice(0, 10);
   return {
     project_no: pno, product_code: pcode, base, process_code: proc, work_order: wo,
+    coke_type: coke,
     dx0: rnd(1.2, 2.5), dx1: rnd(2.2, 3.6), dx10, dx50, dx90,
     dx99: rnd(55, 75), dx100: rnd(90, 120),
     k_value: rnd(0.8, 2.4),

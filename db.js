@@ -64,9 +64,10 @@ CREATE TABLE IF NOT EXISTS project_data (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   project_no   TEXT NOT NULL,                         -- 项目编号
   product_code TEXT NOT NULL,                         -- 产品代码
-  base         TEXT,                                  -- 生产基地
-  process_code TEXT,                                  -- 工序代码
-  work_order   TEXT,                                  -- 工单编号
+  base         TEXT,                                  -- 所属公司
+  process_code TEXT,                                  -- 工序
+  work_order   TEXT,                                  -- 工单号
+  coke_type    TEXT,                                  -- 焦种
   -- 粒度分布
   dx0   REAL, dx1   REAL, dx10  REAL, dx50  REAL,
   dx90  REAL, dx99  REAL, dx100 REAL,
@@ -127,7 +128,9 @@ ensureColumn('users', 'pwd_changed', 'INTEGER NOT NULL DEFAULT 1');
 ensureColumn('project_data', 'created_by', 'TEXT');
 ensureColumn('project_data', 'created_by_id', 'INTEGER');
 ensureColumn('project_data', 'updated_by', 'TEXT');
+ensureColumn('project_data', 'coke_type', 'TEXT');
 db.exec('CREATE INDEX IF NOT EXISTS idx_data_owner ON project_data(created_by_id)');
+db.exec('CREATE INDEX IF NOT EXISTS idx_data_coke ON project_data(coke_type)');
 
 // 角色规范化：用户名 admin 固定为系统管理员
 db.exec(`UPDATE users SET role = 'sys_admin' WHERE username = 'admin' AND role = 'admin'`);
@@ -151,9 +154,10 @@ if (orphanCount > 0) {
 const FIELDS = [
   { key: 'project_no',   label: '项目编号',   type: 'text' },
   { key: 'product_code', label: '产品代码',   type: 'text' },
-  { key: 'base',         label: '生产基地',   type: 'text' },
-  { key: 'process_code', label: '工序代码',   type: 'text' },
-  { key: 'work_order',   label: '工单编号',   type: 'text' },
+  { key: 'base',         label: '所属公司',   type: 'text' },
+  { key: 'process_code', label: '工序',       type: 'text' },
+  { key: 'work_order',   label: '工单号',     type: 'text' },
+  { key: 'coke_type',    label: '焦种',       type: 'text' },
   { key: 'dx0',   label: 'Dx(0)',   type: 'number' },
   { key: 'dx1',   label: 'Dx(1)',   type: 'number' },
   { key: 'dx10',  label: 'Dx(10)',  type: 'number' },

@@ -237,7 +237,7 @@ function serveStatic(req, res, pathname) {
 /* ============================================================ 业务路由 */
 
 const PROJECT_FILTERS = ['project_no', 'product_code', 'project_type', 'status', 'q'];
-const DATA_FILTERS = ['project_no', 'product_code', 'base', 'process_code', 'work_order'];
+const DATA_FILTERS = ['project_no', 'product_code', 'base', 'process_code', 'work_order', 'coke_type'];
 
 /* ---------- 元数据 ---------- */
 function getMeta(res, user) {
@@ -254,6 +254,7 @@ function getMeta(res, user) {
   const bases = distinct('base');
   const processes = distinct('process_code');
   const workOrders = distinct('work_order');
+  const cokeTypes = distinct('coke_type');
   const productCodes = isAdmin(user)
     ? db.prepare(`SELECT DISTINCT product_code AS v FROM projects WHERE product_code <> '' ORDER BY v`).all().map((r) => r.v)
     : distinct('product_code');
@@ -264,7 +265,7 @@ function getMeta(res, user) {
 
   ok(res, {
     fields: FIELDS,
-    options: { types, bases, processes, workOrders, productCodes, projectNos },
+    options: { types, bases, processes, workOrders, cokeTypes, productCodes, projectNos },
     projectMap,
     roles: Object.entries(ROLES).map(([key, v]) => ({ key, label: v.label })),
     permissions: {
@@ -369,8 +370,8 @@ function listData(res, params, user) {
   const kw = params.get('q');
   if (kw && kw.trim()) {
     const like = `%${kw.trim()}%`;
-    where.push(`(project_no LIKE ? OR product_code LIKE ? OR IFNULL(base,'') LIKE ? OR IFNULL(process_code,'') LIKE ? OR IFNULL(work_order,'') LIKE ? OR IFNULL(remark,'') LIKE ?)`);
-    args.push(like, like, like, like, like, like);
+    where.push(`(project_no LIKE ? OR product_code LIKE ? OR IFNULL(base,'') LIKE ? OR IFNULL(process_code,'') LIKE ? OR IFNULL(work_order,'') LIKE ? OR IFNULL(coke_type,'') LIKE ? OR IFNULL(remark,'') LIKE ?)`);
+    args.push(like, like, like, like, like, like, like);
   }
 
   // 普通用户只能看到自己录入的数据
@@ -403,11 +404,11 @@ function requireProject(projectNo) {
   return p || null;
 }
 
-/* ---------- 唯一键：项目编号 + 产品代码 + 生产基地 + 工序代码 + 工单编号 ---------- */
+/* ---------- 唯一键：项目编号 + 产品代码 + 所属公司 + 工序 + 工单号 ---------- */
 const DUP_KEYS = ['project_no', 'product_code', 'base', 'process_code', 'work_order'];
 const DUP_LABELS = {
   project_no: '项目编号', product_code: '产品代码',
-  base: '生产基地', process_code: '工序代码', work_order: '工单编号',
+  base: '所属公司', process_code: '工序', work_order: '工单号',
 };
 
 /** 五个字段是否全部有值（缺任意一项则不参与重复判定） */
