@@ -90,6 +90,19 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
 
 .content { flex: 1; overflow: auto; padding: 20px 24px 32px; }
 
+/* 页脚版权信息：固定在可视区底部，不参与内容滚动 */
+.app-footer {
+  flex: 0 0 auto;
+  display: flex; align-items: center; justify-content: center; flex-wrap: wrap;
+  gap: 6px; padding: 9px 24px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+  font-size: 11.5px; color: var(--text-3); line-height: 1.5;
+  user-select: none;
+}
+.app-footer .af-sep { opacity: .45; }
+.app-footer .af-license { color: var(--text-2); }
+
 /* ---------------------------------------------------------- 组件 */
 .btn {
   display: inline-flex; align-items: center; gap: 6px;
@@ -340,6 +353,10 @@ textarea.input { height: auto; min-height: 64px; padding: 8px 10px; resize: vert
 .lp b { display: block; font-size: 14.5px; margin-bottom: 5px; font-weight: 600; }
 .lp p { margin: 0; font-size: 12.8px; line-height: 1.7; opacity: .76; }
 .login-foot { font-size: 11.8px; opacity: .6; position: relative; z-index: 1; }
+.login-copy {
+  margin-top: 10px; font-size: 11.2px; line-height: 1.6; opacity: .42;
+  position: relative; z-index: 1;
+}
 
 .login-panel { display: grid; place-items: center; padding: 32px; background: var(--surface); }
 .login-card { width: 100%; max-width: 356px; }

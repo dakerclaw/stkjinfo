@@ -1492,6 +1492,14 @@ document.addEventListener('keydown', (e) => {
 /* ============================================================
    启动
    ============================================================ */
+/** 版权年份自动取当前年，避免跨年后信息过期 */
+function fillCopyrightYear() {
+  const y = String(new Date().getFullYear());
+  document.querySelectorAll('#copyrightYear, .copyright-year').forEach((n) => {
+    n.textContent = y;
+  });
+}
+
 async function refreshMeta() {
   state.meta = await API.get('/api/meta');
 }
@@ -1540,6 +1548,7 @@ function bindAuthEvents() {
 }
 
 (async function boot() {
+  fillCopyrightYear();
   bindAuthEvents();
   try {
     // 已有有效会话则直接进入
