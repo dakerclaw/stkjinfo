@@ -5,8 +5,16 @@
  *   node seed.js          首次初始化（已有数据则跳过示例数据）
  *   node seed.js --reset  清空项目/数据后重新灌入示例数据（保留用户）
  */
-const { db, hashPassword, makeSalt } = require('./server');
-const FIELDS = require('./db').FIELDS;
+const crypto = require('node:crypto');
+const { db, FIELDS } = require('./db');
+
+/* scrypt 散列（与 server.js 保持一致） */
+function hashPassword(password, salt) {
+  return crypto.scryptSync(password, salt, 64).toString('hex');
+}
+function makeSalt() {
+  return crypto.randomBytes(16).toString('hex');
+}
 
 const RESET = process.argv.includes('--reset');
 
@@ -137,5 +145,14 @@ function seedData() {
 
 seedUsers();
 seedData();
+
+// 关键：显式 checkpoint 并关闭数据库，把 WAL 中的数据合并进主库文件
+// 否则直接 process.exit 会丢失尚未落盘的数据
+try {
+  db.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+  db.close();
+} catch (e) {
+  console.warn('  警告：关闭数据库时出错 -', e.message);
+}
+
 console.log('\n  初始化完成。启动服务：npm start  然后访问 http://127.0.0.1:5173\n');
-process.exit(0);

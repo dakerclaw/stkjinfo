@@ -44,3 +44,12 @@ desktop.ini
 
 # 测试临时脚本
 .test-*.mjs
+
+# 部署临时文件（不纳入版本库）
+.pylibs/
+.patch.py
+.patch2.py
+.deploy-*.py
+.deploy-*.ps1
+patch_seed_deps.py
+deploy/*.tar.gz

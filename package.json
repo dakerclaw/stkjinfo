@@ -6,10 +6,11 @@
   "scripts": {
     "start": "node --no-warnings server.js",
     "seed": "node --no-warnings seed.js",
-    "reset": "node --no-warnings seed.js --reset"
+    "reset": "node --no-warnings seed.js --reset",
+    "lan": "HOST=0.0.0.0 node --no-warnings server.js"
   },
   "engines": {
-    "node": ">=22.5.0"
+    "node": ">=22.13.0"
   },
   "private": true
 }

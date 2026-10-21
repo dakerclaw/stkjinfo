@@ -990,4 +990,29 @@ server.listen(PORT, HOST, () => {
   console.log(`  数据库  : ${DB_FILE}\n`);
 });
 
+/* ---------- 优雅退出：把 WAL 中的数据落盘，避免停服丢失写入 ---------- */
+let closing = false;
+function shutdown(signal) {
+  if (closing) return;
+  closing = true;
+  console.log(`\n  收到 ${signal}，正在关闭 ...`);
+  server.close(() => {
+    try {
+      db.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+      db.close();
+      console.log('  数据库已安全关闭');
+    } catch (e) {
+      console.error('  关闭数据库出错:', e.message);
+    }
+    process.exit(0);
+  });
+  // 兜底：10 秒内没关完就强制退出
+  setTimeout(() => {
+    try { db.exec('PRAGMA wal_checkpoint(TRUNCATE);'); db.close(); } catch {}
+    process.exit(0);
+  }, 10000).unref();
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
 module.exports = { server, db, hashPassword, makeSalt };

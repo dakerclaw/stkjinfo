@@ -10,13 +10,25 @@ const path = require('node:path');
 const fs = require('node:fs');
 const { DatabaseSync } = require('node:sqlite');
 
-const DATA_DIR = path.join(__dirname, 'data');
+// 数据目录：可用 DATA_DIR 覆盖（部署到只读目录或独立数据盘时使用）
+const DATA_DIR = process.env.DATA_DIR
+  ? path.resolve(process.env.DATA_DIR)
+  : path.join(__dirname, 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-const DB_FILE = process.env.DB_FILE || path.join(DATA_DIR, 'app.db');
+const DB_FILE = process.env.DB_FILE
+  ? path.resolve(process.env.DB_FILE)
+  : path.join(DATA_DIR, 'app.db');
 
 const db = new DatabaseSync(DB_FILE);
 db.exec('PRAGMA journal_mode = WAL;');
+// FULL：每次事务提交都 fsync，宕机/断电不丢已提交数据（NORMAL 在 WAL 下可能丢最后一笔）
+db.exec('PRAGMA synchronous = FULL;');
+// 每积累 100 页自动 checkpoint，避免 WAL 无限增长、降低异常退出时的数据回退风险
+db.exec('PRAGMA wal_autocheckpoint = 100;');
+// 不允许 WAL 文件超过 64MB，超出立即 checkpoint
+db.exec('PRAGMA journal_size_limit = 67108864;');
 db.exec('PRAGMA foreign_keys = ON;');
+db.exec('PRAGMA busy_timeout = 5000;');
 
 /* ---------------------------------------------------------------- 建表 */
 
