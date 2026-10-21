@@ -1211,7 +1211,9 @@ async function renderUsers() {
     return;
   }
   actions().innerHTML = `<button class="btn btn-primary" onclick="openUserModal()">
-    <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>新增用户</button>`;
+    <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>新增用户</button>
+    <button class="btn" onclick="openUserImport()">
+      <svg viewBox="0 0 24 24"><path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>导入 Excel</button>`;
   const { rows } = await API.get('/api/users');
   state.users.rows = rows;
 
@@ -1261,6 +1263,157 @@ async function renderUsers() {
       </div>
       <div class="pagination"><span>密码以 scrypt 加盐散列存储，不保存明文；新增用户默认密码为账号</span></div>
     </div>`;
+}
+
+/** 用户批量导入：Excel 上传 → 服务端校验 → 预览 → 确认 */
+function openUserImport() {
+  if (!canManageUsers()) return toast('仅管理员可导入用户', 'err');
+  openModal({
+    title: '批量导入用户',
+    sub: '支持 .xlsx 文件；仅「账号」为必填，姓名、角色、状态、备注可选',
+    body: `
+      <div style="background:var(--primary-weak);border-radius:9px;padding:11px 13px;font-size:12.5px;color:#1e4fbf;line-height:1.75;margin-bottom:14px">
+        <b>必填一项</b>：账号（2-32 位字母、数字或 _ . @ -）。<br>
+        角色填「普通用户 / 管理员」（留空视为普通用户），状态填「启用 / 停用」（留空视为启用）。<br>
+        导入用户的<b>初始密码即账号本身</b>，首次登录后请及时修改；账号已存在时由你选择<b>覆盖</b>或<b>跳过</b>。<br>
+        <b>仅支持 .xlsx</b>（Excel 2007 及以上）。若是 .xls 或 .csv，请先用 Excel 另存为 .xlsx。
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+        <input type="file" id="excelFile" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" class="input" style="height:auto;padding:8px;flex:1;min-width:220px" />
+        <button class="btn btn-sm" onclick="downloadFile('/api/users/template')">下载导入模板</button>
+      </div>
+      <div id="importPreview"></div>`,
+    footer: `<button class="btn" onclick="closeModal()">取消</button>
+      <button class="btn btn-primary" id="okImport" disabled>开始导入</button>`,
+  });
+
+  el('#excelFile').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    const prev = el('#importPreview');
+    if (!file) return;
+    if (!/\.xlsx$/i.test(file.name)) {
+      prev.innerHTML = `<div style="color:var(--danger);font-size:12.5px">
+        仅支持 .xlsx 格式。请先用 Excel / WPS 打开后「另存为」Excel 工作簿（.xlsx）再上传。
+      </div>`;
+      el('#okImport').disabled = true;
+      return;
+    }
+
+    prev.innerHTML = `<div style="color:var(--text-3);font-size:12.5px">正在解析 ${esc(file.name)} …</div>`;
+    el('#okImport').disabled = true;
+
+    let info;
+    try {
+      const buf = await file.arrayBuffer();
+      info = await API.postRaw('/api/users/import-file', buf);
+    } catch (err) {
+      prev.innerHTML = `<div style="color:var(--danger);font-size:12.5px">${esc(err.message)}</div>`;
+      return;
+    }
+
+    const { matched = [], unknown = [], missingRequired = [], blankLabels = [], errors = [] } = info;
+    prev.innerHTML = `
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px">
+        <div style="background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:9px 11px">
+          <div style="font-size:11.5px;color:var(--text-3)">数据行</div>
+          <div style="font-size:19px;font-weight:650">${info.rowCount}</div>
+        </div>
+        <div style="background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:9px 11px">
+          <div style="font-size:11.5px;color:var(--text-3)">新增</div>
+          <div style="font-size:19px;font-weight:650;color:var(--ok,#16a34a)">${info.willInsert}</div>
+        </div>
+        <div style="background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:9px 11px">
+          <div style="font-size:11.5px;color:var(--text-3)">账号已存在</div>
+          <div style="font-size:19px;font-weight:650;color:${info.willDup ? 'var(--warn)' : 'var(--text)'}">${info.willDup}</div>
+        </div>
+      </div>
+      <div style="font-size:12.5px;line-height:1.9;color:var(--text-2)">
+        <div><b style="color:var(--text)">识别到的列：</b>
+          <span style="color:var(--text-3)">${matched.map((m) => esc(m.col)).join('、') || '无'}</span></div>
+        ${blankLabels.length ? `<div><b style="color:var(--text)">未提供的列（将留空）：</b>
+          <span style="color:var(--text-3)">${blankLabels.map(esc).join('、')}</span></div>` : ''}
+        ${unknown.length ? `<div style="margin-top:6px"><b style="color:var(--warn)">无法识别的列（将被忽略）：</b> ${unknown.map(esc).join('、')}</div>` : ''}
+        ${missingRequired.length ? `<div style="margin-top:8px;color:var(--danger);font-weight:600">缺少必填表头：${missingRequired.map(esc).join('、')}，请补充后重新选择文件。</div>` : ''}
+        ${info.errorCount ? `<div style="margin-top:8px;color:var(--danger)">
+            <b>${info.errorCount} 行校验未通过（导入时将被跳过）：</b>
+            <div style="margin-top:3px;color:var(--text-2)">${errors.map(esc).join('<br>')}</div>
+          </div>` : ''}
+      </div>`;
+
+    // 全部行都校验失败时不允许提交，避免空跑
+    const nothingToDo = info.rowCount - (info.errorCount || 0) <= 0;
+    el('#okImport').disabled = missingRequired.length > 0 || info.rowCount === 0 || nothingToDo;
+    el('#okImport')._token = info.token;
+  });
+
+  el('#okImport').addEventListener('click', async () => {
+    const token = el('#okImport')._token;
+    if (!token) return toast('请先选择 Excel 文件', 'err');
+
+    const runImport = (dupAction) =>
+      API.post('/api/users/import-confirm', dupAction ? { token, duplicate_action: dupAction } : { token });
+
+    const done = async (r, note) => {
+      closeModal();
+      let msg;
+      if (note) msg = note;
+      else {
+        const parts = [`新增 ${r.inserted} 个`];
+        if (r.overwritten) parts.push(`覆盖 ${r.overwritten} 个`);
+        if (r.skipped) parts.push(`跳过 ${r.skipped} 个`);
+        if (r.failed) parts.push(`失败 ${r.failed} 个`);
+        msg = `导入完成：${parts.join('、')}`;
+      }
+      toast(msg, r.failed ? 'err' : 'ok');
+      if (r.errors && r.errors.length) setTimeout(() => alert('部分行导入失败：\n' + r.errors.join('\n')), 300);
+      renderUsers();
+    };
+
+    try {
+      await done(await runImport());
+    } catch (e) {
+      if (e.status === 409 && e.code === 'DUPLICATE_KEY') {
+        const info = e.payload.duplicate || {};
+        const rowsHtml = (info.rows || []).length
+          ? `<div class="dup-rows"><table>
+              <thead><tr><th>Excel 行号</th><th>账号</th></tr></thead>
+              <tbody>${(info.rows || []).slice(0, 8).map((d) => `<tr>
+                <td>${esc(d.line)}</td><td>${esc(d.username)}</td></tr>`).join('')}
+              </tbody></table>
+              ${info.count > 8 ? `<div class="dup-more">另有 ${info.count - 8} 行未列出</div>` : ''}</div>`
+          : '';
+        openModal({
+          title: `有 ${info.count || 0} 个账号已存在`,
+          narrow: true,
+          body: `
+            <div class="dup-box">
+              <div class="dup-icon">!</div>
+              <div class="dup-text">
+                <p class="dup-lead">以下账号在系统中已经存在（共 ${info.count || 1} 个）。</p>
+                ${rowsHtml}
+              </div>
+            </div>
+            <p class="dup-hint">
+              <b>覆盖已有</b>：用本次文件中的姓名、角色、状态、备注更新已有账号（<b>不改密码</b>；系统管理员账号一律跳过）<br />
+              <b>跳过已存在</b>：只导入新账号，已有的保持不变
+            </p>`,
+          footer: `<button class="btn" onclick="closeModal()">取消</button>
+            <button class="btn" id="dupSkip">跳过已存在</button>
+            <button class="btn btn-primary" id="dupOverwrite">覆盖已有</button>`,
+        });
+        const pick = (choice) => {
+          closeModal();
+          runImport(choice).then((r) => done(r, choice === 'overwrite'
+            ? `导入完成：覆盖 ${r.overwritten} 个、新增 ${r.inserted} 个`
+            : `导入完成：跳过 ${r.skipped} 个、新增 ${r.inserted} 个`)).catch((err) => toast(err.message, 'err'));
+        };
+        el('#dupOverwrite').addEventListener('click', () => pick('overwrite'));
+        el('#dupSkip').addEventListener('click', () => pick('skip'));
+        return;
+      }
+      toast(e.message, 'err');
+    }
+  });
 }
 
 function openUserModal(id) {

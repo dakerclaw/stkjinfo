@@ -9,7 +9,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { db, DB_FILE, FIELDS } = require('./db');
 const xlsx = require('./xlsx');
-const { normHeader, buildHeaderMap, isBlank } = require('./import-map');
+const { normHeader, buildHeaderMap, isBlank, USER_IMPORT_FIELDS } = require('./import-map');
 
 const PORT = Number(process.env.PORT || 5173);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -303,7 +303,7 @@ function exportTemplateXlsx(res, params) {
 const importTokens = new Map(); // token -> { kind:'data'|'project', rows, user, at }
 const IMPORT_TTL = 30 * 60 * 1000;
 
-function newImportToken(rows, user, kind = 'data') {
+function newImportToken(rows, user, kind = 'data', lines = null) {
   // 清理过期批次
   const now = Date.now();
   for (const [k, v] of importTokens) if (now - v.at > IMPORT_TTL) importTokens.delete(k);
@@ -313,7 +313,7 @@ function newImportToken(rows, user, kind = 'data') {
     if (oldest) importTokens.delete(oldest[0]);
   }
   const token = crypto.randomBytes(16).toString('hex');
-  importTokens.set(token, { kind, rows, user: user.username, at: now });
+  importTokens.set(token, { kind, rows, lines, user: user.username, at: now });
   return token;
 }
 
@@ -351,21 +351,26 @@ async function parseUpload(req, fields, requiredLabels) {
   );
 
   const dataRows = table.slice(1).filter((r) => r.some((c) => !isBlank(c)));
-  const rows = dataRows
-    .map((r) => {
-      const out = {};
-      headers.forEach((h, i) => {
-        const key = headerMap.get(normHeader(h));
-        if (!key || isBlank(r[i])) return;
-        out[key] = r[i] === undefined ? '' : r[i];
-      });
-      return out;
-    })
-    .filter((o) => Object.keys(o).length > 0);
+  const rows = [];
+  const lines = [];
+  dataRows.forEach((r, i) => {
+    const out = {};
+    let filled = 0;
+    headers.forEach((h, idx) => {
+      const key = headerMap.get(normHeader(h));
+      if (!key || isBlank(r[idx])) return;
+      out[key] = r[idx] === undefined ? '' : r[idx];
+      filled++;
+    });
+    if (!filled) return;
+    rows.push(out);
+    lines.push(i + 2); // 对应真实 Excel 行号（第 1 行是表头）
+  });
 
   return {
     dataRows: dataRows.length,
     rows,
+    lines, // 与 rows 一一对应，供错误提示定位行号（不污染行数据本身）
     matched,
     unknown,
     missingRequired,
@@ -407,6 +412,22 @@ function importByToken(res, body, user) {
         success: false,
         code: 'DUPLICATE_KEY',
         message: `有 ${out.dup.count} 个项目编号已存在`,
+        duplicate: out.dup,
+      });
+    }
+    importTokens.delete(token);
+    return ok(res, out.result);
+  }
+
+  if (item.kind === 'user') {
+    // 权限在会话期间可能被调整，按当前操作人重新判定
+    if (!isAdmin(user)) return fail(res, 403, '仅管理员可导入用户');
+    const out = performUserImport(item.rows, String(body.duplicate_action || '').toLowerCase(), user, item.lines);
+    if (out.dup) {
+      return send(res, 409, {
+        success: false,
+        code: 'DUPLICATE_KEY',
+        message: `有 ${out.dup.count} 个账号已存在`,
         duplicate: out.dup,
       });
     }
@@ -1191,6 +1212,206 @@ function getStats(res, user) {
   ok(res, { stats: { projectCount, dataCount, typeCount, baseCount, qtySum, byType, byBase, recent } });
 }
 
+/* ---------- 用户批量导入 ---------- */
+
+/** 账号校验规则（与 createUser 保持一致） */
+const USERNAME_RE = /^[A-Za-z0-9_.@-]{2,32}$/;
+
+/** 角色文本 → role 值；无法识别返回 null（只接受完整写法，避免「管理」这类简写误判） */
+function parseRole(v) {
+  const s = String(v === null || v === undefined ? '' : v).trim();
+  if (!s) return 'user';
+  if (/^(系统管理员|超级管理员|sys_?admin|superadmin|root)$/i.test(s)) return 'sys_admin';
+  if (/^(管理员|admin|administrator)$/i.test(s)) return 'admin';
+  if (/^(普通用户|用户|user|member|guest)$/i.test(s)) return 'user';
+  return null;
+}
+
+/** 用户导入模板（角色/状态列按权限裁剪，避免给出无权填写的示例） */
+function exportUserTemplateXlsx(res, user) {
+  const role = isSysAdmin(user) ? '管理员' : '普通用户';
+  const table = [USER_IMPORT_FIELDS.map((f) => f.label), ['zhangsan', '张三', role, '启用', '示例：生产部']];
+  sendXlsx(res, xlsx.build(table, '导入模板'), `用户导入模板_${todayStr()}.xlsx`);
+}
+
+/**
+ * 逐行校验，预览和落库共用同一套规则：
+ *   allowAdmin = 当前操作人是否可导入「管理员」角色
+ * 返回 { clean[], errors[] }，clean 每项为可直接入库的字段对象
+ */
+function validateUserRows(rows, allowAdmin, lines) {
+  const clean = [];
+  const errors = [];
+  const seen = new Set();
+  rows.forEach((raw, i) => {
+    // 行号优先取解析阶段记录的真实 Excel 行号
+    const line = (lines && lines[i]) || i + 2;
+    const username = String(raw.username || '').trim();
+    if (!username) {
+      errors.push(`第 ${line} 行：缺少账号`);
+      return;
+    }
+    if (!USERNAME_RE.test(username)) {
+      errors.push(`第 ${line} 行：账号「${username}」格式不正确，需为 2-32 位字母、数字或 _ . @ -`);
+      return;
+    }
+    if (seen.has(username.toLowerCase())) {
+      errors.push(`第 ${line} 行：账号 ${username} 在文件中重复出现`);
+      return;
+    }
+    seen.add(username.toLowerCase());
+
+    // roleGiven=false 表示文件未提供角色，覆盖已有账号时保持原角色不变
+    const roleGiven = String(raw.role === null || raw.role === undefined ? '' : raw.role).trim() !== '';
+    const role = parseRole(raw.role);
+    if (role === null) {
+      errors.push(`第 ${line} 行：角色「${String(raw.role).trim()}」无法识别，请填写「普通用户」或「管理员」`);
+      return;
+    }
+    if (role === 'sys_admin') {
+      errors.push(`第 ${line} 行：不支持通过导入创建系统管理员`);
+      return;
+    }
+    if (role === 'admin' && !allowAdmin) {
+      errors.push(`第 ${line} 行：仅系统管理员可导入管理员账号`);
+      return;
+    }
+
+    clean.push({
+      line,
+      username,
+      roleGiven,
+      real_name: String(raw.real_name || '').trim() || null,
+      role,
+      status: parseStatus(raw.status),
+      remark: String(raw.remark || '').trim() || null,
+    });
+  });
+  return { clean, errors };
+}
+
+/** 上传用户 Excel → 预览（不改库），返回批次 token 与新增/已存在统计 */
+async function previewUserImportFile(res, req, user) {
+  const p = await parseUpload(req, USER_IMPORT_FIELDS, ['账号']);
+  if (p.error) return fail(res, 400, p.error);
+
+  // 保留每条数据行对应的真实 Excel 行号，过滤时一并过滤
+  const keep = p.rows.map((o, i) => (String(o.username || '').trim() ? i : -1)).filter((i) => i >= 0);
+  const rows = keep.map((i) => p.rows[i]);
+  const lines = keep.map((i) => p.lines[i]);
+  if (!rows.length && !p.missingRequired.length) return fail(res, 400, '没有可导入的有效数据行');
+
+  const { clean, errors } = validateUserRows(rows, isSysAdmin(user), lines);
+  const existSet = new Set(db.prepare('SELECT username FROM users').all().map((r) => r.username.toLowerCase()));
+  let willInsert = 0;
+  let willDup = 0;
+  for (const r of clean) {
+    if (existSet.has(r.username.toLowerCase())) willDup++;
+    else willInsert++;
+  }
+
+  const token = newImportToken(rows, user, 'user', lines);
+  ok(res, {
+    token,
+    kind: 'user',
+    rowCount: rows.length,
+    dataRows: p.dataRows,
+    matched: p.matched,
+    unknown: p.unknown,
+    missingRequired: p.missingRequired,
+    blankLabels: USER_IMPORT_FIELDS.filter((f) => !p.parsedKeys.has(f.key)).map((f) => f.label),
+    willInsert,
+    willDup,
+    errorCount: errors.length,
+    errors: errors.slice(0, 20),
+  });
+}
+
+/**
+ * 用户导入落库：
+ *   duplicate_action = 'overwrite' 覆盖已存在账号的姓名/角色/状态/备注（不动密码）；
+ *   'skip' 跳过已存在账号；未指定且存在重复 → 返回 dup 让前端确认。
+ * 新用户密码一律为账号本身（pwd_changed = 0，登录后会提示修改）。
+ */
+function performUserImport(rows, action, actor, lines) {
+  const { clean, errors } = validateUserRows(rows, isSysAdmin(actor), lines);
+  const existMap = new Map(db.prepare('SELECT id, username, role FROM users').all().map((u) => [u.username.toLowerCase(), u]));
+  let inserted = 0;
+  let overwritten = 0;
+  let skipped = 0;
+  const dupRows = [];
+
+  db.exec('BEGIN');
+  try {
+    for (const r of clean) {
+      const cur = existMap.get(r.username.toLowerCase());
+      if (cur) {
+        // 系统管理员账号一律不允许通过导入改写（含不改动作的预览阶段）
+        if (cur.role === 'sys_admin') {
+          errors.push(`第 ${r.line} 行：${cur.username} 是系统管理员账号，不可通过导入修改`);
+          continue;
+        }
+        // 非系统管理员无权改写其他管理员；但可以改写自己的账号
+        if (cur.role === 'admin' && !isSysAdmin(actor) && cur.id !== actor.id) {
+          errors.push(`第 ${r.line} 行：${cur.username} 是管理员账号，仅系统管理员可修改`);
+          continue;
+        }
+        if (!action) {
+          dupRows.push({ line: r.line, username: cur.username, existingId: cur.id });
+          continue;
+        }
+        if (action === 'skip') {
+          skipped++;
+          continue;
+        }
+        const patch = { status: r.status };
+        if (r.real_name) patch.real_name = r.real_name;
+        if (r.remark) patch.remark = r.remark;
+        // 角色只在文件明确提供时才变更，避免覆盖时把管理员降级为普通用户
+        if (r.roleGiven && r.role !== cur.role) {
+          if (!isSysAdmin(actor)) {
+            errors.push(`第 ${r.line} 行：仅系统管理员可变更角色（${cur.username}）`);
+            continue;
+          }
+          patch.role = r.role;
+        }
+        update('users', cur.id, patch, { touch: false });
+        // 停用后强制退出该用户已登录的会话
+        if (r.status === 0) destroyUserSessions(cur.id);
+        overwritten++;
+        continue;
+      }
+
+      const salt = makeSalt();
+      insert('users', {
+        username: r.username,
+        salt,
+        password_hash: hashPassword(r.username, salt), // 初始密码 = 账号
+        real_name: r.real_name,
+        role: r.role,
+        status: r.status,
+        remark: r.remark,
+        pwd_changed: 0,
+      });
+      existMap.set(r.username.toLowerCase(), { id: 1, username: r.username, role: r.role });
+      inserted++;
+    }
+
+    if (dupRows.length > 0) {
+      db.exec('ROLLBACK');
+      return {
+        dup: { mode: 'user', count: dupRows.length, total: clean.length, rows: dupRows.slice(0, 50) },
+      };
+    }
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+
+  return { result: { inserted, overwritten, skipped, failed: errors.length, errors: errors.slice(0, 20) } };
+}
+
 /* ---------- 用户 ---------- */
 function listUsers(res) {
   const rows = db
@@ -1450,6 +1671,12 @@ async function handleApi(req, res, url) {
     if (p === '/api/users') {
       if (m === 'GET') return listUsers(res);
       if (m === 'POST') return createUser(res, await readBody(req), user);
+    }
+    // 用户批量导入（三个子路径都要在 id 分支之前拦截）
+    if (p === '/api/users/template' && m === 'GET') return exportUserTemplateXlsx(res, user);
+    if (p === '/api/users/import-file' && m === 'POST') return previewUserImportFile(res, req, user);
+    if (p === '/api/users/import-confirm' && m === 'POST') {
+      return importByToken(res, await readBody(req), user);
     }
     const id = Number(seg[1]);
     if (m === 'PUT' || m === 'PATCH') return updateUser(res, id, await readBody(req), user);

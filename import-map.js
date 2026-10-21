@@ -5,6 +5,15 @@
  */
 const { FIELDS } = require('./db');
 
+/** 用户导入使用的字段集合（不含 password，密码单独按需处理） */
+const USER_IMPORT_FIELDS = [
+  { key: 'username', label: '账号', type: 'text' },
+  { key: 'real_name', label: '姓名', type: 'text' },
+  { key: 'role', label: '角色', type: 'text' },
+  { key: 'status', label: '状态', type: 'text' },
+  { key: 'remark', label: '备注', type: 'text' },
+];
+
 /** 空值判定：与后端 normalizeImportValue 的 BLANK_RE 保持一致 */
 const BLANK_RE = /^(|\s*|-{1,2}|\/|—|n\/?a|null|nan|无|未检|未检测|未测|待检)$/i;
 const isBlank = (v) => BLANK_RE.test(String(v === null || v === undefined ? '' : v).trim());
@@ -73,6 +82,12 @@ function buildHeaderMap(fields = FIELDS) {
     生产数量: ['数量', '产量'],
     录入日期: ['日期', '检测日期'],
     备注: ['说明', '备注信息'],
+    // 用户导入
+    账号: ['用户名', '登录名', '登录账号', '用户名账号'],
+    姓名: ['真实姓名', '名字', '员工姓名'],
+    角色: ['用户角色', '权限', '身份'],
+    状态: ['用户状态'],
+    初始密码: ['密码', '登录密码'],
   };
   for (const [label, list] of Object.entries(alias)) {
     const key = map.get(normHeader(label));
@@ -98,4 +113,4 @@ function mapImportRow(raw, headerMap) {
   return { out, skipped };
 }
 
-module.exports = { normHeader, buildHeaderMap, isBlank, BLANK_RE };
+module.exports = { normHeader, buildHeaderMap, isBlank, BLANK_RE, USER_IMPORT_FIELDS };
