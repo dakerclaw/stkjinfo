@@ -61,7 +61,7 @@ const state = {
   view: 'dashboard',
   user: null,
   meta: null,
-  projects: { filters: {}, sort: '', dir: 'asc' },
+  projects: { filters: {}, sort: '', dir: 'asc', selected: new Set() },
   data: { filters: {}, sort: '', dir: 'asc', page: 1, pageSize: 20, selected: new Set() },
   users: { rows: [] },
 };
@@ -197,7 +197,10 @@ async function renderProjects() {
       <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>新增项目
     </button>
     <button class="btn" onclick="openProjectImport()">导入 Excel</button>` : ''}
-    <button class="btn" onclick="exportProjects()">导出 Excel</button>`;
+    <button class="btn" onclick="exportProjects()">导出 Excel</button>
+    ${canManageProjects() ? `
+    <button class="btn btn-sm" id="bulkStOn" style="display:none" onclick="bulkProjectStatus(1)">设为进行中 (<span id="selStOn">0</span>)</button>
+    <button class="btn btn-sm" id="bulkStOff" style="display:none" onclick="bulkProjectStatus(0)">设为已归档 (<span id="selStOff">0</span>)</button>` : ''}`;
 
   content().innerHTML = `
     <div class="filters">
@@ -273,16 +276,20 @@ async function loadProjects() {
   // 可排序列：编号 / 产品代码 / 数据条数 / 最近录入 / 状态
   const SORTABLE = new Set(['project_no', 'product_code', 'data_count', 'last_entry', 'status']);
   const sorted = state.projects.sort;
+  // 管理员可见勾选列，用于批量修改状态
+  const showChk = canManageProjects();
   box.innerHTML = `
     <div class="table-wrap" style="max-height:calc(100vh - 340px)">
       <table class="data-table">
         <thead><tr>
+          ${showChk ? '<th style="width:40px"><input type="checkbox" id="checkAllP" style="accent-color:var(--primary)" /></th>' : ''}
           ${cols.map(([k, label]) => SORTABLE.has(k)
             ? `<th class="sortable ${sorted === k ? 'sorted' : ''}" data-sort="${k}" title="点击切换升序 / 降序">${label}<span class="arrow">${sorted === k ? (state.projects.dir === 'asc' ? '▲' : '▼') : '↕'}</span></th>`
             : `<th>${label}</th>`).join('')}
         </tr></thead>
         <tbody>
           ${rows.map((r) => `<tr>
+            ${showChk ? `<td><input type="checkbox" class="rowChkP" data-id="${r.id}" style="accent-color:var(--primary)" ${state.projects.selected.has(r.id) ? 'checked' : ''} /></td>` : ''}
             <td class="col-sticky"><span class="code-chip">${esc(r.project_no)}</span></td>
             <td>${esc(r.product_code)}</td>
             <td><span class="type-tag ${typeClass(r.project_type)}">${esc(r.project_type)}</span></td>
@@ -304,6 +311,24 @@ async function loadProjects() {
       </table>
     </div>
     <div class="pagination"><span>共 <b>${total}</b> 个项目</span></div>`;
+
+  // 勾选（批量修改状态用）
+  box.querySelectorAll('.rowChkP').forEach((cb) => {
+    cb.addEventListener('change', () => {
+      const id = Number(cb.dataset.id);
+      cb.checked ? state.projects.selected.add(id) : state.projects.selected.delete(id);
+      updateProjSelCount();
+    });
+  });
+  el('#checkAllP')?.addEventListener('change', (e) => {
+    box.querySelectorAll('.rowChkP').forEach((cb) => {
+      cb.checked = e.target.checked;
+      const id = Number(cb.dataset.id);
+      e.target.checked ? state.projects.selected.add(id) : state.projects.selected.delete(id);
+    });
+    updateProjSelCount();
+  });
+  updateProjSelCount();
 
   box.querySelectorAll('th.sortable').forEach((th) => {
     th.addEventListener('click', () => {
@@ -328,6 +353,46 @@ function gotoDataForProject(pno) {
   state.data.selected.clear();
   state.data.onlySelected = false;
   navigate('data');
+}
+
+/** 更新批量状态按钮的可见性与计数 */
+function updateProjSelCount() {
+  const n = state.projects.selected.size;
+  for (const [btn, cnt] of [['#bulkStOn', '#selStOn'], ['#bulkStOff', '#selStOff']]) {
+    const b = el(btn); const c = el(cnt);
+    if (c) c.textContent = n;
+    if (b) b.style.display = n ? 'inline-flex' : 'none';
+  }
+}
+
+function clearProjectSelection() {
+  state.projects.selected.clear();
+  updateProjSelCount();
+  // 同步表格里的勾选框（若已渲染）
+  document.querySelectorAll('.rowChkP').forEach((cb) => { cb.checked = false; });
+  const all = el('#checkAllP');
+  if (all) all.checked = false;
+}
+
+/** 批量修改所选项目状态 */
+function bulkProjectStatus(status) {
+  const ids = [...state.projects.selected];
+  if (!ids.length || !canManageProjects()) return;
+  const label = status ? '进行中' : '已归档';
+  openModal({
+    title: '批量修改状态', narrow: true,
+    body: `<p style="margin:0;color:var(--text-2)">确定把选中的 <b>${ids.length}</b> 个项目状态批量改为「<b>${label}</b>」吗？</p>`,
+    footer: `<button class="btn" onclick="closeModal()">取消</button><button class="btn btn-primary" id="okBulkSt">确认修改</button>`,
+  });
+  el('#okBulkSt').addEventListener('click', async () => {
+    try {
+      const r = await API.post('/api/projects/batch-status', { ids, status });
+      clearProjectSelection();
+      closeModal();
+      toast(`已将 ${r.updated} 个项目设为${label}`, 'ok');
+      loadProjects();
+    } catch (e) { toast(e.message, 'err'); }
+  });
 }
 
 function exportProjects() {

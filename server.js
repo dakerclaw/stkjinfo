@@ -872,6 +872,26 @@ function updateProject(res, id, body) {
   ok(res);
 }
 
+/**
+ * 批量修改项目状态（仅管理员）。
+ * body: { ids: number[], status: 0 | 1 }
+ * 单条 SQL 的 IN 更新即可保证原子性；返回实际改动的行数（含已是目标状态的行）。
+ */
+function batchUpdateProjectStatus(res, body, user) {
+  if (!isAdmin(user)) return fail(res, 403, '仅管理员可修改项目');
+  const ids = Array.isArray(body.ids) ? [...new Set(body.ids.map(Number).filter(Number.isFinite))] : [];
+  if (ids.length === 0) return fail(res, 400, '请选择要修改的项目');
+  const status = body.status === 0 || body.status === '0' ? 0 : body.status === 1 || body.status === '1' ? 1 : null;
+  if (status === null) return fail(res, 400, '状态值不合法，仅支持 0（已归档）或 1（进行中）');
+  if (ids.length > 500) return fail(res, 400, '单次最多修改 500 个项目');
+
+  const marks = ids.map(() => '?').join(',');
+  const info = db
+    .prepare(`UPDATE projects SET status = ?, updated_at = ? WHERE id IN (${marks})`)
+    .run(status, nowStr(), ...ids);
+  ok(res, { updated: info.changes, status });
+}
+
 function deleteProject(res, id) {
   const cur = db.prepare('SELECT * FROM projects WHERE id = ?').get(id);
   if (!cur) return fail(res, 404, '项目不存在');
@@ -1680,6 +1700,10 @@ async function handleApi(req, res, url) {
     if (!isAdmin(user)) return fail(res, 403, '仅管理员可导入项目');
     return importByToken(res, await readBody(req), user);
   }
+  if (p === '/api/projects/batch-status' && m === 'POST') {
+    return batchUpdateProjectStatus(res, await readBody(req), user);
+  }
+  // 注意：batch-status 必须在下方 seg[1] 的 id 分支之前拦截，否则会被当成 id 解析成 NaN
   if (seg[0] === 'projects' && seg[1]) {
     const id = Number(seg[1]);
     if (m === 'GET') return getProject(res, id);

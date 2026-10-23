@@ -191,6 +191,13 @@ node seed.js --reset   # 清空项目与数据后重新灌入示例（保留用�
 - 「导出 Excel」与当前列表**同口径**：带上同样的筛选条件与排序方式
 - 排序参数只接受白名单内的列名，非法值自动回退默认排序（按录入顺序倒序），不影响数据安全
 
+### 项目列表批量修改状态（仅管理员）
+
+- 管理员在项目列表勾选若干项目（表头可全选 / 取消全选），操作栏会出现「设为进行中 / 设为已归档」两个批量按钮
+- 点击后在弹窗中确认，一次性把所选项目状态改为目标值；提交后清空勾选并刷新列表
+- 接口：`POST /api/projects/batch-status`，请求体 `{ids: number[], status: 0 | 1}`，返回 `{updated}`（实际改动的行数）
+- 校验：ids 自动去重、忽略非法值；单次最多 500 个；普通用户请求返回 403
+
 ### 用户批量导入（仅管理员）
 
 用户管理页支持 Excel 批量创建账号，用于人员集中入职时一次性建号，**仅管理员可操作**。
@@ -222,6 +229,7 @@ node seed.js --reset   # 清空项目与数据后重新灌入示例（保留用�
 | GET | /api/stats | 总览统计（普通用户仅统计自己的数据） |
 | GET/POST | /api/projects | 项目列表（全员，支持 `project_no` / `product_code` / `project_type` / `status` 筛选、`sort` / `dir` 排序）/ 新建（管理员） |
 | GET/PUT/DELETE | /api/projects/:id | 项目详情 / 更新（管理员）/ 删除（管理员，级联删数据） |
+| POST | /api/projects/batch-status | 批量修改项目状态 `{ids, status}`，返回 `{updated}`（仅管理员） |
 | GET/POST | /api/data | 数据列表（分页，普通用户仅自己的）/ 新建（五项重复时 409） |
 | GET/PUT/DELETE | /api/data/:id | 详情 / 更新（本人或管理员）/ 删除（管理员） |
 | POST | /api/data/bulk-delete | 批量删除 `{ids:[]}`（管理员） |
