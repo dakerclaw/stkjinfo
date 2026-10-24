@@ -62,7 +62,7 @@ const state = {
   user: null,
   meta: null,
   projects: { filters: {}, sort: '', dir: 'asc', selected: new Set(), onlySelected: false, rows: [] },
-  data: { filters: {}, sort: '', dir: 'asc', page: 1, pageSize: 20, selected: new Set() },
+  data: { filters: {}, sort: '', dir: 'asc', page: 1, pageSize: 20, selected: new Set(), facets: null, facetsSeq: 0 },
   users: { rows: [] },
   audit: { filters: {}, page: 1, pageSize: 50 },
 };
@@ -570,6 +570,14 @@ const TEXT_FIELDS = () => F().filter((f) => f.type !== 'number');
 async function renderData() {
   const f = state.data.filters;
   const o = state.meta.options;
+  // 四个下拉用「筛选联动」结果（随其他筛选收窄）；没有时退回 meta 的全量选项
+  const fo = state.data.facets || {};
+  const facetOpts = {
+    bases: fo.bases || o.bases,
+    processes: fo.processes || o.processes,
+    workOrders: fo.workOrders || o.workOrders,
+    cokeTypes: fo.cokeTypes || o.cokeTypes,
+  };
   // 从项目列表跳转过来时，目标编号可能不在当前用户可见的下拉选项里，需临时补入
   const pnoOpts = [...o.projectNos];
   if (f.project_no && !pnoOpts.includes(f.project_no)) pnoOpts.unshift(f.project_no);
@@ -594,16 +602,16 @@ async function renderData() {
           <select class="select" id="dPc"><option value="">全部</option>${o.productCodes.map((v) => `<option ${f.product_code === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>
         </div>
         <div class="field w-160"><label>所属公司</label>
-          <select class="select" id="dBase"><option value="">全部</option>${o.bases.map((v) => `<option ${f.base === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>
+          <select class="select" id="dBase"><option value="">全部</option>${facetOpts.bases.map((v) => `<option ${f.base === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>
         </div>
         <div class="field w-140"><label>工序</label>
-          <select class="select" id="dProc"><option value="">全部</option>${o.processes.map((v) => `<option ${f.process_code === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>
+          <select class="select" id="dProc"><option value="">全部</option>${facetOpts.processes.map((v) => `<option ${f.process_code === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>
         </div>
         <div class="field w-140"><label>工单号</label>
-          <select class="select" id="dWo"><option value="">全部</option>${o.workOrders.map((v) => `<option ${f.work_order === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>
+          <select class="select" id="dWo"><option value="">全部</option>${facetOpts.workOrders.map((v) => `<option ${f.work_order === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>
         </div>
         <div class="field w-140"><label>焦种</label>
-          <select class="select" id="dCoke"><option value="">全部</option>${(o.cokeTypes || []).map((v) => `<option ${f.coke_type === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>
+          <select class="select" id="dCoke"><option value="">全部</option>${facetOpts.cokeTypes.map((v) => `<option ${f.coke_type === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>
         </div>
         <div class="field w-160"><label>关键词</label>
           <input class="input" id="dKw" placeholder="模糊搜索…" value="${esc(f.q || '')}" />
@@ -651,19 +659,61 @@ async function renderData() {
     state.data.selected.clear();
     updateSelCount();
     loadData();
+    refreshDataOptions();
   };
   ['dPno', 'dPc', 'dBase', 'dProc', 'dWo', 'dCoke', 'dFrom', 'dTo'].forEach((id) => el('#' + id).addEventListener('change', reload));
   el('#dKw').addEventListener('input', debounce(reload, 240));
   el('#onlySel').addEventListener('change', (e) => { state.data.onlySelected = e.target.checked; loadData(); });
 
   loadData();
+  refreshDataOptions();
 }
 
 function clearDataFilters() {
   state.data.filters = {};
   state.data.page = 1;
   state.data.selected.clear();
+  state.data.facets = null;
   renderData();
+}
+
+/**
+ * 筛选联动：按当前全部筛选条件重新取四个下拉的可选值。
+ * 服务端每列都会排除自身条件，所以选中某列后仍能切换到同列其他值。
+ */
+async function refreshDataOptions() {
+  const qs = new URLSearchParams();
+  Object.entries(state.data.filters).forEach(([k, v]) => { if (v) qs.set(k, v); });
+  const seq = (state.data.facetsSeq = (state.data.facetsSeq || 0) + 1);
+  let r;
+  try {
+    r = await API.get('/api/data/facets?' + qs.toString());
+  } catch {
+    return;
+  }
+  if (seq !== state.data.facetsSeq) return; // 已有更新的请求，丢弃过期响应
+  state.data.facets = r.options || null;
+  applyDataOptions();
+}
+
+/** 把联动结果写回四个下拉，保留当前选中值（即使它已不在结果里） */
+function applyDataOptions() {
+  const fo = state.data.facets;
+  if (!fo) return;
+  const f = state.data.filters;
+  const fill = (id, list, cur) => {
+    const box = el('#' + id);
+    if (!box) return;
+    const vals = [...(list || [])];
+    if (cur && !vals.includes(cur)) vals.unshift(cur);
+    box.innerHTML = `<option value="">全部</option>`
+      + vals.map((v) => `<option value="${esc(v)}"${v === cur ? ' selected' : ''}>${esc(v)}</option>`).join('');
+    box.value = cur || '';
+  };
+  fill('dBase', fo.bases, f.base);
+  fill('dProc', fo.processes, f.process_code);
+  fill('dWo', fo.workOrders, f.work_order);
+  fill('dCoke', fo.cokeTypes, f.coke_type);
 }
 
 async function loadData() {
@@ -979,7 +1029,7 @@ function bulkDelete() {
     try {
       const r = await API.post('/api/data/bulk-delete', { ids });
       state.data.selected.clear();
-      closeModal(); toast(`已删除 ${r.deleted} 条记录`, 'ok'); loadData();
+      closeModal(); toast(`已删除 ${r.deleted} 条记录`, 'ok'); loadData(); refreshDataOptions();
     } catch (e) { toast(e.message, 'err'); }
   });
 }
@@ -2014,6 +2064,8 @@ function fillCopyrightYear() {
 
 async function refreshMeta() {
   state.meta = await API.get('/api/meta');
+  // 数据有变动后，筛选联动的可选值也要跟着更新（仅数据页需要）
+  if (state.view === 'data') refreshDataOptions();
 }
 
 /** 登录成功后进入主应用 */

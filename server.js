@@ -1223,6 +1223,29 @@ function listData(res, params, user) {
   ok(res, { rows, total, page, pageSize });
 }
 
+/**
+ * 数据页筛选联动：按当前筛选条件返回各下拉的可选值。
+ * 每列都排除自身条件（否则选中后同列其他值会消失、无法切换），
+ * 其余条件（项目 / 产品 / 关键词 / 日期 / 权限）全部参与过滤。
+ */
+function dataFacets(res, params, user) {
+  const dims = [
+    ['bases', 'base'],
+    ['processes', 'process_code'],
+    ['workOrders', 'work_order'],
+    ['cokeTypes', 'coke_type'],
+  ];
+  const options = {};
+  for (const [name, col] of dims) {
+    const p = new URLSearchParams(params);
+    [col, 'page', 'pageSize', 'sort', 'dir', 'ids', 'onlySelected'].forEach((k) => p.delete(k));
+    const { w, args } = buildDataWhere(p, user);
+    const sql = `SELECT DISTINCT ${col} AS v FROM project_data${w} AND ${col} IS NOT NULL AND ${col} <> ''`;
+    options[name] = db.prepare(sql).all(...args).map((r) => r.v).sort(cmpText);
+  }
+  ok(res, { options });
+}
+
 function getData(res, id, user) {
   const row = db.prepare('SELECT * FROM project_data WHERE id = ? AND deleted_at IS NULL').get(id);
   if (!row) return fail(res, 404, '数据记录不存在');
@@ -2208,6 +2231,8 @@ async function handleApi(req, res, url) {
   }
   // Excel 导出 / 上传解析（需登录，导出受归属过滤限制）
   if (p === '/api/data/export' && m === 'GET') return exportDataXlsx(res, q, user);
+  // 筛选联动：返回各下拉在当前筛选下的可选值
+  if (p === '/api/data/facets' && m === 'GET') return dataFacets(res, q, user);
   if (p === '/api/data/template' && m === 'GET') return exportTemplateXlsx(res, q);
   if (p === '/api/data/import-file' && m === 'POST') return previewImportFile(res, req, user);
   if (p === '/api/data/import-confirm' && m === 'POST') {

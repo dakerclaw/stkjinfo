@@ -254,6 +254,7 @@ node seed.js --reset   # 清空项目与数据后重新灌入示例（保留用�
 | POST | /api/data/bulk-delete | 批量删除 `{ids:[]}`（管理员） |
 | POST | /api/data/import | JSON 导入 `{rows:[], duplicate_action?}`，允许部分字段；返回留空字段清单 |
 | GET | /api/data/export | 导出检测数据为 Excel，按筛选条件；传 `ids` 时只导出勾选的记录 |
+| GET | /api/data/facets | 筛选联动：按当前筛选条件返回「所属公司 / 工序 / 工单号 / 焦种」的可选值（每列排除自身条件） |
 | GET | /api/data/template | 下载导入模板 Excel，`?fields=a,b,c` 可只含指定字段 |
 | POST | /api/data/import-file | 上传 .xlsx 二进制，服务端解析并返回预览与批次 `token` |
 | POST | /api/data/import-confirm | 按 `token` 确认导入 `{token, duplicate_action?}` |
