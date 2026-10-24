@@ -1052,6 +1052,7 @@ function getMeta(res, user) {
       canDeleteData: admin,
       canManageUsers: admin,
       canManageAdmins: isSysAdmin(user),
+      canViewAudit: isSysAdmin(user),
       seeAllData: admin,
     },
   };
@@ -1699,20 +1700,33 @@ function getStats(res, user) {
     .get(...args).c;
   const qtySum = db.prepare(`SELECT IFNULL(SUM(quantity),0) AS s FROM project_data${w}`).get(...args).s;
   const byType = db.prepare(`SELECT project_type AS name, COUNT(*) AS value FROM projects WHERE deleted_at IS NULL GROUP BY project_type ORDER BY value DESC`).all();
-  const byBase = db
-    .prepare(`SELECT IFNULL(base,'未填') AS name, COUNT(*) AS value FROM project_data${w} GROUP BY base ORDER BY value DESC`)
+  // 产品代码 / 统计日期（录入日期）数据量分布
+  const byProduct = db
+    .prepare(`SELECT IFNULL(NULLIF(product_code,''),'未填') AS name, COUNT(*) AS value FROM project_data${w} GROUP BY IFNULL(NULLIF(product_code,''),'未填') ORDER BY value DESC, name`)
     .all(...args);
+  const byDate = db
+    .prepare(`SELECT IFNULL(NULLIF(entry_date,''),'未填') AS name, COUNT(*) AS value FROM project_data${w} GROUP BY IFNULL(NULLIF(entry_date,''),'未填') ORDER BY name DESC`)
+    .all(...args);
+  // 项目状态分布：1 进行中 / 0 已归档（固定顺序，保证没有数据时也能显示两项）
+  const statusRows = db
+    .prepare('SELECT status, COUNT(*) AS value FROM projects WHERE deleted_at IS NULL GROUP BY status')
+    .all();
+  const statusMap = new Map(statusRows.map((r) => [Number(r.status), r.value]));
+  const byStatus = [
+    { name: '进行中', value: statusMap.get(1) || 0, status: 1 },
+    { name: '已归档', value: statusMap.get(0) || 0, status: 0 },
+  ];
   const recent = db
     .prepare(`SELECT id, project_no, product_code, work_order, entry_date, quantity FROM project_data${w} ORDER BY id DESC LIMIT 8`)
     .all(...args);
-  ok(res, { stats: { projectCount, dataCount, typeCount, baseCount, qtySum, byType, byBase, recent } });
+  ok(res, { stats: { projectCount, dataCount, typeCount, baseCount, qtySum, byType, byProduct, byDate, byStatus, recent } });
 }
 
 /* ---------- 审计日志查询（仅管理员） ---------- */
 
 /** 审计日志列表：按时间倒序分页，支持对象 / 动作 / 关键词 / 日期区间筛选 */
 function listAuditLogs(res, params, user) {
-  if (!isAdmin(user)) return fail(res, 403, '仅管理员可查看审计日志');
+  if (!isSysAdmin(user)) return fail(res, 403, '仅系统管理员可查看审计日志');
 
   const where = [];
   const args = [];

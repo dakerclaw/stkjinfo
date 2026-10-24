@@ -73,6 +73,7 @@ const canManageProjects = () => !!can().canManageProjects;
 const canDeleteData = () => !!can().canDeleteData;
 const canManageUsers = () => !!can().canManageUsers;
 const canManageAdmins = () => !!can().canManageAdmins;
+const canViewAudit = () => !!can().canViewAudit;
 const seeAllData = () => !!can().seeAllData;
 
 const el = (sel) => document.querySelector(sel);
@@ -154,9 +155,16 @@ function showViewError(e) {
 async function renderDashboard() {
   content().innerHTML = `<div class="stat-grid">${'<div class="stat"><div class="skeleton" style="height:60px"></div></div>'.repeat(4)}</div>`;
   const { stats } = await API.get('/api/stats');
+  // 兼容旧版接口：缺失的分布字段按空处理，避免整页渲染失败
+  const byProduct = stats.byProduct || [];
+  const byDate = stats.byDate || [];
+  const byStatus = stats.byStatus || [];
 
   const maxType = Math.max(1, ...stats.byType.map((r) => r.value));
-  const maxBase = Math.max(1, ...stats.byBase.map((r) => r.value));
+  const maxProduct = Math.max(1, ...byProduct.map((r) => r.value));
+  const dates = byDate.slice(0, 10);
+  const maxDate = Math.max(1, ...dates.map((r) => r.value));
+  const maxStatus = Math.max(1, ...byStatus.map((r) => r.value));
 
   content().innerHTML = `
     <div class="stat-grid">
@@ -190,21 +198,36 @@ async function renderDashboard() {
         </div>
       </div>
     </div>
-    <div class="card" style="margin-top:14px">
-      <div class="card-head"><h3>所属公司数据分布</h3></div>
-      <div class="card-body">
-        ${stats.byBase.length ? `<div class="bar-list">${stats.byBase.map((r) => barItem(r.name, r.value, maxBase)).join('')}</div>`
-          : `<div class="empty" style="padding:24px"><p>暂无所属公司数据</p></div>`}
+    <div class="grid-3" style="margin-top:14px">
+      <div class="card">
+        <div class="card-head"><h3>产品代码数据分布</h3></div>
+        <div class="card-body">
+          ${stats.byProduct.length ? `<div class="bar-list">${stats.byProduct.map((r) => barItem(r.name, r.value, maxProduct)).join('')}</div>`
+            : `<div class="empty" style="padding:24px"><p>暂无数据记录</p></div>`}
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>统计日期数据分布</h3>${stats.byDate.length > dates.length ? `<span class="meta">近 ${dates.length} 个日期</span>` : ''}</div>
+        <div class="card-body">
+          ${dates.length ? `<div class="bar-list">${dates.map((r) => barItem(r.name, r.value, maxDate)).join('')}</div>`
+            : `<div class="empty" style="padding:24px"><p>暂无数据记录</p></div>`}
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>项目状态分布</h3></div>
+        <div class="card-body">
+          <div class="bar-list">${stats.byStatus.map((r) => barItem(r.name, r.value, maxStatus, r.status === 1 ? '' : 'muted')).join('')}</div>
+        </div>
       </div>
     </div>`;
 }
 function statCard(label, val, unit, hint) {
   return `<div class="stat"><label>${label}</label><div class="val">${val}${unit ? `<small>${unit}</small>` : ''}</div><div class="hint">${esc(hint)}</div></div>`;
 }
-function barItem(name, value, max) {
+function barItem(name, value, max, tone = '') {
   return `<div class="bar-item">
     <div class="bar-label"><span>${esc(name)}</span><b>${value}</b></div>
-    <div class="bar-track"><div class="bar-fill" style="width:${(value / max) * 100}%"></div></div>
+    <div class="bar-track"><div class="bar-fill ${tone}" style="width:${(value / max) * 100}%"></div></div>
   </div>`;
 }
 
@@ -1633,9 +1656,12 @@ function paintUser() {
   el('#userName').textContent = u.real_name || u.username;
   el('#userRole').textContent = u.roleLabel || u.role;
   el('#userAvatar').textContent = (u.real_name || u.username).slice(0, 1);
-  // 用户管理入口仅管理员可见
+  // 用户管理 / 回收站入口仅管理员可见；审计日志仅系统管理员可见
   document.querySelectorAll('[data-admin-only]').forEach((n) => {
     n.style.display = canManageUsers() ? '' : 'none';
+  });
+  document.querySelectorAll('[data-sysadmin-only]').forEach((n) => {
+    n.style.display = canViewAudit() ? '' : 'none';
   });
 }
 
@@ -1835,6 +1861,14 @@ const auditActionLabel = (k) => (AUDIT_ACTIONS.find(([v]) => v === k) || [null, 
 const auditEntityLabel = (k) => (AUDIT_ENTITIES.find(([v]) => v === k) || [null, k || '—'])[1];
 
 async function renderAudit() {
+  if (!canViewAudit()) {
+    actions().innerHTML = '';
+    content().innerHTML = `<div class="card"><div class="card-body" style="text-align:center;padding:40px 0">
+      <p style="margin:0 0 6px;color:var(--danger);font-weight:600">无权查看审计日志</p>
+      <p style="margin:0;color:var(--text-3);font-size:13px">审计日志仅对系统管理员开放</p>
+    </div></div>`;
+    return;
+  }
   actions().innerHTML = `<button class="btn" onclick="renderAudit()">
     <svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.6-6.4M21 3v6h-6"/></svg>刷新</button>`;
   const f = state.audit.filters;

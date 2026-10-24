@@ -156,6 +156,8 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
 
 .grid-2 { display: grid; grid-template-columns: 1.15fr .85fr; gap: 14px; }
 @media (max-width: 1100px) { .grid-2 { grid-template-columns: 1fr; } }
+.grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+@media (max-width: 1100px) { .grid-3 { grid-template-columns: 1fr; } }
 
 /* 筛选条 */
 .filters {
@@ -269,6 +271,7 @@ th.col-sticky { z-index: 3; background: var(--surface-2); }
 .bar-item .bar-label b { color: var(--text); font-weight: 600; }
 .bar-track { height: 7px; border-radius: 4px; background: #eef2f8; overflow: hidden; }
 .bar-fill { height: 100%; border-radius: 4px; background: linear-gradient(90deg, #4f8bff, #2563eb); transition: width .4s ease; }
+.bar-fill.muted { background: linear-gradient(90deg, #cbd5e1, #94a3b8); }
 
 /* ---------------------------------------------------------- 弹窗 */
 .modal-root { position: fixed; inset: 0; display: none; z-index: 100; }
