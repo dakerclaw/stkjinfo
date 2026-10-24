@@ -141,6 +141,9 @@ node seed.js --reset   # 清空项目与数据后重新灌入示例（保留用�
 - **项目列表**：多条件筛选（编号 / 产品代码 / 类型 / 状态）、列排序、增删改、跳转查看关联数据、Excel 导入 / 导出（导入仅管理员）
 - **项目数据**：45 字段宽表、列排序、分页、勾选批量删除、Excel 导入（支持中文表头）、Excel 导出
 - **用户管理**：账号增删改、重置密码、角色分级授权、Excel 批量导入
+- **审计日志**：新增 / 修改（含字段级 from→to）/ 删除 / 恢复 / 导入等关键操作自动落库，保留 180 天
+- **回收站**：项目与数据删除改为软删除，30 天内可在「回收站」页恢复，超期自动物理清理；彻底删除不可恢复
+- **键盘操作**：录入弹窗内 Enter 跳下一字段，最后一个字段 Enter 或 Ctrl+S / Ctrl+Enter 直接保存
 - 修改项目编号时自动同步更新其数据记录的项目编号，保持关联一致
 
 ### Excel 导入：支持部分指标
@@ -244,6 +247,9 @@ node seed.js --reset   # 清空项目与数据后重新灌入示例（保留用�
 | GET | /api/projects/template | 下载项目列表导入模板（仅管理员） |
 | POST | /api/projects/import-file | 上传项目清单 .xlsx，返回预览、`willInsert` / `willDup` 与批次 `token`（仅管理员） |
 | POST | /api/projects/import-confirm | 按 `token` 确认导入 `{token, duplicate_action?}`，重复时 409 待选 `overwrite` / `skip`（仅管理员） |
+| GET | /api/recycle | 回收站列表：已软删除的项目与数据（仅管理员） |
+| POST | /api/recycle/restore | 从回收站恢复 `{entity: project|data, ids}`（仅管理员） |
+| POST | /api/recycle/purge | 彻底删除（物理清除，不可恢复，仅管理员） |
 | GET/POST | /api/users | 用户列表 / 新建（管理员；创建管理员仅系统管理员） |
 | PUT/DELETE | /api/users/:id | 更新 / 删除（管理员；管理员账号仅系统管理员可操作） |
 | GET | /api/users/template | 下载用户导入模板（仅管理员，角色示例列按操作人权限裁剪） |

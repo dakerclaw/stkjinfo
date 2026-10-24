@@ -69,6 +69,20 @@ CREATE TABLE IF NOT EXISTS projects (
 CREATE INDEX IF NOT EXISTS idx_projects_code ON projects(product_code);
 CREATE INDEX IF NOT EXISTS idx_projects_type ON projects(project_type);
 
+CREATE TABLE IF NOT EXISTS audit_logs (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id    INTEGER,                                -- 操作人 id（系统操作时为空）
+  username   TEXT,                                   -- 操作人账号（冗余存储，防用户被删后无法追溯）
+  action     TEXT    NOT NULL,                       -- create / update / soft_delete / restore / purge / import / status
+  entity     TEXT    NOT NULL,                       -- project / data / user
+  entity_id  INTEGER,                                -- 目标行 id（批量操作为空）
+  summary    TEXT    NOT NULL,                       -- 人类可读的操作摘要
+  changes    TEXT,                                   -- JSON：{字段: {from, to}}，仅编辑类操作记录
+  created_at TEXT    NOT NULL DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_audit_time   ON audit_logs(created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_logs(entity, entity_id);
+
 CREATE TABLE IF NOT EXISTS project_data (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   project_no   TEXT NOT NULL,                         -- 项目编号
@@ -138,11 +152,17 @@ ensureColumn('project_data', 'created_by', 'TEXT');
 ensureColumn('project_data', 'created_by_id', 'INTEGER');
 ensureColumn('project_data', 'updated_by', 'TEXT');
 ensureColumn('project_data', 'coke_type', 'TEXT');
+// 软删除：删除仅打标记，30 天内可在回收站恢复，超期由服务端定时物理清理
+ensureColumn('projects', 'deleted_at', 'TEXT');
+ensureColumn('project_data', 'deleted_at', 'TEXT');
 db.exec('CREATE INDEX IF NOT EXISTS idx_data_owner ON project_data(created_by_id)');
 db.exec('CREATE INDEX IF NOT EXISTS idx_data_coke ON project_data(coke_type)');
 // 会话按用户检索（踢下线、清理过期）与按最后活跃时间清理
 db.exec('CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)');
 db.exec('CREATE INDEX IF NOT EXISTS idx_sessions_seen ON sessions(last_seen)');
+// 回收站清理按删除时间检索
+db.exec('CREATE INDEX IF NOT EXISTS idx_projects_deleted ON projects(deleted_at)');
+db.exec('CREATE INDEX IF NOT EXISTS idx_data_deleted ON project_data(deleted_at)');
 
 // 角色规范化：用户名 admin 固定为系统管理员
 db.exec(`UPDATE users SET role = 'sys_admin' WHERE username = 'admin' AND role = 'admin'`);

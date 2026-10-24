@@ -218,6 +218,7 @@ const cell = (v) => (v === null || v === undefined ? '' : v);
 function buildDataWhere(params, user) {
   const { clause, args } = buildFilters(params, DATA_FILTERS);
   const where = clause ? [clause.replace(/^ WHERE /, '')] : [];
+  where.push('deleted_at IS NULL'); // 软删除行不出现在任何业务查询里
 
   const from = params.get('date_from');
   const to = params.get('date_to');
@@ -274,7 +275,8 @@ function exportDataXlsx(res, params, user) {
 /** 导出项目档案为 Excel */
 function exportProjectsXlsx(res, params) {
   const { clause, args } = buildFilters(params, ['project_no', 'product_code', 'project_type']);
-  const parts = [clause ? clause.replace(/^ WHERE /, '') : ''];
+  // 软删除行不导出；条件无占位符，追加在 clause 之后不影响参数顺序
+  const parts = [clause ? clause.replace(/^ WHERE /, '') : '', 'p.deleted_at IS NULL'];
   const allArgs = [...args];
   const st = (params.get('status') || '').trim();
   if (st !== '') {
@@ -307,8 +309,8 @@ function exportProjectsXlsx(res, params) {
   const rows = db
     .prepare(
       `SELECT p.*,
-              (SELECT COUNT(*) FROM project_data d WHERE d.project_no = p.project_no) AS data_count,
-              (SELECT MAX(d.entry_date) FROM project_data d WHERE d.project_no = p.project_no) AS last_entry
+              (SELECT COUNT(*) FROM project_data d WHERE d.project_no = p.project_no AND d.deleted_at IS NULL) AS data_count,
+              (SELECT MAX(d.entry_date) FROM project_data d WHERE d.project_no = p.project_no AND d.deleted_at IS NULL) AS last_entry
        FROM projects p${where}${buildOrder(params, ' ORDER BY p.id DESC', sortable, 'p.', aliasKeys)}`
     )
     .all(...allArgs);
@@ -453,7 +455,7 @@ function importByToken(res, body, user) {
   if (!item) return fail(res, 400, '导入批次已过期，请重新选择 Excel 文件');
   if (item.user !== user.username) return fail(res, 403, '无权导入该批次数据');
   if (item.kind === 'project') {
-    const out = performProjectImport(item.rows, String(body.duplicate_action || '').toLowerCase());
+    const out = performProjectImport(item.rows, String(body.duplicate_action || '').toLowerCase(), user);
     if (out.dup) {
       return send(res, 409, {
         success: false,
@@ -560,8 +562,11 @@ function parseStatus(v) {
  *   duplicate_action = 'overwrite' 时覆盖同编号项目的其余字段；'skip' 跳过已存在的；
  *   未指定且存在重复 → 返回 dup 让前端确认。
  */
-function performProjectImport(rows, action) {
-  const existMap = new Map(db.prepare('SELECT id, project_no FROM projects').all().map((p) => [p.project_no, p.id]));
+function performProjectImport(rows, action, actor = null) {
+  // 唯一索引覆盖软删除行：回收站里的同编号项目也按「已存在」处理，避免 INSERT 撞 UNIQUE
+  const existMap = new Map(
+    db.prepare('SELECT id, project_no, deleted_at FROM projects').all().map((p) => [p.project_no, p])
+  );
   let inserted = 0;
   let overwritten = 0;
   let skipped = 0;
@@ -584,10 +589,10 @@ function performProjectImport(rows, action) {
       }
       seenInFile.add(project_no);
 
-      const id = existMap.get(project_no);
-      if (id) {
+      const exist = existMap.get(project_no);
+      if (exist) {
         if (!action) {
-          dupRows.push({ line, project_no, existingId: id });
+          dupRows.push({ line, project_no, existingId: exist.id });
           return;
         }
         if (action === 'skip') {
@@ -603,8 +608,10 @@ function performProjectImport(rows, action) {
         }
         if ('status' in raw && String(raw.status).trim() !== '') patch.status = parseStatus(raw.status);
         patch.updated_at = nowStr();
-        if (Object.keys(patch).length > 1) {
-          update('projects', id, patch, { touch: false });
+        // 覆盖到回收站里的同名项目时顺带复活（从回收站移回）
+        if (exist.deleted_at) patch.deleted_at = null;
+        if (Object.keys(patch).length > (exist.deleted_at ? 1 : 0)) {
+          update('projects', exist.id, patch, { touch: false });
           overwritten++;
         } else {
           skipped++;
@@ -643,6 +650,7 @@ function performProjectImport(rows, action) {
     throw e;
   }
 
+  logAudit(actor, 'import', 'project', null, `Excel 导入项目：新增 ${inserted}、覆盖 ${overwritten}、跳过 ${skipped}、失败 ${errors.length}`);
   return { result: { inserted, overwritten, skipped, failed: errors.length, errors: errors.slice(0, 20) } };
 }
 
@@ -731,6 +739,66 @@ function update(table, id, row, { touch = true } = {}) {
   db.prepare(`UPDATE ${table} SET ${keys.map((k) => `${k} = ?`).join(', ')}${tail} WHERE id = ?`).run(...args);
 }
 
+/* ============================================================ 审计日志 */
+
+const stmtAuditInsert = db.prepare(
+  'INSERT INTO audit_logs (user_id, username, action, entity, entity_id, summary, changes) VALUES (?, ?, ?, ?, ?, ?, ?)'
+);
+
+/**
+ * 写一条操作日志。任何失败都不应影响主业务流程，故整体吞异常。
+ * changes 传对象时序列化为 JSON（{字段: {from, to}}），供追溯字段级改动。
+ */
+function logAudit(user, action, entity, entityId, summary, changes = null) {
+  try {
+    stmtAuditInsert.run(
+      user && user.id ? user.id : null,
+      user && user.username ? user.username : null,
+      action, entity, entityId == null ? null : Number(entityId),
+      String(summary || ''), changes ? JSON.stringify(changes) : null
+    );
+  } catch { /* 审计失败不阻塞业务 */ }
+}
+
+/** 对比修改前后的行，生成 {字段: {from, to}} 变更集（只含发生变化的字段） */
+function diffRows(cur, next, keys) {
+  const out = {};
+  for (const k of keys) {
+    if (!(k in next)) continue;
+    const a = cur[k] === undefined || cur[k] === null ? '' : cur[k];
+    const b = next[k] === undefined || next[k] === null ? '' : next[k];
+    if (String(a) !== String(b)) out[k] = { from: a, to: b };
+  }
+  return out;
+}
+
+/* ============================================================ 回收站清理 */
+
+/** 软删除保留天数：超过后由清理任务物理删除 */
+const SOFT_DELETE_KEEP_DAYS = 30;
+
+const stmtPurgeData = db.prepare(
+  `DELETE FROM project_data WHERE deleted_at IS NOT NULL AND deleted_at < datetime('now','localtime','-${SOFT_DELETE_KEEP_DAYS} days')`
+);
+const stmtPurgeProjects = db.prepare(
+  `DELETE FROM projects WHERE deleted_at IS NOT NULL AND deleted_at < datetime('now','localtime','-${SOFT_DELETE_KEEP_DAYS} days')`
+);
+const stmtPurgeAudit = db.prepare(
+  'DELETE FROM audit_logs WHERE created_at < datetime(\'now\',\'localtime\',\'-180 days\')'
+);
+
+/** 物理清理：超期软删除的行、180 天前的审计日志。启动时跑一次，之后每 6 小时一次 */
+function purgeExpired() {
+  try {
+    const d = stmtPurgeData.run().changes;
+    const p = stmtPurgeProjects.run().changes;
+    stmtPurgeAudit.run();
+    if (d || p) console.log(`[purge] 清理超期软删除：数据 ${d} 条，项目 ${p} 个`);
+  } catch (e) { console.error('[purge] 清理失败：', e.message); }
+}
+purgeExpired();
+setInterval(purgeExpired, 6 * 3600 * 1000).unref();
+
 /* ============================================================ 静态资源 */
 
 const MIME = {
@@ -775,14 +843,14 @@ const DATA_FILTERS = ['project_no', 'product_code', 'base', 'process_code', 'wor
 
 /* ---------- 元数据 ---------- */
 function getMeta(res, user) {
-  const types = db.prepare(`SELECT DISTINCT project_type AS v FROM projects WHERE project_type <> '' ORDER BY v`).all().map((r) => r.v);
+  const types = db.prepare(`SELECT DISTINCT project_type AS v FROM projects WHERE deleted_at IS NULL AND project_type <> '' ORDER BY v`).all().map((r) => r.v);
 
   // 普通用户的筛选下拉只列自己数据中出现过的值，避免泄露他人数据
   const of = ownerFilter(user);
-  const w = of ? ` WHERE ${of.sql}` : '';
+  const w = of ? ` WHERE ${of.sql} AND deleted_at IS NULL` : ' WHERE deleted_at IS NULL';
   const args = of ? [of.arg] : [];
   const distinct = (col) =>
-    db.prepare(`SELECT DISTINCT ${col} AS v FROM project_data${w}${of ? ' AND' : ' WHERE'} ${col} IS NOT NULL AND ${col} <> '' ORDER BY v`)
+    db.prepare(`SELECT DISTINCT ${col} AS v FROM project_data${w} AND ${col} IS NOT NULL AND ${col} <> '' ORDER BY v`)
       .all(...args).map((r) => r.v);
 
   const bases = distinct('base');
@@ -790,12 +858,12 @@ function getMeta(res, user) {
   const workOrders = distinct('work_order');
   const cokeTypes = distinct('coke_type');
   const productCodes = isAdmin(user)
-    ? db.prepare(`SELECT DISTINCT product_code AS v FROM projects WHERE product_code <> '' ORDER BY v`).all().map((r) => r.v)
+    ? db.prepare(`SELECT DISTINCT product_code AS v FROM projects WHERE deleted_at IS NULL AND product_code <> '' ORDER BY v`).all().map((r) => r.v)
     : distinct('product_code');
-  const projectNos = db.prepare(`SELECT DISTINCT project_no AS v FROM projects ORDER BY v`).all().map((r) => r.v);
+  const projectNos = db.prepare(`SELECT DISTINCT project_no AS v FROM projects WHERE deleted_at IS NULL ORDER BY v`).all().map((r) => r.v);
 
   // 项目编号 → 产品代码，供录入时自动带出
-  const projectMap = db.prepare('SELECT project_no, product_code FROM projects ORDER BY project_no').all();
+  const projectMap = db.prepare('SELECT project_no, product_code FROM projects WHERE deleted_at IS NULL ORDER BY project_no').all();
 
   ok(res, {
     fields: FIELDS,
@@ -815,7 +883,8 @@ function getMeta(res, user) {
 /* ---------- 项目列表 ---------- */
 function listProjects(res, params, user) {
   const { clause, args } = buildFilters(params, ['project_no', 'product_code', 'project_type']);
-  const parts = [clause ? clause.replace(/^ WHERE /, '') : ''];
+  // 软删除行不出现在列表里；条件无占位符，追加在 clause 之后不影响参数顺序
+  const parts = [clause ? clause.replace(/^ WHERE /, '') : '', 'p.deleted_at IS NULL'];
   const allArgs = [...args];
 
   // 状态筛选：1 进行中 / 0 已归档，只接受这两个值
@@ -852,8 +921,8 @@ function listProjects(res, params, user) {
   const rows = db
     .prepare(
       `SELECT p.*,
-              (SELECT COUNT(*) FROM project_data d WHERE d.project_no = p.project_no${own}) AS data_count,
-              (SELECT MAX(d.entry_date) FROM project_data d WHERE d.project_no = p.project_no${own}) AS last_entry
+              (SELECT COUNT(*) FROM project_data d WHERE d.project_no = p.project_no AND d.deleted_at IS NULL${own}) AS data_count,
+              (SELECT MAX(d.entry_date) FROM project_data d WHERE d.project_no = p.project_no AND d.deleted_at IS NULL${own}) AS last_entry
        FROM projects p${where}${buildOrder(params, ' ORDER BY p.id DESC', sortable, 'p.', aliasKeys)}`
     )
     .all(...ownArgs, ...ownArgs, ...allArgs);
@@ -861,12 +930,12 @@ function listProjects(res, params, user) {
 }
 
 function getProject(res, id) {
-  const row = db.prepare('SELECT * FROM projects WHERE id = ?').get(id);
+  const row = db.prepare('SELECT * FROM projects WHERE id = ? AND deleted_at IS NULL').get(id);
   if (!row) return fail(res, 404, '项目不存在');
   ok(res, { row });
 }
 
-function createProject(res, body) {
+function createProject(res, body, user) {
   const row = {
     project_no: (body.project_no || '').trim(),
     product_code: (body.product_code || '').trim(),
@@ -877,14 +946,19 @@ function createProject(res, body) {
   if (!row.project_no) return fail(res, 400, '项目编号不能为空');
   if (!row.product_code) return fail(res, 400, '产品代码不能为空');
   if (!row.project_type) return fail(res, 400, '项目类型不能为空');
-  const existed = db.prepare('SELECT id FROM projects WHERE project_no = ?').get(row.project_no);
+  const existed = db.prepare('SELECT id FROM projects WHERE project_no = ? AND deleted_at IS NULL').get(row.project_no);
   if (existed) return fail(res, 409, `项目编号 ${row.project_no} 已存在`);
+  // 唯一索引覆盖软删除行：同名项目在回收站里时给出明确指引
+  const tomb = db.prepare('SELECT id FROM projects WHERE project_no = ? AND deleted_at IS NOT NULL').get(row.project_no);
+  if (tomb) return fail(res, 409, `项目编号 ${row.project_no} 已存在于回收站，请先恢复或彻底删除后再新建`);
   const info = insert('projects', row);
-  ok(res, { id: Number(info.lastInsertRowid) });
+  const id = Number(info.lastInsertRowid);
+  logAudit(user, 'create', 'project', id, `新增项目 ${row.project_no}（${row.product_code} / ${row.project_type}）`);
+  ok(res, { id });
 }
 
-function updateProject(res, id, body) {
-  const cur = db.prepare('SELECT * FROM projects WHERE id = ?').get(id);
+function updateProject(res, id, body, user) {
+  const cur = db.prepare('SELECT * FROM projects WHERE id = ? AND deleted_at IS NULL').get(id);
   if (!cur) return fail(res, 404, '项目不存在');
   const row = {};
   for (const k of ['project_no', 'product_code', 'project_type', 'description', 'status']) {
@@ -902,6 +976,7 @@ function updateProject(res, id, body) {
     }
   }
   update('projects', id, row);
+  logAudit(user, 'update', 'project', id, `修改项目 ${row.project_no || cur.project_no}`, diffRows(cur, row, Object.keys(row)));
   ok(res);
 }
 
@@ -920,14 +995,16 @@ function batchUpdateProjectStatus(res, body, user) {
 
   const marks = ids.map(() => '?').join(',');
   const info = db
-    .prepare(`UPDATE projects SET status = ?, updated_at = ? WHERE id IN (${marks})`)
+    .prepare(`UPDATE projects SET status = ?, updated_at = ? WHERE id IN (${marks}) AND deleted_at IS NULL`)
     .run(status, nowStr(), ...ids);
+  logAudit(user, 'status', 'project', null, `批量修改 ${info.changes} 个项目状态为 ${status === 1 ? '进行中' : '已归档'}`, { ids, status });
   ok(res, { updated: info.changes, status });
 }
 
 /**
- * 批量删除项目（仅管理员）。与单个删除一致：级联删除所选项目下的全部数据记录。
+ * 批量删除项目（仅管理员）。与单个删除一致：级联软删除所选项目下的全部数据记录。
  * body: { ids: number[] }，事务内完成，返回 { removed, removedData }。
+ * 软删除仅打 deleted_at 标记，30 天内可在回收站恢复，超期物理清理。
  */
 function bulkDeleteProjects(res, body, user) {
   if (!isAdmin(user)) return fail(res, 403, '仅管理员可删除项目');
@@ -935,20 +1012,23 @@ function bulkDeleteProjects(res, body, user) {
   if (ids.length === 0) return fail(res, 400, '请选择要删除的项目');
   if (ids.length > 500) return fail(res, 400, '单次最多删除 500 个项目');
   const marks = ids.map(() => '?').join(',');
-  const pros = db.prepare(`SELECT id, project_no FROM projects WHERE id IN (${marks})`).all(...ids);
+  const pros = db.prepare(`SELECT id, project_no FROM projects WHERE id IN (${marks}) AND deleted_at IS NULL`).all(...ids);
   const pnos = pros.map((p) => p.project_no);
   let removedData = 0;
   db.exec('BEGIN');
   try {
+    const now = nowStr();
     for (const pno of pnos) {
-      removedData += db.prepare('SELECT COUNT(*) AS c FROM project_data WHERE project_no = ?').get(pno).c;
+      removedData += db.prepare('SELECT COUNT(*) AS c FROM project_data WHERE project_no = ? AND deleted_at IS NULL').get(pno).c;
     }
     if (pnos.length) {
       const pm = pnos.map(() => '?').join(',');
-      db.prepare(`DELETE FROM project_data WHERE project_no IN (${pm})`).run(...pnos);
+      db.prepare(`UPDATE project_data SET deleted_at = ? WHERE project_no IN (${pm}) AND deleted_at IS NULL`).run(now, ...pnos);
     }
-    const info = db.prepare(`DELETE FROM projects WHERE id IN (${marks})`).run(...ids);
+    const info = db.prepare(`UPDATE projects SET deleted_at = ?, updated_at = ? WHERE id IN (${marks}) AND deleted_at IS NULL`).run(now, now, ...ids);
     db.exec('COMMIT');
+    logAudit(user, 'soft_delete', 'project', null,
+      `批量删除 ${info.changes} 个项目（${pros.map((p) => p.project_no).join('、')}）及其 ${removedData} 条数据`, { ids });
     ok(res, { removed: info.changes, removedData });
   } catch (e) {
     db.exec('ROLLBACK');
@@ -956,12 +1036,21 @@ function bulkDeleteProjects(res, body, user) {
   }
 }
 
-function deleteProject(res, id) {
-  const cur = db.prepare('SELECT * FROM projects WHERE id = ?').get(id);
+function deleteProject(res, id, user) {
+  const cur = db.prepare('SELECT * FROM projects WHERE id = ? AND deleted_at IS NULL').get(id);
   if (!cur) return fail(res, 404, '项目不存在');
-  const cnt = db.prepare('SELECT COUNT(*) AS c FROM project_data WHERE project_no = ?').get(cur.project_no).c;
-  db.prepare('DELETE FROM projects WHERE id = ?').run(id);
-  db.prepare('DELETE FROM project_data WHERE project_no = ?').run(cur.project_no);
+  const cnt = db.prepare('SELECT COUNT(*) AS c FROM project_data WHERE project_no = ? AND deleted_at IS NULL').get(cur.project_no).c;
+  const now = nowStr();
+  db.exec('BEGIN');
+  try {
+    db.prepare('UPDATE projects SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL').run(now, now, id);
+    db.prepare('UPDATE project_data SET deleted_at = ? WHERE project_no = ? AND deleted_at IS NULL').run(now, cur.project_no);
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+  logAudit(user, 'soft_delete', 'project', id, `删除项目 ${cur.project_no} 及其 ${cnt} 条数据`);
   ok(res, { removedData: cnt });
 }
 
@@ -981,15 +1070,15 @@ function listData(res, params, user) {
 }
 
 function getData(res, id, user) {
-  const row = db.prepare('SELECT * FROM project_data WHERE id = ?').get(id);
+  const row = db.prepare('SELECT * FROM project_data WHERE id = ? AND deleted_at IS NULL').get(id);
   if (!row) return fail(res, 404, '数据记录不存在');
   if (!isAdmin(user) && row.created_by_id !== user.id) return fail(res, 403, '无权查看该数据记录');
   ok(res, { row });
 }
 
-/** 校验项目编号存在，并返回该项目以同步产品代码 */
+/** 校验项目编号存在（软删除的项目视为不存在，不能继续录入数据），并返回该项目以同步产品代码 */
 function requireProject(projectNo) {
-  const p = db.prepare('SELECT * FROM projects WHERE project_no = ?').get(projectNo);
+  const p = db.prepare('SELECT * FROM projects WHERE project_no = ? AND deleted_at IS NULL').get(projectNo);
   return p || null;
 }
 
@@ -1008,12 +1097,12 @@ function hasFullKey(row) {
   });
 }
 
-/** 统计某五元组已存在的记录数 */
+/** 统计某五元组已存在的记录数（软删除行不参与重复判定） */
 function countByKey(key) {
   return db
     .prepare(
       `SELECT COUNT(*) AS c FROM project_data
-       WHERE project_no = ? AND product_code = ? AND IFNULL(base,'') = ?
+       WHERE deleted_at IS NULL AND project_no = ? AND product_code = ? AND IFNULL(base,'') = ?
          AND IFNULL(process_code,'') = ? AND IFNULL(work_order,'') = ?`
     )
     .get(key.project_no, key.product_code, key.base || '', key.process_code || '', key.work_order || '').c;
@@ -1024,7 +1113,7 @@ function findDuplicate(key) {
   return db
     .prepare(
       `SELECT * FROM project_data
-       WHERE project_no = ? AND product_code = ? AND IFNULL(base,'') = ?
+       WHERE deleted_at IS NULL AND project_no = ? AND product_code = ? AND IFNULL(base,'') = ?
          AND IFNULL(process_code,'') = ? AND IFNULL(work_order,'') = ?
        ORDER BY id DESC LIMIT 1`
     )
@@ -1094,6 +1183,8 @@ function createData(res, body, user) {
     delete patch.created_by_id;
     patch.updated_by = user.username;
     update('project_data', existing.id, patch);
+    logAudit(user, 'update', 'data', existing.id,
+      `覆盖录入数据（${existing.project_no} / 工单 ${existing.work_order || '-'}）`, diffRows(existing, patch, Object.keys(patch)));
     return ok(res, { id: existing.id, mode: 'overwrite', previous: existing.id });
   }
 
@@ -1101,11 +1192,13 @@ function createData(res, body, user) {
   row.created_by_id = user.id;
   row.updated_by = user.username;
   const info = insert('project_data', row);
-  ok(res, { id: Number(info.lastInsertRowid), mode: existing ? 'append' : 'create' });
+  const newId = Number(info.lastInsertRowid);
+  logAudit(user, 'create', 'data', newId, `录入数据（${row.project_no} / 工单 ${row.work_order || '-'} / 日期 ${row.entry_date}）`);
+  ok(res, { id: newId, mode: existing ? 'append' : 'create' });
 }
 
 function updateData(res, id, body, user) {
-  const cur = db.prepare('SELECT * FROM project_data WHERE id = ?').get(id);
+  const cur = db.prepare('SELECT * FROM project_data WHERE id = ? AND deleted_at IS NULL').get(id);
   if (!cur) return fail(res, 404, '数据记录不存在');
   // 普通用户只能改自己录入的记录
   if (!isAdmin(user) && cur.created_by_id !== user.id) return fail(res, 403, '无权修改他人录入的数据');
@@ -1128,31 +1221,133 @@ function updateData(res, id, body, user) {
   }
   row.updated_by = user.username;
   update('project_data', id, row);
+  logAudit(user, 'update', 'data', id, `修改数据（${cur.project_no} / 工单 ${cur.work_order || '-'}）`, diffRows(cur, row, Object.keys(row)));
   ok(res);
 }
 
 function deleteData(res, id, user) {
   if (!isAdmin(user)) return fail(res, 403, '仅管理员可删除数据记录');
-  const info = db.prepare('DELETE FROM project_data WHERE id = ?').run(id);
-  if (info.changes === 0) return fail(res, 404, '数据记录不存在');
+  // 软删除：仅打标记，可在回收站恢复
+  const cur = db.prepare('SELECT * FROM project_data WHERE id = ? AND deleted_at IS NULL').get(id);
+  if (!cur) return fail(res, 404, '数据记录不存在');
+  db.prepare('UPDATE project_data SET deleted_at = ? WHERE id = ?').run(nowStr(), id);
+  logAudit(user, 'soft_delete', 'data', id, `删除数据（${cur.project_no} / 工单 ${cur.work_order || '-'} / 日期 ${cur.entry_date}）`);
   ok(res);
 }
 
 function bulkDeleteData(res, body, user) {
   if (!isAdmin(user)) return fail(res, 403, '仅管理员可删除数据记录');
-  const ids = Array.isArray(body.ids) ? body.ids.map(Number).filter(Number.isFinite) : [];
+  const ids = Array.isArray(body.ids) ? [...new Set(body.ids.map(Number).filter(Number.isFinite))] : [];
   if (ids.length === 0) return fail(res, 400, '请选择要删除的记录');
-  const stmt = db.prepare('DELETE FROM project_data WHERE id = ?');
+  const marks = ids.map(() => '?').join(',');
+  const rows = db.prepare(`SELECT id, project_no, work_order FROM project_data WHERE id IN (${marks}) AND deleted_at IS NULL`).all(...ids);
+  if (rows.length === 0) return fail(res, 404, '数据记录不存在');
+  const stmt = db.prepare('UPDATE project_data SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL');
   let n = 0;
   db.exec('BEGIN');
   try {
-    for (const id of ids) n += stmt.run(id).changes;
+    for (const id of ids) n += stmt.run(nowStr(), id).changes;
     db.exec('COMMIT');
   } catch (e) {
     db.exec('ROLLBACK');
     throw e;
   }
+  logAudit(user, 'soft_delete', 'data', null, `批量删除 ${n} 条数据（${rows.map((r) => r.project_no).slice(0, 5).join('、')}${rows.length > 5 ? ' 等' : ''}）`, { ids });
   ok(res, { deleted: n });
+}
+
+/* ---------- 回收站 ---------- */
+
+/** 回收站列表（仅管理员）：项目与其数据不重复列出——随项目删除的数据在恢复项目时一并恢复 */
+function listRecycle(res, user) {
+  if (!isAdmin(user)) return fail(res, 403, '仅管理员可查看回收站');
+  const projects = db
+    .prepare(
+      `SELECT p.id, p.project_no, p.product_code, p.project_type, p.status, p.deleted_at,
+              (SELECT COUNT(*) FROM project_data d WHERE d.project_no = p.project_no AND d.deleted_at IS NOT NULL) AS data_count
+       FROM projects p WHERE p.deleted_at IS NOT NULL ORDER BY p.deleted_at DESC`
+    )
+    .all();
+  const datas = db
+    .prepare(
+      `SELECT id, project_no, product_code, work_order, entry_date, created_by, deleted_at
+       FROM project_data
+       WHERE deleted_at IS NOT NULL
+         AND project_no NOT IN (SELECT project_no FROM projects WHERE deleted_at IS NOT NULL)
+       ORDER BY deleted_at DESC LIMIT 1000`
+    )
+    .all();
+  ok(res, { projects, datas, keepDays: SOFT_DELETE_KEEP_DAYS });
+}
+
+/** 从回收站恢复（仅管理员）。body: { entity: 'project' | 'data', ids: number[] } */
+function restoreRecycle(res, body, user) {
+  if (!isAdmin(user)) return fail(res, 403, '仅管理员可恢复数据');
+  const entity = body.entity === 'data' ? 'data' : body.entity === 'project' ? 'project' : null;
+  if (!entity) return fail(res, 400, 'entity 需为 project 或 data');
+  const ids = Array.isArray(body.ids) ? [...new Set(body.ids.map(Number).filter(Number.isFinite))] : [];
+  if (ids.length === 0) return fail(res, 400, '请选择要恢复的记录');
+  if (ids.length > 500) return fail(res, 400, '单次最多恢复 500 条');
+  const marks = ids.map(() => '?').join(',');
+
+  if (entity === 'project') {
+    const pros = db.prepare(`SELECT id, project_no FROM projects WHERE id IN (${marks}) AND deleted_at IS NOT NULL`).all(...ids);
+    if (pros.length === 0) return fail(res, 404, '项目不存在或不在回收站中');
+    const pnos = pros.map((p) => p.project_no);
+    const pm = pnos.map(() => '?').join(',');
+    db.exec('BEGIN');
+    try {
+      const now = nowStr();
+      const p = db.prepare(`UPDATE projects SET deleted_at = NULL, updated_at = ? WHERE id IN (${marks}) AND deleted_at IS NOT NULL`).run(now, ...ids);
+      // 项目恢复时，随它一起被软删除的数据一并恢复
+      const d = db.prepare(`UPDATE project_data SET deleted_at = NULL WHERE project_no IN (${pm}) AND deleted_at IS NOT NULL`).run(...pnos);
+      db.exec('COMMIT');
+      logAudit(user, 'restore', 'project', null, `从回收站恢复 ${p.changes} 个项目（${pnos.join('、')}）及其 ${d.changes} 条数据`, { ids });
+      return ok(res, { restored: p.changes, restoredData: d.changes });
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw e;
+    }
+  }
+
+  const n = db.prepare(`UPDATE project_data SET deleted_at = NULL WHERE id IN (${marks}) AND deleted_at IS NOT NULL`).run(...ids).changes;
+  if (n === 0) return fail(res, 404, '数据记录不存在或不在回收站中');
+  logAudit(user, 'restore', 'data', null, `从回收站恢复 ${n} 条数据`, { ids });
+  ok(res, { restored: n, restoredData: 0 });
+}
+
+/** 彻底删除（仅管理员，不可恢复）。body: { entity: 'project' | 'data', ids: number[] } */
+function purgeRecycle(res, body, user) {
+  if (!isAdmin(user)) return fail(res, 403, '仅管理员可彻底删除数据');
+  const entity = body.entity === 'data' ? 'data' : body.entity === 'project' ? 'project' : null;
+  if (!entity) return fail(res, 400, 'entity 需为 project 或 data');
+  const ids = Array.isArray(body.ids) ? [...new Set(body.ids.map(Number).filter(Number.isFinite))] : [];
+  if (ids.length === 0) return fail(res, 400, '请选择要彻底删除的记录');
+  if (ids.length > 500) return fail(res, 400, '单次最多删除 500 条');
+  const marks = ids.map(() => '?').join(',');
+
+  if (entity === 'project') {
+    const pros = db.prepare(`SELECT id, project_no FROM projects WHERE id IN (${marks}) AND deleted_at IS NOT NULL`).all(...ids);
+    if (pros.length === 0) return fail(res, 404, '项目不存在或不在回收站中');
+    const pnos = pros.map((p) => p.project_no);
+    const pm = pnos.map(() => '?').join(',');
+    db.exec('BEGIN');
+    try {
+      const d = db.prepare(`DELETE FROM project_data WHERE project_no IN (${pm}) AND deleted_at IS NOT NULL`).run(...pnos);
+      const p = db.prepare(`DELETE FROM projects WHERE id IN (${marks}) AND deleted_at IS NOT NULL`).run(...ids);
+      db.exec('COMMIT');
+      logAudit(user, 'purge', 'project', null, `彻底删除 ${p.changes} 个项目（${pnos.join('、')}）及其 ${d.changes} 条数据`, { ids });
+      return ok(res, { purged: p.changes, purgedData: d.changes });
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw e;
+    }
+  }
+
+  const n = db.prepare(`DELETE FROM project_data WHERE id IN (${marks}) AND deleted_at IS NOT NULL`).run(...ids).changes;
+  if (n === 0) return fail(res, 404, '数据记录不存在或不在回收站中');
+  logAudit(user, 'purge', 'data', null, `彻底删除 ${n} 条数据`, { ids });
+  ok(res, { purged: n, purgedData: 0 });
 }
 
 /**
@@ -1289,6 +1484,7 @@ function performImport(rows, user, action) {
   }
 
   const blankFields = FIELDS.filter((f) => !filledCount[f.key]).map((f) => f.label);
+  logAudit(user, 'import', 'data', null, `Excel 导入数据：新增 ${inserted}、覆盖 ${overwritten}、失败 ${errors.length}`);
   return {
     result: {
       inserted,
@@ -1325,17 +1521,17 @@ function finishImport(res, rows, action, user) {
 /* ---------- 统计 ---------- */
 function getStats(res, user) {
   const of = ownerFilter(user);
-  const w = of ? ` WHERE ${of.sql}` : '';
+  const w = of ? ` WHERE ${of.sql} AND deleted_at IS NULL` : ' WHERE deleted_at IS NULL';
   const args = of ? [of.arg] : [];
 
-  const projectCount = db.prepare('SELECT COUNT(*) AS c FROM projects').get().c;
+  const projectCount = db.prepare('SELECT COUNT(*) AS c FROM projects WHERE deleted_at IS NULL').get().c;
   const dataCount = db.prepare(`SELECT COUNT(*) AS c FROM project_data${w}`).get(...args).c;
-  const typeCount = db.prepare(`SELECT COUNT(DISTINCT project_type) AS c FROM projects`).get().c;
+  const typeCount = db.prepare(`SELECT COUNT(DISTINCT project_type) AS c FROM projects WHERE deleted_at IS NULL`).get().c;
   const baseCount = db
-    .prepare(`SELECT COUNT(DISTINCT base) AS c FROM project_data${w}${of ? ' AND' : ' WHERE'} base IS NOT NULL AND base <> ''`)
+    .prepare(`SELECT COUNT(DISTINCT base) AS c FROM project_data${w} AND base IS NOT NULL AND base <> ''`)
     .get(...args).c;
   const qtySum = db.prepare(`SELECT IFNULL(SUM(quantity),0) AS s FROM project_data${w}`).get(...args).s;
-  const byType = db.prepare(`SELECT project_type AS name, COUNT(*) AS value FROM projects GROUP BY project_type ORDER BY value DESC`).all();
+  const byType = db.prepare(`SELECT project_type AS name, COUNT(*) AS value FROM projects WHERE deleted_at IS NULL GROUP BY project_type ORDER BY value DESC`).all();
   const byBase = db
     .prepare(`SELECT IFNULL(base,'未填') AS name, COUNT(*) AS value FROM project_data${w} GROUP BY base ORDER BY value DESC`)
     .all(...args);
@@ -1542,6 +1738,7 @@ function performUserImport(rows, action, actor, lines) {
     throw e;
   }
 
+  logAudit(actor, 'import', 'user', null, `Excel 导入用户：新增 ${inserted}、覆盖 ${overwritten}、跳过 ${skipped}、失败 ${errors.length}`);
   return { result: { inserted, overwritten, skipped, failed: errors.length, errors: errors.slice(0, 20) } };
 }
 
@@ -1584,6 +1781,7 @@ function createUser(res, body, user) {
     remark: (body.remark || '').trim() || null,
     pwd_changed: body.password ? 1 : 0, // 未指定密码 → 记为初始密码
   });
+  logAudit(user, 'create', 'user', null, `新增用户 ${username}（${role === 'admin' ? '管理员' : '普通用户'}）`);
   ok(res, { username, role, defaultPassword: !body.password });
 }
 
@@ -1616,6 +1814,12 @@ function updateUser(res, id, body, actor) {
   update('users', id, row, { touch: false });
   // 停用或改密后，强制该用户重新登录
   destroyUserSessions(id);
+  const acts = [];
+  if ('status' in row) acts.push(row.status === 1 ? '启用' : '停用');
+  if ('role' in row && row.role !== cur.role) acts.push(`角色改为${row.role === 'admin' ? '管理员' : '普通用户'}`);
+  if (body.reset_password) acts.push('重置密码为初始密码');
+  else if (body.password) acts.push('修改密码');
+  logAudit(actor, 'update', 'user', id, `修改用户 ${cur.username}：${acts.join('、') || '资料'}`, diffRows(cur, row, Object.keys(row)));
   ok(res);
 }
 
@@ -1629,6 +1833,7 @@ function deleteUser(res, id, actor) {
   const dataCount = db.prepare('SELECT COUNT(*) AS c FROM project_data WHERE created_by_id = ?').get(id).c;
   db.prepare('DELETE FROM users WHERE id = ?').run(id);
   destroyUserSessions(id);
+  logAudit(actor, 'soft_delete', 'user', id, `删除用户 ${cur.username}（其名下 ${dataCount} 条数据保留）`);
   ok(res, { removedUser: true, dataCount });
 }
 
@@ -1742,12 +1947,17 @@ async function handleApi(req, res, url) {
   if (m === 'GET' && p === '/api/meta') return getMeta(res, user);
   if (m === 'GET' && p === '/api/stats') return getStats(res, user);
 
+  // 回收站（仅管理员）
+  if (p === '/api/recycle' && m === 'GET') return listRecycle(res, user);
+  if (p === '/api/recycle/restore' && m === 'POST') return restoreRecycle(res, await readBody(req), user);
+  if (p === '/api/recycle/purge' && m === 'POST') return purgeRecycle(res, await readBody(req), user);
+
   // projects：全员可查看；增删改仅管理员
   if (p === '/api/projects') {
     if (m === 'GET') return listProjects(res, q, user);
     if (m === 'POST') {
       if (!isAdmin(user)) return fail(res, 403, '仅管理员可新增项目');
-      return createProject(res, await readBody(req));
+      return createProject(res, await readBody(req), user);
     }
   }
   if (p === '/api/projects/export' && m === 'GET') return exportProjectsXlsx(res, q);
@@ -1776,11 +1986,11 @@ async function handleApi(req, res, url) {
     if (m === 'GET') return getProject(res, id);
     if (m === 'PUT' || m === 'PATCH') {
       if (!isAdmin(user)) return fail(res, 403, '仅管理员可修改项目');
-      return updateProject(res, id, await readBody(req));
+      return updateProject(res, id, await readBody(req), user);
     }
     if (m === 'DELETE') {
       if (!isAdmin(user)) return fail(res, 403, '仅管理员可删除项目');
-      return deleteProject(res, id);
+      return deleteProject(res, id, user);
     }
   }
 

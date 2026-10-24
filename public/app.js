@@ -116,6 +116,7 @@ const VIEWS = {
   projects: { title: '项目列表', sub: '按项目编号、产品代码、项目类型、状态筛选项目', render: renderProjects },
   data: { title: '项目数据', sub: '按项目编号、产品代码、所属公司、工序、工单号、焦种筛选', render: renderData },
   users: { title: '用户管理', sub: '系统账号与权限信息', render: renderUsers },
+  recycle: { title: '回收站', sub: '已删除的项目与数据，30 天内可恢复，超期自动清除', render: renderRecycle },
 };
 
 function navigate(view) {
@@ -1713,6 +1714,128 @@ function openPasswordModal() {
 }
 
 /* ============================================================
+   回收站
+   ============================================================ */
+/** 「YYYY-MM-DD HH:MM:SS」→「YYYY-MM-DD HH:MM」 */
+function fmtDateTime(s) {
+  return s ? String(s).slice(0, 16) : '';
+}
+/** 软删除后还剩几天可恢复 */
+function daysLeft(deletedAt, keepDays) {
+  const t = new Date(String(deletedAt).replace(' ', 'T')).getTime();
+  if (!Number.isFinite(t)) return keepDays;
+  return Math.max(0, Math.ceil((t + keepDays * 86400000 - Date.now()) / 86400000));
+}
+
+async function renderRecycle() {
+  actions().innerHTML = `<button class="btn" onclick="renderRecycle()">
+    <svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.6-6.4M21 3v6h-6"/></svg>刷新</button>`;
+  content().innerHTML = `<div class="card"><div class="card-body"><div class="skeleton" style="height:200px"></div></div></div>`;
+  let info;
+  try {
+    info = await API.get('/api/recycle');
+  } catch (e) {
+    content().innerHTML = `<div class="card"><div class="card-body"><p class="muted">${esc(e.message)}</p></div></div>`;
+    return;
+  }
+  const kp = info.keepDays || 30;
+  const projects = info.projects || [];
+  const datas = info.datas || [];
+
+  if (projects.length === 0 && datas.length === 0) {
+    content().innerHTML = `
+      <div class="card"><div class="card-body" style="text-align:center;padding:48px 0">
+        <p style="margin:0;color:var(--text-3)">回收站是空的</p>
+        <p style="margin:8px 0 0;color:var(--text-3);font-size:13px">删除的项目和数据会在这里保留 ${kp} 天，之后自动清除</p>
+      </div></div>`;
+    return;
+  }
+
+  const left = (dt) => {
+    const n = daysLeft(dt, kp);
+    return `<span style="color:${n <= 3 ? 'var(--danger)' : 'var(--text-3)'}">${n} 天</span>`;
+  };
+
+  content().innerHTML = `
+    ${projects.length ? `
+    <div class="card">
+      <div class="card-head"><h3>已删除的项目 (${projects.length})</h3></div>
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead><tr><th>项目编号</th><th>产品代码</th><th>项目类型</th><th>数据条数</th><th>删除时间</th><th>剩余可恢复</th><th>操作</th></tr></thead>
+          <tbody>
+            ${projects.map((r) => `<tr>
+              <td class="col-sticky"><span class="code-chip">${esc(r.project_no)}</span></td>
+              <td>${esc(r.product_code)}</td>
+              <td>${esc(r.project_type)}</td>
+              <td>${r.data_count || 0}</td>
+              <td>${fmtDateTime(r.deleted_at)}</td>
+              <td>${left(r.deleted_at)}</td>
+              <td><div class="row-actions">
+                <button class="btn btn-sm btn-ghost" onclick="recycleRestore('project', ${r.id})">恢复</button>
+                <button class="btn btn-sm btn-ghost" style="color:var(--danger)" onclick="confirmRecyclePurge('project', ${r.id}, '${esc(r.project_no)}', ${r.data_count || 0})">彻底删除</button>
+              </div></td>
+            </tr>`).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>` : ''}
+    ${datas.length ? `
+    <div class="card">
+      <div class="card-head"><h3>已删除的数据记录 (${datas.length}${datas.length >= 1000 ? '+' : ''})</h3></div>
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead><tr><th>项目编号</th><th>产品代码</th><th>工单号</th><th>录入日期</th><th>录入人</th><th>删除时间</th><th>剩余可恢复</th><th>操作</th></tr></thead>
+          <tbody>
+            ${datas.map((r) => `<tr>
+              <td class="col-sticky"><span class="code-chip">${esc(r.project_no)}</span></td>
+              <td>${esc(r.product_code)}</td>
+              <td>${esc(r.work_order)}</td>
+              <td>${esc(r.entry_date)}</td>
+              <td>${esc(r.created_by)}</td>
+              <td>${fmtDateTime(r.deleted_at)}</td>
+              <td>${left(r.deleted_at)}</td>
+              <td><div class="row-actions">
+                <button class="btn btn-sm btn-ghost" onclick="recycleRestore('data', ${r.id})">恢复</button>
+                <button class="btn btn-sm btn-ghost" style="color:var(--danger)" onclick="confirmRecyclePurge('data', ${r.id}, '${esc(r.project_no)} 工单 ${esc(r.work_order) || '-'}', 0)">彻底删除</button>
+              </div></td>
+            </tr>`).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>` : ''}
+    <div style="padding:0 16px 12px"><span class="scroll-hint">↔ 恢复项目时，随项目一起删除的数据会一并恢复；彻底删除不可恢复</span></div>`;
+}
+
+async function recycleRestore(entity, id) {
+  try {
+    const r = await API.post('/api/recycle/restore', { entity, ids: [id] });
+    const d = r.restoredData || 0;
+    toast(entity === 'project' ? `已恢复项目及其 ${d} 条数据` : '已恢复该数据记录', 'ok');
+    renderRecycle();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+function confirmRecyclePurge(entity, id, label, dataCount) {
+  openModal({
+    title: '彻底删除', narrow: true,
+    body: `<p style="margin:0 0 8px">确定<b style="color:var(--danger)">永久删除</b> ${entity === 'project' ? '项目' : '数据记录'} <b>${esc(label)}</b> 吗？</p>
+      ${entity === 'project' && dataCount ? `<p style="margin:0;color:var(--danger);font-size:13px">其下 <b>${dataCount}</b> 条数据记录将一并永久删除，此操作不可恢复。</p>`
+        : `<p style="margin:0;color:var(--danger);font-size:13px">此操作不可恢复。</p>`}`,
+    footer: `<button class="btn" onclick="closeModal()">取消</button>
+      <button class="btn btn-danger" id="okPurge">永久删除</button>`,
+  });
+  el('#okPurge').addEventListener('click', async () => {
+    try {
+      await API.post('/api/recycle/purge', { entity, ids: [id] });
+      closeModal();
+      toast('已彻底删除', 'ok');
+      renderRecycle();
+    } catch (e) { toast(e.message, 'err'); }
+  });
+}
+
+/* ============================================================
    弹窗基础
    ============================================================ */
 function openModal({ title, sub, body, footer, narrow, wide }) {
@@ -1742,9 +1865,36 @@ function closeModal() {
 
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') closeModal();
-  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+  // Ctrl+Enter / Ctrl+S（Mac 为 ⌘+Enter / ⌘+S）：提交当前弹窗
+  if ((e.ctrlKey || e.metaKey) && (e.key === 'Enter' || e.key === 's' || e.key === 'S')) {
+    e.preventDefault();
     const btn = document.querySelector('.modal-foot .btn-primary');
     if (btn) btn.click();
+    return;
+  }
+  // 录入表单内 Enter 跳到下一个字段（textarea 换行、按钮触发不受影响）
+  if (e.key === 'Enter' && !e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey) {
+    const root = el('#modalRoot');
+    if (!root.classList.contains('open')) return;
+    const t = e.target;
+    if (!t || !root.contains(t)) return;
+    if (t.tagName === 'TEXTAREA' || t.tagName === 'BUTTON' || t.tagName === 'A' || t.tagName === 'LABEL') return;
+    if (t.type === 'checkbox' || t.type === 'radio' || t.type === 'file' || t.type === 'submit') return;
+    // 可聚焦的字段序：文本/数字/日期输入、下拉框、多行文本（textarea 内按 Enter 不触发跳转，只作跳转目标）
+    const fields = [...root.querySelectorAll('input, select, textarea')]
+      .filter((n) => !n.disabled && n.type !== 'hidden' && n.type !== 'checkbox' && n.type !== 'radio' && n.type !== 'file');
+    const i = fields.indexOf(t);
+    if (i >= 0 && i < fields.length - 1) {
+      e.preventDefault();
+      const nxt = fields[i + 1];
+      nxt.focus();
+      if (nxt.tagName === 'INPUT' && ['text', 'number', 'date'].includes(nxt.type)) nxt.select();
+    } else if (i === fields.length - 1) {
+      // 最后一个字段按 Enter 直接触发主按钮（保存）
+      e.preventDefault();
+      const btn = root.querySelector('.modal-foot .btn-primary');
+      if (btn) btn.click();
+    }
   }
 });
 
