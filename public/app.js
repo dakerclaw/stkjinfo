@@ -192,15 +192,7 @@ function barItem(name, value, max) {
    ============================================================ */
 async function renderProjects() {
   const f = state.projects.filters;
-  actions().innerHTML = `
-    ${canManageProjects() ? `<button class="btn btn-primary" onclick="openProjectModal()">
-      <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>新增项目
-    </button>
-    <button class="btn" onclick="openProjectImport()">导入 Excel</button>` : ''}
-    <button class="btn" onclick="exportProjects()">导出 Excel</button>
-    ${canManageProjects() ? `
-    <button class="btn btn-sm" id="bulkStOn" style="display:none" onclick="bulkProjectStatus(1)">设为进行中 (<span id="selStOn">0</span>)</button>
-    <button class="btn btn-sm" id="bulkStOff" style="display:none" onclick="bulkProjectStatus(0)">设为已归档 (<span id="selStOff">0</span>)</button>` : ''}`;
+  actions().innerHTML = '';
 
   content().innerHTML = `
     <div class="filters">
@@ -228,6 +220,17 @@ async function renderProjects() {
           <button class="btn btn-ghost" onclick="clearProjectFilters()">重置</button>
         </div>
       </div>
+    </div>
+    <div class="toolbar" id="projToolbar">
+      ${canManageProjects() ? `<button class="btn btn-primary" onclick="openProjectModal()">
+        <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>新增项目
+      </button>
+      <button class="btn" onclick="openProjectImport()">导入 Excel</button>` : ''}
+      <button class="btn" onclick="exportProjects()">导出 Excel</button>
+      ${canManageProjects() ? `
+      <span class="toolbar-sep"></span>
+      <button class="btn btn-sm" id="bulkStOn" style="display:none" onclick="bulkProjectStatus(1)">设为进行中 (<span id="selStOn">0</span>)</button>
+      <button class="btn btn-sm" id="bulkStOff" style="display:none" onclick="bulkProjectStatus(0)">设为已归档 (<span id="selStOff">0</span>)</button>` : ''}
     </div>
     <div class="card"><div id="projectTable"><div class="card-body"><div class="skeleton" style="height:200px"></div></div></div></div>`;
 
@@ -279,7 +282,7 @@ async function loadProjects() {
   // 管理员可见勾选列，用于批量修改状态
   const showChk = canManageProjects();
   box.innerHTML = `
-    <div class="table-wrap" style="max-height:calc(100vh - 340px)">
+    <div class="table-wrap" style="max-height:calc(100vh - 385px)">
       <table class="data-table">
         <thead><tr>
           ${showChk ? '<th style="width:40px"><input type="checkbox" id="checkAllP" style="accent-color:var(--primary)" /></th>' : ''}

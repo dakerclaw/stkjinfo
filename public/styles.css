@@ -183,6 +183,15 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
 .w-160 { width: 160px; } .w-140 { width: 140px; } .w-120 { width: 120px; } .w-220 { width: 220px; }
 .filter-actions { margin-left: auto; display: flex; gap: 8px; align-items: center; }
 
+/* 操作工具栏（项目列表等页面，位于筛选块下方） */
+.toolbar {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius-lg); padding: 10px 18px; margin-bottom: 14px;
+  box-shadow: var(--shadow-sm);
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+}
+.toolbar-sep { width: 1px; height: 20px; background: var(--border); margin: 0 4px; }
+
 /* 表格 */
 .table-wrap { overflow: auto; border-radius: 0 0 var(--radius-lg) var(--radius-lg); max-height: calc(100vh - 300px); }
 table.data-table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13px; }
