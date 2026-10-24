@@ -1014,16 +1014,18 @@ function getMeta(res, user) {
 
   // 普通用户的筛选下拉只列自己数据中出现过的值，避免泄露他人数据。
   // 4~5 条 DISTINCT 合并成一条 UNION ALL，减少往返；结果在内存里分组排序。
+  // 注意：每个分支都要 DISTINCT，否则同值会按数据行数重复出现，下拉框里就是一堆重复项。
   const of = ownerFilter(user);
   const w = of ? ` WHERE ${of.sql} AND deleted_at IS NULL` : ' WHERE deleted_at IS NULL';
   const args = of ? [of.arg] : [];
   const cols = ['base', 'process_code', 'work_order', 'coke_type'];
   if (!admin) cols.push('product_code');
   const unionSql = cols
-    .map((c) => `SELECT '${c}' AS k, ${c} AS v FROM project_data${w} AND ${c} IS NOT NULL AND ${c} <> ''`)
+    .map((c) => `SELECT DISTINCT '${c}' AS k, ${c} AS v FROM project_data${w} AND ${c} IS NOT NULL AND ${c} <> ''`)
     .join(' UNION ALL ');
   const optRows = db.prepare(unionSql).all(...cols.flatMap(() => args));
-  const pick = (k) => optRows.filter((r) => r.k === k).map((r) => r.v).sort(cmpText);
+  // 兜底去重：即使 SQL 侧没有 DISTINCT，下拉框也不会出现重复项
+  const pick = (k) => [...new Set(optRows.filter((r) => r.k === k).map((r) => r.v))].sort(cmpText);
 
   // 项目编号 → 产品代码，供录入时自动带出（项目编号列表也由此派生，省一条查询）
   const projectMap = db
