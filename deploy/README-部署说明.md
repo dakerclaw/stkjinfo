@@ -29,10 +29,9 @@
 ~/
 ├── apps/
 │   ├── node-v22.23.3-linux-x64/      Node.js 运行时（免 sudo）
-│   ├── stkj/                         代码目录（APP_DIR）
-│   │   ├── stkjinfo/                 代码根（CODE_DIR；若仓库根即代码则为 stkj/ 本身）
-│   │   │   ├── server.js  db.js  ...
-│   │   │   └── deploy/               部署脚本与 systemd 单元模板
+│   ├── stkj/                         代码目录（APP_DIR = CODE_DIR，仓库根即代码）
+│   │   ├── server.js  db.js  ...
+│   │   ├── deploy/                   部署脚本与 systemd 单元模板
 │   │   ├── data/app.db               SQLite 数据库（含 -wal / -shm）
 │   │   ├── backups/                  每日自动备份
 │   │   └── logs/app.log              运行日志
@@ -175,7 +174,7 @@ After=network-online.target
 Type=simple
 User=<用户名>
 Group=<用户名>
-WorkingDirectory=/home/<用户名>/apps/stkj/stkjinfo
+WorkingDirectory=/home/<用户名>/apps/stkj
 Environment=NODE_ENV=production
 Environment=HOST=0.0.0.0
 Environment=PORT=<端口>
@@ -190,8 +189,8 @@ StandardError=append:/home/<用户名>/apps/stkj/logs/app.log
 WantedBy=multi-user.target
 ```
 
-> 若代码直接放在 `~/apps/stkj`（没有 `stkjinfo/` 子目录），把 `WorkingDirectory` 改回
-> `/home/<用户名>/apps/stkj` 即可；`DATA_DIR` 保持指向 `apps/stkj/data` 不变。
+> 若历史部署把代码放在 `~/apps/stkj/stkjinfo`（子目录布局），把 `WorkingDirectory` 改回
+> 该子目录即可；`DATA_DIR` 始终指向 `apps/stkj/data`，与代码目录无关。
 
 ```bash
 sudo cp stkj-system.service /etc/systemd/system/stkj.service

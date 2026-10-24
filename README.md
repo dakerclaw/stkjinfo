@@ -9,10 +9,9 @@
 
 ## 快速开始
 
-代码位于本仓库的 `stkjinfo/` 目录，先进入该目录再执行：
+仓库根目录即代码目录，克隆后直接执行：
 
 ```bash
-cd stkjinfo
 npm start          # 启动服务，访问 http://127.0.0.1:5173
 ```
 
@@ -276,20 +275,19 @@ node seed.js --reset   # 清空项目与数据后重新灌入示例（保留用�
 
 ## 目录结构
 
-仓库采用 `stkjinfo/` 子目录存放代码（部署脚本会自动识别，也兼容代码直接在仓库根目录的布局）：
+仓库根目录即代码目录（部署脚本兼容根目录与 `stkjinfo/` 子目录两种布局）：
 
 ```
-stkjinfo/
-  server.js          后端服务与 API
-  db.js              建表语句与字段定义（前后端共用字段元数据）
-  xlsx.js            极简 XLSX 读写（零第三方依赖：手写 ZIP + XML）
-  import-map.js      导入表头识别（中文列名 / 字段名 / 别名 → 字段 key）
-  seed.js            初始化账号与示例数据
-  public/index.html  页面骨架
-  public/styles.css  样式
-  public/app.js      前端逻辑（视图渲染、筛选、表单、Excel 导入导出）
-  deploy/            部署脚本与 systemd 单元（详见 deploy/README-部署说明.md）
-data/app.db          SQLite 数据库（本机默认 stkjinfo/data；部署时用 DATA_DIR 固定到 APP_DIR/data）
+server.js            后端服务与 API
+db.js                建表语句与字段定义（前后端共用字段元数据）
+xlsx.js              极简 XLSX 读写（零第三方依赖：手写 ZIP + XML）
+import-map.js        导入表头识别（中文列名 / 字段名 / 别名 → 字段 key）
+seed.js              初始化账号与示例数据
+public/index.html    页面骨架
+public/styles.css    样式
+public/app.js        前端逻辑（视图渲染、筛选、表单、Excel 导入导出）
+deploy/              部署脚本与 systemd 单元（详见 deploy/README-部署说明.md）
+data/app.db          SQLite 数据库（本机默认 ./data；部署时用 DATA_DIR 固定到 APP_DIR/data）
 ```
 
 `deploy/` 目录内容：
