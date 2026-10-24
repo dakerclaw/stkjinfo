@@ -122,6 +122,8 @@ const VIEWS = {
 };
 
 function navigate(view) {
+  // 元数据还没就绪（例如会话失效后刷新）时不渲染，避免读空 meta 报错
+  if (!state.meta) return;
   state.view = view;
   document.querySelectorAll('.nav-item').forEach((n) => n.classList.toggle('active', n.dataset.view === view));
   el('#viewTitle').textContent = VIEWS[view].title;
@@ -569,7 +571,7 @@ const TEXT_FIELDS = () => F().filter((f) => f.type !== 'number');
 
 async function renderData() {
   const f = state.data.filters;
-  const o = state.meta.options;
+  const o = (state.meta && state.meta.options) || {};
   // 六个下拉都用「筛选联动」结果（随其他筛选收窄）；没有时退回 meta 的全量选项
   const fo = state.data.facets || {};
   const facetOpts = {
@@ -637,6 +639,7 @@ async function renderData() {
       <label style="display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--text-2);cursor:pointer">
         <input type="checkbox" id="onlySel" style="accent-color:var(--primary)" ${state.data.onlySelected ? 'checked' : ''}/> 仅显示已选
       </label>
+      <button class="btn btn-sm" id="copyRow" style="display:none" onclick="copySelectedData()" title="勾选一行后，可基于它复制出一条新记录">复制为新行</button>
       <button class="btn btn-sm btn-danger" id="bulkDel" style="display:none" onclick="bulkDelete()">删除选中 (<span id="selCount">0</span>)</button>
     </div>
     <div class="card"><div id="dataTable"><div class="card-body"><div class="skeleton" style="height:240px"></div></div></div></div>`;
@@ -728,6 +731,7 @@ async function loadData() {
   if (state.data.sort) { qs.set('sort', state.data.sort); qs.set('dir', state.data.dir); }
 
   const { rows: allRows, total, page, pageSize } = await API.get('/api/data?' + qs.toString());
+  state.data.rows = allRows; // 供「复制为新行」等操作按 id 取原始记录
   const rows = state.data.onlySelected && state.data.selected.size
     ? allRows.filter((r) => state.data.selected.has(r.id))
     : allRows;
@@ -750,8 +754,8 @@ async function loadData() {
       <table class="data-table">
         <thead>
           <tr>
-            ${canDeleteData() ? '<th class="col-sticky" style="width:40px"><input type="checkbox" id="checkAll" style="accent-color:var(--primary)" /></th>' : ''}
-            ${F().map((f, i) => `<th class="sortable ${i === 0 && !canDeleteData() ? 'col-sticky' : ''} ${sorted === f.key ? 'sorted' : ''}" data-sort="${f.key}">${esc(f.label)}<span class="arrow">${arrow(f.key)}</span></th>${
+            <th class="col-sticky" style="width:40px"><input type="checkbox" id="checkAll" style="accent-color:var(--primary)" /></th>
+            ${F().map((f) => `<th class="sortable ${sorted === f.key ? 'sorted' : ''}" data-sort="${f.key}">${esc(f.label)}<span class="arrow">${arrow(f.key)}</span></th>${
               f.key === 'entry_date' ? `<th class="sortable ${sorted === 'created_by' ? 'sorted' : ''}" data-sort="created_by">录入人<span class="arrow">${arrow('created_by')}</span></th>` : ''
             }`).join('')}
             <th style="position:sticky;right:0;background:var(--surface-2);z-index:3">操作</th>
@@ -761,10 +765,10 @@ async function loadData() {
           ${rows.map((r) => {
             const mine = r.created_by_id === state.user.id;
             return `<tr>
-            ${canDeleteData() ? `<td class="col-sticky"><input type="checkbox" class="rowChk" data-id="${r.id}" style="accent-color:var(--primary)" ${state.data.selected.has(r.id) ? 'checked' : ''} /></td>` : ''}
-            ${F().map((f, i) => {
+            <td class="col-sticky"><input type="checkbox" class="rowChk" data-id="${r.id}" style="accent-color:var(--primary)" ${state.data.selected.has(r.id) ? 'checked' : ''} /></td>
+            ${F().map((f) => {
               const v = r[f.key];
-              const sticky = i === 0 && !canDeleteData() ? 'col-sticky' : '';
+              const sticky = '';
               const ownerCell = f.key === 'entry_date'
                 ? `<td><span class="owner-chip ${mine ? 'me' : ''}">${esc(r.created_by || '—')}${mine ? '（我）' : ''}</span></td>`
                 : '';
@@ -827,6 +831,17 @@ function updateSelCount() {
   if (c) c.textContent = n;
   const b = el('#bulkDel');
   if (b) b.style.display = n && canDeleteData() ? 'inline-flex' : 'none';
+  const cp = el('#copyRow');
+  if (cp) cp.style.display = n === 1 ? 'inline-flex' : 'none';
+}
+
+/** 以勾选的那一行为模板，打开新增表单（保存后生成独立的新记录） */
+function copySelectedData() {
+  const id = [...state.data.selected][0];
+  if (!id) return toast('请先勾选一行数据', 'err');
+  const row = (state.data.rows || []).find((r) => r.id === id);
+  if (!row) return toast('未找到选中的记录，请刷新后重试', 'err');
+  openDataModal(null, { copyFrom: row });
 }
 
 function renderPagination(total, page, pageSize) {
@@ -853,9 +868,12 @@ function renderPagination(total, page, pageSize) {
 }
 
 /* ---------- 数据录入弹窗 ---------- */
-function openDataModal(id) {
+function openDataModal(id, opts = {}) {
   const editing = !!id;
-  const load = editing ? API.get('/api/data/' + id).then((r) => r.row) : Promise.resolve({ entry_date: new Date().toISOString().slice(0, 10) });
+  const copyFrom = opts.copyFrom || null;
+  const load = editing
+    ? API.get('/api/data/' + id).then((r) => r.row)
+    : Promise.resolve(copyFrom ? { ...copyFrom } : { entry_date: new Date().toISOString().slice(0, 10) });
   load.then((row) => {
     const groups = [
       { title: '基础信息', keys: ['project_no', 'product_code', 'base', 'process_code', 'work_order'] },
@@ -905,8 +923,12 @@ function openDataModal(id) {
     };
 
     openModal({
-      title: editing ? '编辑数据记录' : '新增数据记录',
-      sub: editing ? `工单 ${row.work_order || '—'} · 录入 ${row.entry_date || ''}` : '填写检测与生产数据，数值项留空表示未检测',
+      title: editing ? '编辑数据记录' : copyFrom ? '复制为新数据记录' : '新增数据记录',
+      sub: editing
+        ? `工单 ${row.work_order || '—'} · 录入 ${row.entry_date || ''}`
+        : copyFrom
+          ? `已复制「${row.project_no} / 工单 ${row.work_order || '—'}」的全部字段，修改工单号或录入日期后保存为新记录`
+          : '填写检测与生产数据，数值项留空表示未检测',
       wide: true,
       body: `<div class="form-grid" style="grid-template-columns:repeat(auto-fill,minmax(180px,1fr))">
         ${groups.map((g) => `<div class="form-section-title">${g.title}</div>${g.keys.map(inputFor).join('')}`).join('')}
@@ -956,11 +978,14 @@ function openDataModal(id) {
       try {
         await save();
         closeModal();
-        toast(editing ? '记录已更新' : '记录已保存', 'ok');
+        toast(editing ? '记录已更新' : copyFrom ? '已复制为新记录' : '记录已保存', 'ok');
+        if (copyFrom) { state.data.selected.clear(); updateSelCount(); }
         await refreshMeta();
         loadData();
       } catch (e) {
         if (e.status === 409 && e.code === 'DUPLICATE_KEY') {
+          // 复制场景：五项与被复制的那条完全相同，不提供「覆盖」，避免误改原记录
+          if (copyFrom) return toast('与原有记录五项完全相同，请先修改工单号或录入日期再保存', 'err');
           // 五项全部相同 → 询问覆盖还是追加
           const info = e.payload.duplicate || {};
           askDuplicateAction({
