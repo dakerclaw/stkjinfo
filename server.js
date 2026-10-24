@@ -925,6 +925,37 @@ function batchUpdateProjectStatus(res, body, user) {
   ok(res, { updated: info.changes, status });
 }
 
+/**
+ * 批量删除项目（仅管理员）。与单个删除一致：级联删除所选项目下的全部数据记录。
+ * body: { ids: number[] }，事务内完成，返回 { removed, removedData }。
+ */
+function bulkDeleteProjects(res, body, user) {
+  if (!isAdmin(user)) return fail(res, 403, '仅管理员可删除项目');
+  const ids = Array.isArray(body.ids) ? [...new Set(body.ids.map(Number).filter(Number.isFinite))] : [];
+  if (ids.length === 0) return fail(res, 400, '请选择要删除的项目');
+  if (ids.length > 500) return fail(res, 400, '单次最多删除 500 个项目');
+  const marks = ids.map(() => '?').join(',');
+  const pros = db.prepare(`SELECT id, project_no FROM projects WHERE id IN (${marks})`).all(...ids);
+  const pnos = pros.map((p) => p.project_no);
+  let removedData = 0;
+  db.exec('BEGIN');
+  try {
+    for (const pno of pnos) {
+      removedData += db.prepare('SELECT COUNT(*) AS c FROM project_data WHERE project_no = ?').get(pno).c;
+    }
+    if (pnos.length) {
+      const pm = pnos.map(() => '?').join(',');
+      db.prepare(`DELETE FROM project_data WHERE project_no IN (${pm})`).run(...pnos);
+    }
+    const info = db.prepare(`DELETE FROM projects WHERE id IN (${marks})`).run(...ids);
+    db.exec('COMMIT');
+    ok(res, { removed: info.changes, removedData });
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+}
+
 function deleteProject(res, id) {
   const cur = db.prepare('SELECT * FROM projects WHERE id = ?').get(id);
   if (!cur) return fail(res, 404, '项目不存在');
@@ -1736,7 +1767,10 @@ async function handleApi(req, res, url) {
   if (p === '/api/projects/batch-status' && m === 'POST') {
     return batchUpdateProjectStatus(res, await readBody(req), user);
   }
-  // 注意：batch-status 必须在下方 seg[1] 的 id 分支之前拦截，否则会被当成 id 解析成 NaN
+  if (p === '/api/projects/bulk-delete' && m === 'POST') {
+    return bulkDeleteProjects(res, await readBody(req), user);
+  }
+  // 注意：batch-status / bulk-delete 必须在下方 seg[1] 的 id 分支之前拦截，否则会被当成 id 解析成 NaN
   if (seg[0] === 'projects' && seg[1]) {
     const id = Number(seg[1]);
     if (m === 'GET') return getProject(res, id);

@@ -61,7 +61,7 @@ const state = {
   view: 'dashboard',
   user: null,
   meta: null,
-  projects: { filters: {}, sort: '', dir: 'asc', selected: new Set() },
+  projects: { filters: {}, sort: '', dir: 'asc', selected: new Set(), onlySelected: false, rows: [] },
   data: { filters: {}, sort: '', dir: 'asc', page: 1, pageSize: 20, selected: new Set() },
   users: { rows: [] },
 };
@@ -230,7 +230,11 @@ async function renderProjects() {
       ${canManageProjects() ? `
       <span class="toolbar-sep"></span>
       <button class="btn btn-sm" id="bulkStOn" style="display:none" onclick="bulkProjectStatus(1)">设为进行中 (<span id="selStOn">0</span>)</button>
-      <button class="btn btn-sm" id="bulkStOff" style="display:none" onclick="bulkProjectStatus(0)">设为已归档 (<span id="selStOff">0</span>)</button>` : ''}
+      <button class="btn btn-sm" id="bulkStOff" style="display:none" onclick="bulkProjectStatus(0)">设为已归档 (<span id="selStOff">0</span>)</button>
+      <label style="display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--text-2);cursor:pointer">
+        <input type="checkbox" id="onlySelP" style="accent-color:var(--primary)" ${state.projects.onlySelected ? 'checked' : ''}/> 仅显示已选
+      </label>
+      <button class="btn btn-sm btn-danger" id="bulkDelP" style="display:none" onclick="bulkDeleteProjects()">删除选中 (<span id="selDelP">0</span>)</button>` : ''}
     </div>
     <div class="card"><div id="projectTable"><div class="card-body"><div class="skeleton" style="height:200px"></div></div></div></div>`;
 
@@ -263,7 +267,12 @@ async function loadProjects() {
   const qs = new URLSearchParams();
   Object.entries(f).forEach(([k, v]) => { if (v) qs.set(k, v); });
   if (state.projects.sort) { qs.set('sort', state.projects.sort); qs.set('dir', state.projects.dir); }
-  const { rows, total } = await API.get('/api/projects?' + qs.toString());
+  const { rows: allRows, total } = await API.get('/api/projects?' + qs.toString());
+  // 仅显示已选：客户端过滤当前勾选的项目
+  const rows = state.projects.onlySelected && state.projects.selected.size
+    ? allRows.filter((r) => state.projects.selected.has(r.id))
+    : allRows;
+  state.projects.rows = allRows;
 
   const box = el('#projectTable');
   if (!rows.length) {
@@ -304,8 +313,7 @@ async function loadProjects() {
               <div class="row-actions">
                 <button class="btn btn-sm btn-ghost" onclick="gotoDataForProject('${esc(r.project_no)}')">查看数据</button>
                 ${canManageProjects()
-                  ? `<button class="btn btn-sm btn-ghost" onclick="openProjectModal(${r.id})">编辑</button>
-                     <button class="btn btn-sm btn-ghost" style="color:var(--danger)" onclick="confirmDeleteProject(${r.id}, '${esc(r.project_no)}', ${r.data_count})">删除</button>`
+                  ? `<button class="btn btn-sm btn-ghost" onclick="openProjectModal(${r.id})">编辑</button>`
                   : ''}
               </div>
             </td>
@@ -315,7 +323,7 @@ async function loadProjects() {
     </div>
     <div class="pagination"><span>共 <b>${total}</b> 个项目</span></div>`;
 
-  // 勾选（批量修改状态用）
+  // 勾选（批量操作用）
   box.querySelectorAll('.rowChkP').forEach((cb) => {
     cb.addEventListener('change', () => {
       const id = Number(cb.dataset.id);
@@ -330,6 +338,10 @@ async function loadProjects() {
       e.target.checked ? state.projects.selected.add(id) : state.projects.selected.delete(id);
     });
     updateProjSelCount();
+  });
+  el('#onlySelP')?.addEventListener('change', (e) => {
+    state.projects.onlySelected = e.target.checked;
+    loadProjects();
   });
   updateProjSelCount();
 
@@ -358,10 +370,10 @@ function gotoDataForProject(pno) {
   navigate('data');
 }
 
-/** 更新批量状态按钮的可见性与计数 */
+/** 更新批量状态/删除按钮的可见性与计数 */
 function updateProjSelCount() {
   const n = state.projects.selected.size;
-  for (const [btn, cnt] of [['#bulkStOn', '#selStOn'], ['#bulkStOff', '#selStOff']]) {
+  for (const [btn, cnt] of [['#bulkStOn', '#selStOn'], ['#bulkStOff', '#selStOff'], ['#bulkDelP', '#selDelP']]) {
     const b = el(btn); const c = el(cnt);
     if (c) c.textContent = n;
     if (b) b.style.display = n ? 'inline-flex' : 'none';
@@ -393,6 +405,32 @@ function bulkProjectStatus(status) {
       clearProjectSelection();
       closeModal();
       toast(`已将 ${r.updated} 个项目设为${label}`, 'ok');
+      loadProjects();
+    } catch (e) { toast(e.message, 'err'); }
+  });
+}
+
+/** 批量删除所选项目（级联删除其下数据记录） */
+function bulkDeleteProjects() {
+  const ids = [...state.projects.selected];
+  if (!ids.length || !canManageProjects()) return;
+  // 用当前列表数据估算将被级联删除的数据条数
+  const dataCount = state.projects.rows
+    .filter((r) => state.projects.selected.has(r.id))
+    .reduce((a, r) => a + (r.data_count || 0), 0);
+  openModal({
+    title: '批量删除项目', narrow: true,
+    body: `<p style="margin:0 0 8px;color:var(--text-2)">确定删除选中的 <b>${ids.length}</b> 个项目吗？</p>
+      ${dataCount ? `<p style="margin:0;color:var(--danger);font-size:13px">这些项目下共有 <b>${dataCount}</b> 条数据记录，删除项目会同时删除这些记录，此操作不可恢复。</p>`
+        : `<p style="margin:0;color:var(--text-3);font-size:13px">所选项目暂无数据记录。</p>`}`,
+    footer: `<button class="btn" onclick="closeModal()">取消</button><button class="btn btn-danger" id="okBulkDelP">确认删除</button>`,
+  });
+  el('#okBulkDelP').addEventListener('click', async () => {
+    try {
+      const r = await API.post('/api/projects/bulk-delete', { ids });
+      clearProjectSelection();
+      closeModal();
+      toast(`已删除 ${r.removed} 个项目${r.removedData ? `及其 ${r.removedData} 条数据` : ''}`, 'ok');
       loadProjects();
     } catch (e) { toast(e.message, 'err'); }
   });
@@ -470,24 +508,6 @@ function openProjectModal(id) {
         loadProjects();
       } catch (e) { toast(e.message, 'err'); }
     });
-  });
-}
-
-function confirmDeleteProject(id, pno, dataCount) {
-  openModal({
-    title: '删除项目', narrow: true,
-    body: `<p style="margin:0 0 8px">确定删除项目 <b>${esc(pno)}</b> 吗？</p>
-      ${dataCount ? `<p style="margin:0;color:var(--danger);font-size:13px">该项目下还有 <b>${dataCount}</b> 条数据记录，删除项目会同时删除这些记录，此操作不可恢复。</p>`
-        : `<p style="margin:0;color:var(--text-3);font-size:13px">该项目暂无数据记录。</p>`}`,
-    footer: `<button class="btn" onclick="closeModal()">取消</button>
-      <button class="btn btn-danger" id="okDel">确认删除</button>`,
-  });
-  el('#okDel').addEventListener('click', async () => {
-    try {
-      const r = await API.del('/api/projects/' + id);
-      closeModal(); toast(`已删除项目${r.removedData ? `及其 ${r.removedData} 条数据` : ''}`, 'ok');
-      await refreshMeta(); loadProjects();
-    } catch (e) { toast(e.message, 'err'); }
   });
 }
 
@@ -648,7 +668,6 @@ async function loadData() {
             <td style="position:sticky;right:0;background:var(--surface);border-left:1px solid var(--border)">
               <div class="row-actions">
                 <button class="btn btn-sm btn-ghost" onclick="openDataModal(${r.id})">编辑</button>
-                ${canDeleteData() ? `<button class="btn btn-sm btn-ghost" style="color:var(--danger)" onclick="confirmDeleteData(${r.id})">删除</button>` : ''}
               </div>
             </td>
           </tr>`;
@@ -657,7 +676,7 @@ async function loadData() {
       </table>
     </div>
     ${renderPagination(total, page, pageSize)}
-    <div style="padding:0 16px 12px"><span class="scroll-hint">↔ 表格可横向滚动查看全部 ${F().length} 个指标字段${canDeleteData() ? '' : ' · 删除操作需管理员权限'}</span></div>`;
+    <div style="padding:0 16px 12px"><span class="scroll-hint">↔ 表格可横向滚动查看全部 ${F().length} 个指标字段</span></div>`;
 
   // 排序
   box.querySelectorAll('th.sortable').forEach((th) => {
@@ -891,21 +910,6 @@ function askDuplicateAction({ title, key, count, extra, rowsHtml, onChoice }) {
   };
   el('#dupOverwrite').addEventListener('click', () => pick('overwrite'));
   el('#dupAppend').addEventListener('click', () => pick('append'));
-}
-
-function confirmDeleteData(id) {
-  openModal({
-    title: '删除数据记录', narrow: true,
-    body: `<p style="margin:0;color:var(--text-2)">确定删除这条数据记录吗？此操作不可恢复。</p>`,
-    footer: `<button class="btn" onclick="closeModal()">取消</button><button class="btn btn-danger" id="okDel">确认删除</button>`,
-  });
-  el('#okDel').addEventListener('click', async () => {
-    try {
-      await API.del('/api/data/' + id);
-      state.data.selected.delete(id);
-      closeModal(); toast('已删除', 'ok'); loadData();
-    } catch (e) { toast(e.message, 'err'); }
-  });
 }
 
 function bulkDelete() {
