@@ -1832,7 +1832,7 @@ async function loadAudit() {
             <td><span class="code-chip">${esc(auditActionLabel(x.action))}</span></td>
             <td>${esc(auditEntityLabel(x.entity))}</td>
             <td style="max-width:560px">${esc(x.summary)}</td>
-            <td>${x.changes
+            <td>${auditHasDetail(x)
               ? `<button class="btn btn-sm btn-ghost" data-audit-detail="${x.id}">查看</button>`
               : '<span class="empty-num">—</span>'}</td>
           </tr>`).join('')}
@@ -1857,10 +1857,37 @@ async function loadAudit() {
   });
 }
 
-/** 查看某条日志的字段级变更（changes 形如 {字段: {from, to}}） */
+/** 审计 changes 有两种形态：{字段:{from,to}}（字段级变更）、{ids:[...]}（批量操作影响范围） */
+function parseAuditChanges(raw) {
+  let obj = raw;
+  if (typeof raw === 'string') {
+    try { obj = JSON.parse(raw); } catch { obj = null; }
+  }
+  const out = { ids: [], diffs: [], extras: [] };
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return out;
+  Object.entries(obj).forEach(([k, v]) => {
+    if (k === 'ids' || k === 'entity_ids') {
+      (Array.isArray(v) ? v : [v])
+        .filter((n) => n !== null && n !== undefined && n !== '')
+        .forEach((n) => out.ids.push(n));
+    } else if (v && typeof v === 'object' && !Array.isArray(v) && ('from' in v || 'to' in v)) {
+      out.diffs.push([k, v.from, v.to]);
+    } else {
+      out.extras.push([k, v]);
+    }
+  });
+  return out;
+}
+
+/** 该条日志是否有可展示的详情（没有就显示「—」，不出查看按钮） */
+function auditHasDetail(row) {
+  const p = parseAuditChanges(row && row.changes);
+  return p.ids.length > 0 || p.diffs.length > 0 || p.extras.length > 0;
+}
+
+/** 查看某条日志详情：摘要 + 影响范围（记录 ID）+ 字段级变更 */
 function openAuditDetail(row) {
-  let changes = {};
-  try { changes = JSON.parse(row.changes || '{}') || {}; } catch { changes = {}; }
+  const { ids, diffs, extras } = parseAuditChanges(row.changes);
   // 字段键优先取指标字段的中文名，其次取常见档案字段名
   const EXTRA_LABELS = {
     project_no: '项目编号', product_code: '产品代码', project_type: '项目类型', description: '项目简介',
@@ -1868,20 +1895,45 @@ function openAuditDetail(row) {
   };
   const labelOf = (k) => (F().find((f) => f.key === k) || {}).label || EXTRA_LABELS[k] || k;
   const fmtVal = (v) => (v === '' || v === null || v === undefined ? '（空）' : String(v));
-  const keys = Object.keys(changes);
+  const fmtAny = (v) => {
+    if (v === null || v === undefined || v === '') return '（空）';
+    if (typeof v === 'object') return JSON.stringify(v);
+    return String(v);
+  };
+
+  const metaRows = [];
+  if (ids.length) metaRows.push(['涉及记录 ID', ids.join('、')]);
+  if (row.entity_id !== null && row.entity_id !== undefined && row.entity_id !== '') {
+    metaRows.push(['对象 ID', String(row.entity_id)]);
+  }
+  extras.forEach(([k, v]) => metaRows.push([labelOf(k), fmtAny(v)]));
+
+  const blocks = [`<p style="margin:0 0 10px;color:var(--text-2);font-size:13px">${esc(row.summary)}</p>`];
+  if (metaRows.length) {
+    blocks.push(`<div class="table-wrap"><table class="data-table">
+      <thead><tr><th>项目</th><th>内容</th></tr></thead>
+      <tbody>${metaRows.map(([k, v]) => `<tr>
+        <td style="white-space:nowrap">${esc(k)}</td>
+        <td>${esc(v)}</td>
+      </tr>`).join('')}</tbody></table></div>`);
+  }
+  if (diffs.length) {
+    blocks.push(`<div class="table-wrap"${metaRows.length ? ' style="margin-top:12px"' : ''}><table class="data-table">
+      <thead><tr><th>字段</th><th>变更前</th><th>变更后</th></tr></thead>
+      <tbody>${diffs.map(([k, from, to]) => `<tr>
+        <td>${esc(labelOf(k))}</td>
+        <td style="color:var(--text-3)">${esc(fmtVal(from))}</td>
+        <td style="font-weight:550">${esc(fmtVal(to))}</td>
+      </tr>`).join('')}</tbody></table></div>`);
+  } else {
+    blocks.push(`<p style="margin:${metaRows.length ? '10px' : '0'} 0 0;color:var(--text-3);font-size:13px">该操作没有字段级变更${ids.length ? '，仅记录受影响的记录 ID' : ''}。</p>`);
+  }
+
   openModal({
-    title: '变更详情',
+    title: '操作详情',
     sub: `${auditActionLabel(row.action)} · ${row.username || '系统'} · ${row.created_at}`,
     narrow: true,
-    body: `<p style="margin:0 0 10px;color:var(--text-2);font-size:13px">${esc(row.summary)}</p>
-      ${keys.length ? `<div class="table-wrap"><table class="data-table">
-        <thead><tr><th>字段</th><th>变更前</th><th>变更后</th></tr></thead>
-        <tbody>${keys.map((k) => `<tr>
-          <td>${esc(labelOf(k))}</td>
-          <td style="color:var(--text-3)">${esc(fmtVal(changes[k] && changes[k].from))}</td>
-          <td style="font-weight:550">${esc(fmtVal(changes[k] && changes[k].to))}</td>
-        </tr>`).join('')}</tbody></table></div>`
-        : `<p style="margin:0;color:var(--text-3);font-size:13px">该操作没有字段级变更记录。</p>`}`,
+    body: blocks.join(''),
     footer: `<button class="btn" onclick="closeModal()">关闭</button>`,
   });
 }
