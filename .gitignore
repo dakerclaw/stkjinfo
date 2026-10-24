@@ -40,9 +40,6 @@ exports/
 Thumbs.db
 desktop.ini
 
-# WorkBuddy 本地工作目录（保留 memory 可选，此处整体忽略）
-.workbuddy/
-
 # 测试临时脚本
 .test-*.mjs
 
