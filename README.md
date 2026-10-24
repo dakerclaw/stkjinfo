@@ -195,6 +195,7 @@ node seed.js --reset   # 清空项目与数据后重新灌入示例（保留用�
 
 - 管理员在项目列表勾选若干项目（表头可全选 / 取消全选），操作栏会出现「设为进行中 / 设为已归档」两个批量按钮
 - 点击后在弹窗中确认，一次性把所选项目状态改为目标值；提交后清空勾选并刷新列表
+- 「导出 Excel」在有勾选时只导出**勾选的项目**（`?ids=1,2,3`），否则按当前筛选与排序导出
 - 接口：`POST /api/projects/batch-status`，请求体 `{ids: number[], status: 0 | 1}`，返回 `{updated}`（实际改动的行数）
 - 校验：ids 自动去重、忽略非法值；单次最多 500 个；普通用户请求返回 403
 
@@ -234,11 +235,11 @@ node seed.js --reset   # 清空项目与数据后重新灌入示例（保留用�
 | GET/PUT/DELETE | /api/data/:id | 详情 / 更新（本人或管理员）/ 删除（管理员） |
 | POST | /api/data/bulk-delete | 批量删除 `{ids:[]}`（管理员） |
 | POST | /api/data/import | JSON 导入 `{rows:[], duplicate_action?}`，允许部分字段；返回留空字段清单 |
-| GET | /api/data/export | 导出检测数据为 Excel（按当前筛选条件） |
+| GET | /api/data/export | 导出检测数据为 Excel，按筛选条件；传 `ids` 时只导出勾选的记录 |
 | GET | /api/data/template | 下载导入模板 Excel，`?fields=a,b,c` 可只含指定字段 |
 | POST | /api/data/import-file | 上传 .xlsx 二进制，服务端解析并返回预览与批次 `token` |
 | POST | /api/data/import-confirm | 按 `token` 确认导入 `{token, duplicate_action?}` |
-| GET | /api/projects/export | 导出项目档案为 Excel |
+| GET | /api/projects/export | 导出项目档案为 Excel，按筛选与排序；传 `ids` 时只导出勾选的项目 |
 | GET | /api/projects/template | 下载项目列表导入模板（仅管理员） |
 | POST | /api/projects/import-file | 上传项目清单 .xlsx，返回预览、`willInsert` / `willDup` 与批次 `token`（仅管理员） |
 | POST | /api/projects/import-confirm | 按 `token` 确认导入 `{token, duplicate_action?}`，重复时 409 待选 `overwrite` / `skip`（仅管理员） |

@@ -237,10 +237,36 @@ function buildDataWhere(params, user) {
   return { w: where.length ? ` WHERE ${where.join(' AND ')}` : '', args };
 }
 
-/** 导出检测数据为 Excel（按当前筛选条件） */
+/**
+ * 解析 ids 查询参数（逗号分隔的记录 id），用于「导出已勾选的行」。
+ * 返回去重后的 id 数组；超过上限或含非法片段时返回 null（区别于「未提供」的空数组）。
+ */
+function parseIdParam(raw, cap) {
+  if (!raw || !raw.trim()) return [];
+  const parts = raw.split(',');
+  if (parts.length > cap) return null;
+  const ids = [];
+  for (const s of parts) {
+    const n = Number(s.trim());
+    if (!Number.isInteger(n) || n <= 0) return null;
+    if (!ids.includes(n)) ids.push(n);
+  }
+  return ids;
+}
+
+/** 导出检测数据为 Excel（按当前筛选条件，或指定的已勾选 ids） */
 function exportDataXlsx(res, params, user) {
   const { w, args } = buildDataWhere(params, user);
-  const rows = db.prepare(`SELECT * FROM project_data${w} ORDER BY id DESC`).all(...args);
+  const ids = parseIdParam(params.get('ids'), 2000);
+  if (ids === null) return fail(res, 400, 'ids 参数不合法或超出数量上限（2000）');
+  let cond = '';
+  const idArgs = [];
+  if (ids.length) {
+    cond = ` id IN (${ids.map(() => '?').join(',')})`;
+    idArgs.push(...ids);
+  }
+  const full = cond ? (w ? `${w} AND${cond}` : ` WHERE${cond}`) : w;
+  const rows = db.prepare(`SELECT * FROM project_data${full} ORDER BY id DESC`).all(...args, ...idArgs);
   const table = [FIELDS.map((f) => f.label), ...rows.map((r) => FIELDS.map((f) => cell(r[f.key])))];
   sendXlsx(res, xlsx.build(table, '项目数据'), `项目数据_${todayStr()}.xlsx`);
 }
@@ -263,6 +289,13 @@ function exportProjectsXlsx(res, params) {
     parts.push("(p.project_no LIKE ? OR p.product_code LIKE ? OR p.project_type LIKE ? OR IFNULL(p.description,'') LIKE ?)");
     const like = `%${q.trim()}%`;
     allArgs.push(like, like, like, like);
+  }
+  // 指定 ids（导出已勾选的项目）：优先于其它筛选条件
+  const ids = parseIdParam(params.get('ids'), 500);
+  if (ids === null) return fail(res, 400, 'ids 参数不合法或超出数量上限（500）');
+  if (ids.length) {
+    parts.push(`p.id IN (${ids.map(() => '?').join(',')})`);
+    allArgs.push(...ids);
   }
   const where = parts.filter(Boolean).length ? ` WHERE ${parts.filter(Boolean).join(' AND ')}` : '';
   // 导出与列表同口径：同样的筛选 + 排序

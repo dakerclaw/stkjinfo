@@ -401,6 +401,13 @@ function bulkProjectStatus(status) {
 function exportProjects() {
   const f = state.projects.filters;
   const qs = new URLSearchParams();
+  // 已勾选时优先只导出勾选的项目；否则按当前筛选 + 排序导出
+  if (state.projects.selected.size) {
+    qs.set('ids', [...state.projects.selected].join(','));
+    downloadFile('/api/projects/export?' + qs.toString());
+    toast(`已导出选中的 ${state.projects.selected.size} 个项目`, 'ok');
+    return;
+  }
   Object.entries(f).forEach(([k, v]) => { if (v) qs.set(k, v); });
   // 导出口径与当前列表一致：带上筛选 + 排序
   if (state.projects.sort) { qs.set('sort', state.projects.sort); qs.set('dir', state.projects.dir); }
@@ -497,12 +504,7 @@ async function renderData() {
   // 从项目列表跳转过来时，目标编号可能不在当前用户可见的下拉选项里，需临时补入
   const pnoOpts = [...o.projectNos];
   if (f.project_no && !pnoOpts.includes(f.project_no)) pnoOpts.unshift(f.project_no);
-  actions().innerHTML = `
-    <button class="btn btn-primary" onclick="openDataModal()">
-      <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>新增数据
-    </button>
-    <button class="btn" onclick="openImport()">导入 Excel</button>
-    <button class="btn" onclick="exportData()">导出 Excel</button>`;
+  actions().innerHTML = '';
 
   content().innerHTML = `
     ${f.project_no ? `<div class="perm-note" style="background:var(--primary-weak);border-color:#c7d8ff">
@@ -544,13 +546,19 @@ async function renderData() {
       <div class="filter-row" style="margin-top:10px">
         <div class="field w-160"><label>录入日期 起</label><input class="input" type="date" id="dFrom" value="${esc(f.date_from || '')}" /></div>
         <div class="field w-160"><label>录入日期 止</label><input class="input" type="date" id="dTo" value="${esc(f.date_to || '')}" /></div>
-        <div class="filter-actions">
-          <label style="display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--text-2);cursor:pointer">
-            <input type="checkbox" id="onlySel" style="accent-color:var(--primary)" ${state.data.onlySelected ? 'checked' : ''}/> 仅显示已选
-          </label>
-          <button class="btn btn-sm btn-danger" id="bulkDel" style="display:none" onclick="bulkDelete()">删除选中 (<span id="selCount">0</span>)</button>
-        </div>
       </div>
+    </div>
+    <div class="toolbar" id="dataToolbar">
+      <button class="btn btn-primary" onclick="openDataModal()">
+        <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>新增数据
+      </button>
+      <button class="btn" onclick="openImport()">导入 Excel</button>
+      <button class="btn" onclick="exportData()">导出 Excel</button>
+      <span class="toolbar-sep"></span>
+      <label style="display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--text-2);cursor:pointer">
+        <input type="checkbox" id="onlySel" style="accent-color:var(--primary)" ${state.data.onlySelected ? 'checked' : ''}/> 仅显示已选
+      </label>
+      <button class="btn btn-sm btn-danger" id="bulkDel" style="display:none" onclick="bulkDelete()">删除选中 (<span id="selCount">0</span>)</button>
     </div>
     <div class="card"><div id="dataTable"><div class="card-body"><div class="skeleton" style="height:240px"></div></div></div></div>`;
 
@@ -1066,6 +1074,15 @@ function openProjectImport() {
 
 async function exportData() {
   const qs = new URLSearchParams();
+
+  // 已勾选时优先只导出勾选的记录
+  if (state.data.selected.size) {
+    qs.set('ids', [...state.data.selected].join(','));
+    downloadFile('/api/data/export?' + qs.toString());
+    toast(`已导出选中的 ${state.data.selected.size} 条记录`, 'ok');
+    return;
+  }
+
   Object.entries(state.data.filters).forEach(([k, v]) => { if (v) qs.set(k, v); });
 
   // 先取总数用于提示，实际文件由服务端按同样条件生成
@@ -1315,7 +1332,7 @@ async function renderUsers() {
       <div class="card-head"><h3>用户账号<span class="sub">
         共 ${rows.length} 个 · 管理员 ${(counts.admin || 0) + (counts.sys_admin || 0)} · 普通用户 ${counts.user || 0}
       </span></h3></div>
-      <div class="table-wrap" style="max-height:calc(100vh - 260px)">
+      <div class="table-wrap" style="max-height:calc(100vh - 320px)">
         <table class="data-table">
           <thead><tr>
             <th class="col-sticky">账号</th><th>姓名</th><th>角色</th><th>状态</th><th>密码</th>
