@@ -126,6 +126,8 @@ function navigate(view) {
   // 元数据还没就绪（例如会话失效后刷新）时不渲染，避免读空 meta 报错
   if (!state.meta) return;
   state.view = view;
+  // 数据页改为「只有表格内部滚动」，避免整页再出现一条滚动条
+  content().classList.toggle('fit', view === 'data');
   document.querySelectorAll('.nav-item').forEach((n) => n.classList.toggle('active', n.dataset.view === view));
   el('#viewTitle').textContent = VIEWS[view].title;
   el('#viewSub').textContent = VIEWS[view].sub;
