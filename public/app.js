@@ -570,16 +570,18 @@ const TEXT_FIELDS = () => F().filter((f) => f.type !== 'number');
 async function renderData() {
   const f = state.data.filters;
   const o = state.meta.options;
-  // 四个下拉用「筛选联动」结果（随其他筛选收窄）；没有时退回 meta 的全量选项
+  // 六个下拉都用「筛选联动」结果（随其他筛选收窄）；没有时退回 meta 的全量选项
   const fo = state.data.facets || {};
   const facetOpts = {
+    projectNos: fo.projectNos || o.projectNos,
+    productCodes: fo.productCodes || o.productCodes,
     bases: fo.bases || o.bases,
     processes: fo.processes || o.processes,
     workOrders: fo.workOrders || o.workOrders,
     cokeTypes: fo.cokeTypes || o.cokeTypes,
   };
   // 从项目列表跳转过来时，目标编号可能不在当前用户可见的下拉选项里，需临时补入
-  const pnoOpts = [...o.projectNos];
+  const pnoOpts = [...facetOpts.projectNos];
   if (f.project_no && !pnoOpts.includes(f.project_no)) pnoOpts.unshift(f.project_no);
   actions().innerHTML = '';
 
@@ -599,7 +601,7 @@ async function renderData() {
           <select class="select" id="dPno"><option value="">全部</option>${pnoOpts.map((v) => `<option ${f.project_no === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>
         </div>
         <div class="field w-160"><label>产品代码</label>
-          <select class="select" id="dPc"><option value="">全部</option>${o.productCodes.map((v) => `<option ${f.product_code === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>
+          <select class="select" id="dPc"><option value="">全部</option>${facetOpts.productCodes.map((v) => `<option ${f.product_code === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>
         </div>
         <div class="field w-160"><label>所属公司</label>
           <select class="select" id="dBase"><option value="">全部</option>${facetOpts.bases.map((v) => `<option ${f.base === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>
@@ -696,7 +698,7 @@ async function refreshDataOptions() {
   applyDataOptions();
 }
 
-/** 把联动结果写回四个下拉，保留当前选中值（即使它已不在结果里） */
+/** 把联动结果写回六个下拉，保留当前选中值（即使它已不在结果里） */
 function applyDataOptions() {
   const fo = state.data.facets;
   if (!fo) return;
@@ -710,6 +712,8 @@ function applyDataOptions() {
       + vals.map((v) => `<option value="${esc(v)}"${v === cur ? ' selected' : ''}>${esc(v)}</option>`).join('');
     box.value = cur || '';
   };
+  fill('dPno', fo.projectNos, f.project_no);
+  fill('dPc', fo.productCodes, f.product_code);
   fill('dBase', fo.bases, f.base);
   fill('dProc', fo.processes, f.process_code);
   fill('dWo', fo.workOrders, f.work_order);

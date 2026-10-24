@@ -1224,12 +1224,14 @@ function listData(res, params, user) {
 }
 
 /**
- * 数据页筛选联动：按当前筛选条件返回各下拉的可选值。
+ * 数据页筛选联动：按当前筛选条件返回六个下拉的可选值。
  * 每列都排除自身条件（否则选中后同列其他值会消失、无法切换），
- * 其余条件（项目 / 产品 / 关键词 / 日期 / 权限）全部参与过滤。
+ * 其余条件（含关键词 / 日期 / 权限）全部参与过滤，因此结果与选择顺序无关。
  */
 function dataFacets(res, params, user) {
   const dims = [
+    ['projectNos', 'project_no'],
+    ['productCodes', 'product_code'],
     ['bases', 'base'],
     ['processes', 'process_code'],
     ['workOrders', 'work_order'],
