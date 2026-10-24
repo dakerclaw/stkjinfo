@@ -125,7 +125,16 @@ else
   echo "  已解包：$(basename "$SRC")"
 fi
 cd "$APP_DIR"
-[ -f server.js ] || { echo "✗ $APP_DIR 下没有 server.js，代码包内容不对"; exit 1; }
+# 兼容两种打包布局：仓库根目录即代码，或代码在 stkjinfo/ 子目录
+if [ -f "$APP_DIR/server.js" ]; then
+  CODE_DIR="$APP_DIR"; CODE_PATH=""
+elif [ -f "$APP_DIR/stkjinfo/server.js" ]; then
+  CODE_DIR="$APP_DIR/stkjinfo"; CODE_PATH="/stkjinfo"
+else
+  echo "✗ $APP_DIR 下找不到 server.js（支持根目录或 stkjinfo/ 子目录两种布局），代码包内容不对"
+  exit 1
+fi
+echo "  代码目录：$CODE_DIR"
 
 # ------------------------------------------------------------ 3. 目录与权限
 echo
@@ -142,6 +151,7 @@ echo "  data/ backups/ 权限已收紧为 700"
 # ------------------------------------------------------------ 4. 数据库
 echo
 echo "==> [4/6] 初始化数据库"
+# 数据目录通过 DATA_DIR 固定到 $APP_DIR/data，与代码目录无关
 if [ -f "$APP_DIR/data/app.db" ] && [ -s "$APP_DIR/data/app.db" ]; then
   echo "  已存在数据库，跳过初始化（不会覆盖现有数据）"
   "$NODE_BIN" --no-warnings -e "
@@ -151,7 +161,7 @@ if [ -f "$APP_DIR/data/app.db" ] && [ -s "$APP_DIR/data/app.db" ]; then
                 '条，数据', db.prepare('SELECT COUNT(*) c FROM project_data').get().c, '条');
     db.close();" "$APP_DIR/data/app.db"
 else
-  "$NODE_BIN" --no-warnings seed.js
+  ( cd "$CODE_DIR" && DATA_DIR="$APP_DIR/data" "$NODE_BIN" --no-warnings seed.js )
 fi
 
 # ------------------------------------------------------------ 5. systemd
@@ -161,6 +171,7 @@ mkdir -p "$UNIT_DIR"
 sed -e "s|%h/apps/stkj/logs|$LOG_DIR|g" \
     -e "s|%h/apps/stkj|$APP_DIR|g" \
     -e "s|%h/apps/node|$NODE_DIR|g" \
+    -e "s|%code_path%|$CODE_PATH|g" \
     -e "s|Environment=PORT=5173|Environment=PORT=$PORT|" \
     -e "s|Environment=HOST=0.0.0.0|Environment=HOST=$HOST|" \
     deploy/stkj.service > "$UNIT_DIR/stkj.service"

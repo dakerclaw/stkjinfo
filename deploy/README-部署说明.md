@@ -29,18 +29,23 @@
 ~/
 ├── apps/
 │   ├── node-v22.23.3-linux-x64/      Node.js 运行时（免 sudo）
-│   ├── stkj/                         代码目录
-│   │   ├── server.js  db.js  ...
+│   ├── stkj/                         代码目录（APP_DIR）
+│   │   ├── stkjinfo/                 代码根（CODE_DIR；若仓库根即代码则为 stkj/ 本身）
+│   │   │   ├── server.js  db.js  ...
+│   │   │   └── deploy/               部署脚本与 systemd 单元模板
 │   │   ├── data/app.db               SQLite 数据库（含 -wal / -shm）
 │   │   ├── backups/                  每日自动备份
-│   │   ├── logs/app.log              运行日志
-│   │   └── deploy/                   部署脚本与 systemd 单元模板
+│   │   └── logs/app.log              运行日志
 │   └── backups/code-<时间戳>.tar.gz  更新前的代码快照
 └── .config/systemd/user/
     ├── stkj.service
     ├── stkj-backup.service
     └── stkj-backup.timer
 ```
+
+> **两种代码布局都支持**：`install.sh` / `apply-update.sh` 会自动检测 `APP_DIR/server.js` 或
+> `APP_DIR/stkjinfo/server.js`，并把 systemd 单元的 `WorkingDirectory` 指到实际代码目录。
+> 数据目录始终是 `APP_DIR/data`，由服务单元的 `DATA_DIR` 环境变量固定，与代码目录解耦。
 
 ---
 
@@ -170,10 +175,11 @@ After=network-online.target
 Type=simple
 User=<用户名>
 Group=<用户名>
-WorkingDirectory=/home/<用户名>/apps/stkj
+WorkingDirectory=/home/<用户名>/apps/stkj/stkjinfo
 Environment=NODE_ENV=production
 Environment=HOST=0.0.0.0
 Environment=PORT=<端口>
+Environment=DATA_DIR=/home/<用户名>/apps/stkj/data
 ExecStart=/home/<用户名>/apps/node-v22.23.3-linux-x64/bin/node --no-warnings server.js
 Restart=always
 RestartSec=3
@@ -183,6 +189,9 @@ StandardError=append:/home/<用户名>/apps/stkj/logs/app.log
 [Install]
 WantedBy=multi-user.target
 ```
+
+> 若代码直接放在 `~/apps/stkj`（没有 `stkjinfo/` 子目录），把 `WorkingDirectory` 改回
+> `/home/<用户名>/apps/stkj` 即可；`DATA_DIR` 保持指向 `apps/stkj/data` 不变。
 
 ```bash
 sudo cp stkj-system.service /etc/systemd/system/stkj.service

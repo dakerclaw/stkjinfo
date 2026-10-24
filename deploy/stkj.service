@@ -5,11 +5,14 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/apps/stkj
+# %code_path% 由 install.sh 按代码布局替换：仓库根即代码时为空，代码在 stkjinfo/ 时为 /stkjinfo
+WorkingDirectory=%h/apps/stkj%code_path%
 Environment=NODE_ENV=production
 Environment=HOST=0.0.0.0
 Environment=PORT=5173
 Environment=LANG=zh_CN.UTF-8
+# 数据目录固定在 APP_DIR/data，与代码目录解耦：以后调整代码布局也不会丢数据
+Environment=DATA_DIR=%h/apps/stkj/data
 ExecStart=%h/apps/node/bin/node --no-warnings server.js
 Restart=always
 RestartSec=3

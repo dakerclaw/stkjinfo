@@ -9,9 +9,10 @@
 
 ## 快速开始
 
-在终端执行：
+代码位于本仓库的 `stkjinfo/` 目录，先进入该目录再执行：
 
 ```bash
+cd stkjinfo
 npm start          # 启动服务，访问 http://127.0.0.1:5173
 ```
 
@@ -60,6 +61,7 @@ node seed.js --reset   # 清空项目与数据后重新灌入示例（保留用�
 - **新增用户时密码默认为账号**；不填密码即使用该默认值，用户列表以「初始密码」标记
 - 管理员可「重置密码」为账号本身；用户可在右上角菜单自行修改密码
 - 改密后该账号的**其他登录会话立即失效**，当前会话自动续发新 Cookie，无需重新登录
+- 仍在使用初始密码时，登录后会弹窗提醒改密（不强制，可稍后处理）
 - 防暴力猜解：同一账号连续 5 次密码错误即锁定 5 分钟，期间提示剩余等待时间
 
 ## 安全说明
@@ -68,15 +70,19 @@ node seed.js --reset   # 清空项目与数据后重新灌入示例（保留用�
 
 | 风险点 | 处理方式 |
 |---|---|
-| 路径穿越 | 静态文件仅提供 `public/` 目录，拼出的路径必须以 `public/` 为前缀，否则 403；非法路径回落 SPA 首页 |
-| SQL 注入 | 所有查询参数化；`sort` / `order` 走白名单映射，非白名单值直接忽略 |
-| 越权读写 | 逐条校验归属：普通用户只能看 / 改 / 删自己录入的数据；**覆盖导入与单条修改同权限**，不能覆盖他人记录 |
+| 路径穿越 | 静态文件仅提供 `public/` 目录，拼出的路径必须等于 `public/` 或以 `public/<分隔符>` 开头（避免 `public-x/` 误判），否则 403；`decodeURIComponent` 失败返回 400；非 GET/HEAD 返回 405；未知路径回落 SPA 首页 |
+| SQL 注入 | 所有查询参数化；`sort` / `dir` 走白名单映射，非白名单值直接忽略 |
+| 越权读写 | 逐条校验归属：普通用户只能看 / 改 / 删自己录入的数据；**覆盖导入与单条修改同权限**，不能覆盖他人记录。项目列表与导出的「数据条数 / 最近录入」也按同一口径统计，不会泄露他人数据规模 |
 | 账号枚举 | 账号不存在与密码错误返回同一提示；用户列表不返回 `password_hash` / `salt` |
-| 会话固定与劫持 | 登录后重新签发 `sid`；改密 / 重置密码 / 停用账号即销毁该用户全部会话；Cookie 为 `HttpOnly; SameSite=Lax` |
-| 弱口令爆破 | 连续 5 次密码错误锁定 5 分钟 |
+| 会话固定与劫持 | 登录后重新签发 `sid`；改密 / 重置密码 / 停用账号 / 变更角色即销毁该用户全部会话（仅改姓名等资料不会踢人）；Cookie 为 `HttpOnly; SameSite=Lax`；过期会话每小时随清理任务删除 |
+| 弱口令爆破 | 连续 5 次密码错误锁定 5 分钟；失败计数表超过 1000 条约自动清理过期项 |
 | 错误信息泄露 | 500 仅返回「服务器内部错误」，SQL / 表结构 / 文件路径只写服务端日志；Excel 解析错误统一为友好文案 |
-| 上传型攻击 | 单次上传上限 20 MB；ZIP 单条目解压上限 32 MB、合计 64 MB、条目数上限 256，并启用 `maxOutputLength` 硬限制，防解压炸弹 |
-| 点击劫持 / XSS | 全站响应头含 `X-Content-Type-Options`、`X-Frame-Options`、`Referrer-Policy`、`Content-Security-Policy` |
+| 畸形请求 | 非法 JSON 返回 400；请求体超过 4 MB 返回 413；文件超过 20 MB 返回 413（先排空请求流再回包，客户端能收到可读提示，而不是连接被重置） |
+| 上传型攻击 | 单次上传上限 20 MB；ZIP 单条目解压上限 32 MB、合计 64 MB、条目数上限 256，并启用 `maxOutputLength` 硬限制，防解压炸弹；单次导入最多 5 万行 |
+| 存储型 XSS | 所有动态文本经 `esc()` 转义；列表中的点击动作改用 `data-*` 属性 + 文档级事件委托传递参数，不再把用户输入拼进内联 JS 字符串。CSP 的 `script-src` 保留 `'unsafe-inline'`（界面大量使用内联 `onclick`，CSP 无法对事件属性做白名单），因此转义与参数隔离是 XSS 的主要防线 |
+| 脏数据 / 超长内容 | 文本字段统一清洗（去控制字符、压缩空白）并按字段截断（编号 100、简介 1000、备注 2000 字符），避免污染列表、导出与日志 |
+| 点击劫持 | 响应头含 `X-Frame-Options: SAMEORIGIN`、`frame-ancestors 'self'` |
+| 审计追溯 | 项目 / 数据 / 账号的新增、修改、软删除、恢复、彻底删除、导入与批量状态变更写入 `audit_logs`，保留 180 天，管理员可在「审计日志」页按对象、动作、日期、关键词检索并查看字段级变更 |
 
 部署注意事项：
 
@@ -84,9 +90,16 @@ node seed.js --reset   # 清空项目与数据后重新灌入示例（保留用�
 - 单进程 Node 服务，CPU 密集操作（大文件导入、导出）会阻塞其他请求。大表导入建议避开使用高峰，单次不超过 5 万行
 - 数据库文件与 `backups/` 目录权限应为 `600` / `700`，不要放在 Web 可访问目录下
 
+### 静态资源与接口性能
+
+- `public/` 下的文本资源（html / css / js）首次读取后缓存在内存，并按 `Accept-Encoding` 协商 **br / gzip** 压缩（`app.js` 压缩后约为原来的 1/4）
+- 静态资源带 `ETag` / `Last-Modified` + `Cache-Control: no-cache`，内容未变时返回 **304** 且无正文；代码更新后首次访问即生效，不会读到旧文件
+- 项目列表与导出共用同一条查询：`LEFT JOIN + GROUP BY` 一次算出「数据条数 / 最近录入」，避免每行两次相关子查询
+- `/api/meta`（字段定义与筛选下拉）按用户缓存，任何写操作后自动失效，切页时不再重复跑 7 条 `DISTINCT`
+
 ## 数据库
 
-文件：`data/app.db`（WAL 模式）。核心三张表（另有一张 `sessions` 登录会话表，由服务自动维护）：
+文件：`data/app.db`（WAL 模式；可用环境变量 `DATA_DIR` 指定所在目录）。核心三张表（另有 `sessions` 登录会话表与 `audit_logs` 审计日志表，由服务自动维护）：
 
 ### 1. `users` 用户账号信息表
 | 字段 | 说明 |
@@ -232,9 +245,11 @@ node seed.js --reset   # 清空项目与数据后重新灌入示例（保留用�
 | POST | /api/auth/password | 自助修改密码 `{old_password,new_password}` |
 | GET | /api/meta | 字段定义、筛选下拉、角色列表、当前用户权限位 |
 | GET | /api/stats | 总览统计（普通用户仅统计自己的数据） |
+| GET | /api/audit-logs | 审计日志分页查询（仅管理员）：`page` / `pageSize`（≤200）/ `entity` / `action` / `q` / `date_from` / `date_to`，保留 180 天 |
 | GET/POST | /api/projects | 项目列表（全员，支持 `project_no` / `product_code` / `project_type` / `status` 筛选、`sort` / `dir` 排序）/ 新建（管理员） |
 | GET/PUT/DELETE | /api/projects/:id | 项目详情 / 更新（管理员）/ 删除（管理员，级联删数据） |
 | POST | /api/projects/batch-status | 批量修改项目状态 `{ids, status}`，返回 `{updated}`（仅管理员） |
+| POST | /api/projects/bulk-delete | 批量删除项目 `{ids}`（软删除，级联其下数据，可在回收站恢复；仅管理员） |
 | GET/POST | /api/data | 数据列表（分页，普通用户仅自己的）/ 新建（五项重复时 409） |
 | GET/PUT/DELETE | /api/data/:id | 详情 / 更新（本人或管理员）/ 删除（管理员） |
 | POST | /api/data/bulk-delete | 批量删除 `{ids:[]}`（管理员） |
@@ -261,17 +276,20 @@ node seed.js --reset   # 清空项目与数据后重新灌入示例（保留用�
 
 ## 目录结构
 
+仓库采用 `stkjinfo/` 子目录存放代码（部署脚本会自动识别，也兼容代码直接在仓库根目录的布局）：
+
 ```
-server.js          后端服务与 API
-db.js              建表语句与字段定义（前后端共用字段元数据）
-xlsx.js            极简 XLSX 读写（零第三方依赖：手写 ZIP + XML）
-import-map.js      导入表头识别（中文列名 / 字段名 / 别名 → 字段 key）
-seed.js            初始化账号与示例数据
-public/index.html  页面骨架
-public/styles.css  样式
-public/app.js      前端逻辑（视图渲染、筛选、表单、Excel 导入导出）
-data/app.db        SQLite 数据库文件
-deploy/            部署脚本与 systemd 单元（详见 deploy/README-部署说明.md）
+stkjinfo/
+  server.js          后端服务与 API
+  db.js              建表语句与字段定义（前后端共用字段元数据）
+  xlsx.js            极简 XLSX 读写（零第三方依赖：手写 ZIP + XML）
+  import-map.js      导入表头识别（中文列名 / 字段名 / 别名 → 字段 key）
+  seed.js            初始化账号与示例数据
+  public/index.html  页面骨架
+  public/styles.css  样式
+  public/app.js      前端逻辑（视图渲染、筛选、表单、Excel 导入导出）
+  deploy/            部署脚本与 systemd 单元（详见 deploy/README-部署说明.md）
+data/app.db          SQLite 数据库（本机默认 stkjinfo/data；部署时用 DATA_DIR 固定到 APP_DIR/data）
 ```
 
 `deploy/` 目录内容：

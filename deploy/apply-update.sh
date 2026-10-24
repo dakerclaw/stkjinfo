@@ -79,12 +79,40 @@ else
   echo "==> 代码已更新（解包 $PKG）"
 fi
 
-# 4) 语法自检
-cd "$APP_DIR"
+# 4) 语法自检（兼容根目录与 stkjinfo/ 子目录两种代码布局）
+if [ -f "$APP_DIR/server.js" ]; then
+  CODE_DIR="$APP_DIR"
+elif [ -f "$APP_DIR/stkjinfo/server.js" ]; then
+  CODE_DIR="$APP_DIR/stkjinfo"
+else
+  echo "✗ 在 $APP_DIR 下找不到 server.js，更新包内容不对"; exit 1
+fi
+echo "==> 代码目录: $CODE_DIR"
+cd "$CODE_DIR"
 for f in server.js db.js xlsx.js seed.js; do
   [ -f "$f" ] && "$NODE" --check "$f"
 done
 echo "==> 语法检查通过"
+
+# 4.1) 修补旧版服务单元：代码迁到子目录后，WorkingDirectory 与 DATA_DIR 必须跟着改，
+#      否则服务会在仓库根找不到 server.js，或把数据库建到代码目录里。
+UNIT="$HOME/.config/systemd/user/stkj.service"
+if [ -f "$UNIT" ]; then
+  CHANGED=0
+  if ! grep -q '^Environment=DATA_DIR=' "$UNIT"; then
+    sed -i "/^WorkingDirectory=/a Environment=DATA_DIR=$APP_DIR/data" "$UNIT"
+    CHANGED=1
+  fi
+  if ! grep -qx "WorkingDirectory=$CODE_DIR" "$UNIT"; then
+    sed -i "s|^WorkingDirectory=.*|WorkingDirectory=$CODE_DIR|" "$UNIT"
+    CHANGED=1
+  fi
+  if [ "$CHANGED" = "1" ]; then
+    mkdir -p "$APP_DIR/data"
+    systemctl --user daemon-reload
+    echo "==> 已更新服务单元（WorkingDirectory / DATA_DIR）"
+  fi
+fi
 
 # 5) 启动服务
 systemctl --user start stkj.service

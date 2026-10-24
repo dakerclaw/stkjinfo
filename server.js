@@ -7,6 +7,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const zlib = require('node:zlib');
 const { db, DB_FILE, FIELDS } = require('./db');
 const xlsx = require('./xlsx');
 const { normHeader, buildHeaderMap, isBlank, USER_IMPORT_FIELDS } = require('./import-map');
@@ -31,6 +32,30 @@ function safeEqual(a, b) {
   const bb = Buffer.from(String(b));
   if (ba.length !== bb.length) return false;
   return crypto.timingSafeEqual(ba, bb);
+}
+
+/**
+ * 带 HTTP 状态码的“客户端错误”。
+ * 顶层 catch 会按 status 返回 4xx（而不是一律 500），业务代码只需抛出即可。
+ */
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+/** 各文本字段的长度上限：防止超长内容撑爆列表 / 导出 / 审计日志 */
+const TEXT_LIMITS = {
+  project_no: 100, product_code: 100, project_type: 100,
+  base: 100, process_code: 100, work_order: 100, coke_type: 100,
+  description: 1000, remark: 2000,
+};
+
+/** 文本清洗：去掉控制字符（含换行，避免污染表格与日志）并截断到上限 */
+function cleanText(v, max = 200) {
+  if (v === null || v === undefined) return '';
+  return String(v).replace(/[\u0000-\u001F\u007F]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max);
 }
 
 /* ============================================================ 角色与权限 */
@@ -62,6 +87,10 @@ const stmtSessionDelete = db.prepare('DELETE FROM sessions WHERE token = ?');
 const stmtSessionDeleteByUser = db.prepare('DELETE FROM sessions WHERE user_id = ?');
 const stmtSessionTouch = db.prepare('UPDATE sessions SET last_seen = ? WHERE token = ?');
 const stmtSessionCleanExpired = db.prepare('DELETE FROM sessions WHERE last_seen < ?');
+// 热点语句：每个请求都要查当前用户，提前 prepare 避免重复解析 SQL
+const stmtUserById = db.prepare(
+  'SELECT id, username, real_name, role, status, pwd_changed FROM users WHERE id = ?'
+);
 
 function createSession(userId, req) {
   const token = crypto.randomBytes(32).toString('hex');
@@ -88,7 +117,16 @@ function parseCookies(req) {
   const out = {};
   raw.split(';').forEach((p) => {
     const i = p.indexOf('=');
-    if (i > 0) out[p.slice(0, i).trim()] = decodeURIComponent(p.slice(i + 1).trim());
+    if (i <= 0) return;
+    const key = p.slice(0, i).trim();
+    const val = p.slice(i + 1).trim();
+    try {
+      out[key] = decodeURIComponent(val);
+    } catch {
+      // 非法百分号转义（如 "sid=%"）：保留原始值，后续按无效 token 处理，
+      // 不能因为一个畸形 Cookie 把整个请求变成 500
+      out[key] = val;
+    }
   });
   return out;
 }
@@ -110,9 +148,7 @@ function currentUser(req) {
   if (now - s.last_seen > SESSION_TOUCH_INTERVAL) {
     stmtSessionTouch.run(now, token);
   }
-  const u = db
-    .prepare('SELECT id, username, real_name, role, status, pwd_changed FROM users WHERE id = ?')
-    .get(s.user_id);
+  const u = stmtUserById.get(s.user_id);
   if (!u || u.status !== 1) return null;
   return u;
 }
@@ -126,7 +162,10 @@ function ownerFilter(user, alias = '') {
   return { sql: `${alias}created_by_id = ?`, arg: user.id };
 }
 
-/* 全局安全响应头 */
+/* 全局安全响应头。
+   script-src 保留 'unsafe-inline' 是因为界面大量使用内联事件属性（onclick="..."），
+   而 CSP 无法对事件属性做白名单；所有动态文本均已 HTML 转义（见 app.js 的 esc()），
+   列表中的项目编号改为 data-* + 事件委托传递，不再拼进 JS 字符串。 */
 const SECURITY_HEADERS = {
   'X-Content-Type-Options': 'nosniff',      // 禁止浏览器 MIME 嗅探
   'X-Frame-Options': 'SAMEORIGIN',          // 防点击劫持（禁止被第三方页面内嵌）
@@ -149,25 +188,35 @@ function send(res, status, data, headers = {}) {
 const ok = (res, data = {}) => send(res, 200, { success: true, ...data });
 const fail = (res, status, message) => send(res, status, { success: false, message });
 
-function readBody(req) {
+/**
+ * 读取 JSON 请求体。
+ * 超限时不再 destroy 连接（会导致客户端只看到 "fetch failed"），而是丢弃后续数据、
+ * 排空请求流后返回 413，让前端能拿到可读的错误提示。
+ */
+function readBody(req, limitBytes = 4 * 1024 * 1024) {
   return new Promise((resolve, reject) => {
     let raw = '';
     let size = 0;
+    let tooLarge = false;
     req.on('data', (chunk) => {
+      if (tooLarge) return;            // 已超限：丢弃，但继续排空
       size += chunk.length;
-      if (size > 4 * 1024 * 1024) {
-        reject(new Error('请求体过大'));
-        req.destroy();
+      if (size > limitBytes) {
+        tooLarge = true;
+        raw = '';                      // 立即释放已缓存的部分
         return;
       }
       raw += chunk;
     });
     req.on('end', () => {
+      if (tooLarge) {
+        return reject(new HttpError(413, `请求体过大（上限 ${Math.round(limitBytes / 1048576)} MB）`));
+      }
       if (!raw) return resolve({});
       try {
         resolve(JSON.parse(raw));
       } catch {
-        reject(new Error('请求体不是合法 JSON'));
+        reject(new HttpError(400, '请求体不是合法 JSON'));
       }
     });
     req.on('error', reject);
@@ -191,7 +240,7 @@ function readRawBody(req, limitBytes = 20 * 1024 * 1024) {
       chunks.push(chunk);
     });
     req.on('end', () => {
-      if (tooLarge) reject(new Error('文件过大（上限 20 MB），请拆分后重试'));
+      if (tooLarge) reject(new HttpError(413, '文件过大（上限 20 MB），请拆分后重试'));
       else resolve(Buffer.concat(chunks));
     });
     req.on('error', reject);
@@ -272,12 +321,17 @@ function exportDataXlsx(res, params, user) {
   sendXlsx(res, xlsx.build(table, '项目数据'), `项目数据_${todayStr()}.xlsx`);
 }
 
-/** 导出项目档案为 Excel */
-function exportProjectsXlsx(res, params) {
+/**
+ * 项目列表 / 导出的共用查询：筛选、排序、数据条数统计完全同口径。
+ * 数据条数与最近录入日期用 LEFT JOIN + GROUP BY 一次算完（替代每行两个相关子查询），
+ * 并对普通用户按 created_by_id 过滤，避免导出时泄露他人数据的数量与时间。
+ */
+function queryProjects(params, user) {
   const { clause, args } = buildFilters(params, ['project_no', 'product_code', 'project_type']);
-  // 软删除行不导出；条件无占位符，追加在 clause 之后不影响参数顺序
+  // 软删除行不出现；条件无占位符，追加在 clause 之后不影响参数顺序
   const parts = [clause ? clause.replace(/^ WHERE /, '') : '', 'p.deleted_at IS NULL'];
   const allArgs = [...args];
+
   const st = (params.get('status') || '').trim();
   if (st !== '') {
     const vals = st.split(',').map((s) => s.trim()).filter((s) => s === '0' || s === '1');
@@ -292,28 +346,40 @@ function exportProjectsXlsx(res, params) {
     const like = `%${q.trim()}%`;
     allArgs.push(like, like, like, like);
   }
-  // 指定 ids（导出已勾选的项目）：优先于其它筛选条件
+  // 指定 ids（导出已勾选的项目）：与其它筛选是 AND 交集
   const ids = parseIdParam(params.get('ids'), 500);
-  if (ids === null) return fail(res, 400, 'ids 参数不合法或超出数量上限（500）');
+  if (ids === null) return { error: 'ids 参数不合法或超出数量上限（500）' };
   if (ids.length) {
     parts.push(`p.id IN (${ids.map(() => '?').join(',')})`);
     allArgs.push(...ids);
   }
   const where = parts.filter(Boolean).length ? ` WHERE ${parts.filter(Boolean).join(' AND ')}` : '';
-  // 导出与列表同口径：同样的筛选 + 排序
+
+  const of = ownerFilter(user, 'd.');
+  const join = ` LEFT JOIN project_data d ON d.project_no = p.project_no AND d.deleted_at IS NULL${of ? ` AND ${of.sql}` : ''}`;
+  const ownArgs = of ? [of.arg] : [];
+
   const sortable = new Set([
     'project_no', 'product_code', 'project_type', 'description', 'status',
     'id', 'created_at', 'updated_at', 'data_count', 'last_entry',
   ]);
   const aliasKeys = new Set(['data_count', 'last_entry']);
+  const order = buildOrder(params, ' ORDER BY p.id DESC', sortable, 'p.', aliasKeys);
+
   const rows = db
     .prepare(
-      `SELECT p.*,
-              (SELECT COUNT(*) FROM project_data d WHERE d.project_no = p.project_no AND d.deleted_at IS NULL) AS data_count,
-              (SELECT MAX(d.entry_date) FROM project_data d WHERE d.project_no = p.project_no AND d.deleted_at IS NULL) AS last_entry
-       FROM projects p${where}${buildOrder(params, ' ORDER BY p.id DESC', sortable, 'p.', aliasKeys)}`
+      `SELECT p.*, COUNT(d.id) AS data_count, MAX(d.entry_date) AS last_entry
+       FROM projects p${join}${where}
+       GROUP BY p.id${order}`
     )
-    .all(...allArgs);
+    .all(...ownArgs, ...allArgs);
+  return { rows };
+}
+
+/** 导出项目档案为 Excel（与列表同口径：同样的筛选、排序与归属统计） */
+function exportProjectsXlsx(res, params, user) {
+  const { rows, error } = queryProjects(params, user);
+  if (error) return fail(res, 400, error);
   const header = ['项目编号', '产品代码', '项目类型', '项目简介', '数据量', '最新录入日期', '状态'];
   const table = [
     header,
@@ -351,6 +417,8 @@ function exportTemplateXlsx(res, params) {
 /* ---------- Excel 导入：解析后缓存待确认批次 ---------- */
 const importTokens = new Map(); // token -> { kind:'data'|'project', rows, user, at }
 const IMPORT_TTL = 30 * 60 * 1000;
+/** 单次导入行数上限：防止「合法但超大」的表格把内存与事务打满 */
+const MAX_IMPORT_ROWS = 50000;
 
 function newImportToken(rows, user, kind = 'data', lines = null) {
   // 清理过期批次
@@ -400,6 +468,9 @@ async function parseUpload(req, fields, requiredLabels) {
   );
 
   const dataRows = table.slice(1).filter((r) => r.some((c) => !isBlank(c)));
+  if (dataRows.length > MAX_IMPORT_ROWS) {
+    return { error: `单次最多导入 ${MAX_IMPORT_ROWS.toLocaleString('en-US')} 行，请拆分文件后重试（当前 ${dataRows.length} 行）` };
+  }
   const rows = [];
   const lines = [];
   dataRows.forEach((r, i) => {
@@ -455,6 +526,8 @@ function importByToken(res, body, user) {
   if (!item) return fail(res, 400, '导入批次已过期，请重新选择 Excel 文件');
   if (item.user !== user.username) return fail(res, 403, '无权导入该批次数据');
   if (item.kind === 'project') {
+    // 权限在会话期间可能被调整，按当前操作人重新判定（与用户导入一致）
+    if (!isAdmin(user)) return fail(res, 403, '仅管理员可导入项目');
     const out = performProjectImport(item.rows, String(body.duplicate_action || '').toLowerCase(), user);
     if (out.dup) {
       return send(res, 409, {
@@ -713,7 +786,8 @@ function pickData(body, { requireNo = true } = {}) {
       // 指标字段统一保留 2 位小数（四舍五入），见 db.js ROUND2_KEYS
       row[key] = Number.isFinite(n) ? (meta.round2 ? Math.round(n * 100) / 100 : n) : null;
     } else {
-      row[key] = String(v).trim();
+      // 文本字段统一清洗：去控制字符、截断超长内容，避免脏数据进入列表与导出
+      row[key] = cleanText(v, TEXT_LIMITS[key] || 200);
     }
   }
   if (requireNo && !row.project_no) throw new Error('项目编号为必填项');
@@ -787,13 +861,16 @@ const stmtPurgeAudit = db.prepare(
   'DELETE FROM audit_logs WHERE created_at < datetime(\'now\',\'localtime\',\'-180 days\')'
 );
 
-/** 物理清理：超期软删除的行、180 天前的审计日志。启动时跑一次，之后每 6 小时一次 */
+/** 物理清理：超期软删除的行、180 天前的审计日志、过期会话。启动时跑一次，之后每 6 小时一次 */
 function purgeExpired() {
   try {
     const d = stmtPurgeData.run().changes;
     const p = stmtPurgeProjects.run().changes;
     stmtPurgeAudit.run();
+    // 会话原本只在启动时清理：长期运行会不断累积已过期但未删除的行
+    const s = stmtSessionCleanExpired.run(Date.now() - SESSION_TTL).changes;
     if (d || p) console.log(`[purge] 清理超期软删除：数据 ${d} 条，项目 ${p} 个`);
+    if (s) console.log(`[purge] 清理过期会话 ${s} 条`);
   } catch (e) { console.error('[purge] 清理失败：', e.message); }
 }
 purgeExpired();
@@ -812,27 +889,99 @@ const MIME = {
   '.woff2': 'font/woff2',
 };
 
+/** 可压缩类型：文本类资源体积大（app.js 约 100KB），压缩后可省 70% 以上 */
+const COMPRESSIBLE = /^(text\/|application\/(javascript|json)\b|image\/svg)/;
+/** 静态文件内存缓存：key = 绝对路径，value = { mtimeMs, size, etag, type, raw, gzip?, br? } */
+const staticCache = new Map();
+
+function buildStaticEntry(filePath, data, stat) {
+  const type = MIME[path.extname(filePath).toLowerCase()] || 'application/octet-stream';
+  const entry = {
+    mtimeMs: stat.mtimeMs,
+    size: data.length,
+    type,
+    etag: `W/"${data.length.toString(16)}-${Math.floor(stat.mtimeMs).toString(16)}"`,
+    raw: data,
+  };
+  // 压缩结果与文件内容一起缓存，避免每个请求重复压缩
+  if (COMPRESSIBLE.test(type) && data.length > 1024) {
+    entry.gzip = zlib.gzipSync(data, { level: 6 });
+    entry.br = zlib.brotliCompressSync(data, {
+      params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 5 },
+    });
+  }
+  if (staticCache.size >= 64) staticCache.clear(); // public/ 文件数很少，超限直接重置
+  staticCache.set(filePath, entry);
+  return entry;
+}
+
+/** 输出静态资源：协商 br/gzip、带 ETag 与 Last-Modified，命中时返回 304 */
+function sendStaticEntry(req, res, entry) {
+  const headers = {
+    'Content-Type': entry.type,
+    // no-cache 不是不缓存，而是每次都带 ETag 回来校验：代码更新立即生效，未变则 304 无正文
+    'Cache-Control': 'no-cache',
+    ETag: entry.etag,
+    'Last-Modified': new Date(entry.mtimeMs).toUTCString(),
+    ...SECURITY_HEADERS,
+  };
+  const inm = req.headers['if-none-match'];
+  if (inm && inm.split(',').some((v) => v.trim() === entry.etag)) {
+    res.writeHead(304, headers);
+    return res.end();
+  }
+  let body = entry.raw;
+  let encoding = null;
+  const ae = String(req.headers['accept-encoding'] || '');
+  if (entry.br && /\bbr\b/.test(ae)) { body = entry.br; encoding = 'br'; }
+  else if (entry.gzip && /\bgzip\b/.test(ae)) { body = entry.gzip; encoding = 'gzip'; }
+  if (entry.gzip || entry.br) headers.Vary = 'Accept-Encoding';
+  if (encoding) headers['Content-Encoding'] = encoding;
+  headers['Content-Length'] = body.length;
+  res.writeHead(200, headers);
+  res.end(req.method === 'HEAD' ? undefined : body);
+}
+
+/** SPA 回退：未知路径统一返回 index.html */
+function serveIndex(req, res) {
+  const filePath = path.join(PUBLIC_DIR, 'index.html');
+  fs.stat(filePath, (err, stat) => {
+    if (err || !stat.isFile()) return fail(res, 404, '页面不存在');
+    const cached = staticCache.get(filePath);
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+      return sendStaticEntry(req, res, cached);
+    }
+    fs.readFile(filePath, (e2, html) => {
+      if (e2) return fail(res, 404, '页面不存在');
+      sendStaticEntry(req, res, buildStaticEntry(filePath, html, stat));
+    });
+  });
+}
+
 function serveStatic(req, res, pathname) {
-  let rel = decodeURIComponent(pathname);
+  if (req.method !== 'GET' && req.method !== 'HEAD') return fail(res, 405, '仅支持 GET / HEAD');
+  let rel;
+  try {
+    rel = decodeURIComponent(pathname);
+  } catch {
+    return fail(res, 400, '路径不合法');
+  }
   if (rel === '/' || rel === '') rel = '/index.html';
   const filePath = path.join(PUBLIC_DIR, rel);
-  if (!filePath.startsWith(PUBLIC_DIR)) return send(res, 403, { success: false, message: '禁止访问' });
-  fs.readFile(filePath, (err, data) => {
-    if (err) {
-      // SPA 回退
-      fs.readFile(path.join(PUBLIC_DIR, 'index.html'), (e2, html) => {
-        if (e2) return send(res, 404, { success: false, message: '页面不存在' });
-        res.writeHead(200, { 'Content-Type': MIME['.html'], ...SECURITY_HEADERS });
-        res.end(html);
-      });
-      return;
+  // 前缀判断必须带路径分隔符，否则 public-x/ 这类兄弟目录会被误判为 public/ 之内
+  if (filePath !== PUBLIC_DIR && !filePath.startsWith(PUBLIC_DIR + path.sep)) {
+    return fail(res, 403, '禁止访问');
+  }
+  fs.stat(filePath, (err, stat) => {
+    if (err || !stat.isFile()) return serveIndex(req, res);
+    const cached = staticCache.get(filePath);
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+      return sendStaticEntry(req, res, cached);
     }
-    res.writeHead(200, {
-      'Content-Type': MIME[path.extname(filePath).toLowerCase()] || 'application/octet-stream',
-      'Cache-Control': 'no-cache',
-      ...SECURITY_HEADERS,
+    fs.readFile(filePath, (e2, data) => {
+      if (e2) return serveIndex(req, res);
+      sendStaticEntry(req, res, buildStaticEntry(filePath, data, stat));
     });
-    res.end(data);
   });
 }
 
@@ -842,90 +991,78 @@ const PROJECT_FILTERS = ['project_no', 'product_code', 'project_type', 'status',
 const DATA_FILTERS = ['project_no', 'product_code', 'base', 'process_code', 'work_order', 'coke_type'];
 
 /* ---------- 元数据 ---------- */
-function getMeta(res, user) {
-  const types = db.prepare(`SELECT DISTINCT project_type AS v FROM projects WHERE deleted_at IS NULL AND project_type <> '' ORDER BY v`).all().map((r) => r.v);
+/** 元数据缓存：任何写操作后失效。页面每次切换都会拉 /api/meta，缓存可省掉 5~7 条 DISTINCT 查询 */
+let metaVersion = 0;
+const metaCache = new Map(); // `${userId}` -> { version, data }
 
-  // 普通用户的筛选下拉只列自己数据中出现过的值，避免泄露他人数据
+function invalidateMeta() {
+  metaVersion += 1;
+  metaCache.clear();
+}
+
+const cmpText = (a, b) => String(a).localeCompare(String(b), 'zh-CN');
+
+function getMeta(res, user) {
+  const key = String(user.id);
+  const hit = metaCache.get(key);
+  if (hit && hit.version === metaVersion) return ok(res, hit.data);
+
+  const admin = isAdmin(user);
+  const types = db
+    .prepare(`SELECT DISTINCT project_type AS v FROM projects WHERE deleted_at IS NULL AND project_type <> '' ORDER BY v`)
+    .all().map((r) => r.v);
+
+  // 普通用户的筛选下拉只列自己数据中出现过的值，避免泄露他人数据。
+  // 4~5 条 DISTINCT 合并成一条 UNION ALL，减少往返；结果在内存里分组排序。
   const of = ownerFilter(user);
   const w = of ? ` WHERE ${of.sql} AND deleted_at IS NULL` : ' WHERE deleted_at IS NULL';
   const args = of ? [of.arg] : [];
-  const distinct = (col) =>
-    db.prepare(`SELECT DISTINCT ${col} AS v FROM project_data${w} AND ${col} IS NOT NULL AND ${col} <> '' ORDER BY v`)
-      .all(...args).map((r) => r.v);
+  const cols = ['base', 'process_code', 'work_order', 'coke_type'];
+  if (!admin) cols.push('product_code');
+  const unionSql = cols
+    .map((c) => `SELECT '${c}' AS k, ${c} AS v FROM project_data${w} AND ${c} IS NOT NULL AND ${c} <> ''`)
+    .join(' UNION ALL ');
+  const optRows = db.prepare(unionSql).all(...cols.flatMap(() => args));
+  const pick = (k) => optRows.filter((r) => r.k === k).map((r) => r.v).sort(cmpText);
 
-  const bases = distinct('base');
-  const processes = distinct('process_code');
-  const workOrders = distinct('work_order');
-  const cokeTypes = distinct('coke_type');
-  const productCodes = isAdmin(user)
-    ? db.prepare(`SELECT DISTINCT product_code AS v FROM projects WHERE deleted_at IS NULL AND product_code <> '' ORDER BY v`).all().map((r) => r.v)
-    : distinct('product_code');
-  const projectNos = db.prepare(`SELECT DISTINCT project_no AS v FROM projects WHERE deleted_at IS NULL ORDER BY v`).all().map((r) => r.v);
+  // 项目编号 → 产品代码，供录入时自动带出（项目编号列表也由此派生，省一条查询）
+  const projectMap = db
+    .prepare('SELECT project_no, product_code FROM projects WHERE deleted_at IS NULL ORDER BY project_no')
+    .all();
 
-  // 项目编号 → 产品代码，供录入时自动带出
-  const projectMap = db.prepare('SELECT project_no, product_code FROM projects WHERE deleted_at IS NULL ORDER BY project_no').all();
-
-  ok(res, {
+  const data = {
     fields: FIELDS,
-    options: { types, bases, processes, workOrders, cokeTypes, productCodes, projectNos },
-    projectMap,
-    roles: Object.entries(ROLES).map(([key, v]) => ({ key, label: v.label })),
-    permissions: {
-      canManageProjects: isAdmin(user),
-      canDeleteData: isAdmin(user),
-      canManageUsers: isAdmin(user),
-      canManageAdmins: isSysAdmin(user),
-      seeAllData: isAdmin(user),
+    options: {
+      types,
+      bases: pick('base'),
+      processes: pick('process_code'),
+      workOrders: pick('work_order'),
+      cokeTypes: pick('coke_type'),
+      productCodes: admin
+        ? [...new Set(projectMap.map((r) => r.product_code).filter(Boolean))].sort(cmpText)
+        : pick('product_code'),
+      projectNos: projectMap.map((r) => r.project_no),
     },
-  });
+    projectMap,
+    roles: Object.entries(ROLES).map(([k, v]) => ({ key: k, label: v.label })),
+    permissions: {
+      canManageProjects: admin,
+      canDeleteData: admin,
+      canManageUsers: admin,
+      canManageAdmins: isSysAdmin(user),
+      seeAllData: admin,
+    },
+  };
+
+  if (metaCache.size > 200) metaCache.clear(); // 用户数异常增长时兜底
+  metaCache.set(key, { version: metaVersion, data });
+  ok(res, data);
 }
 
 /* ---------- 项目列表 ---------- */
 function listProjects(res, params, user) {
-  const { clause, args } = buildFilters(params, ['project_no', 'product_code', 'project_type']);
-  // 软删除行不出现在列表里；条件无占位符，追加在 clause 之后不影响参数顺序
-  const parts = [clause ? clause.replace(/^ WHERE /, '') : '', 'p.deleted_at IS NULL'];
-  const allArgs = [...args];
-
-  // 状态筛选：1 进行中 / 0 已归档，只接受这两个值
-  const st = (params.get('status') || '').trim();
-  if (st !== '') {
-    const vals = st.split(',').map((s) => s.trim()).filter((s) => s === '0' || s === '1');
-    if (vals.length) {
-      parts.push(`p.status IN (${vals.map(() => '?').join(',')})`);
-      allArgs.push(...vals.map(Number));
-    }
-  }
-
-  const q = params.get('q');
-  if (q && q.trim()) {
-    parts.push(`(p.project_no LIKE ? OR p.product_code LIKE ? OR p.project_type LIKE ? OR IFNULL(p.description,'') LIKE ?)`);
-    const like = `%${q.trim()}%`;
-    allArgs.push(like, like, like, like);
-  }
-  const where = parts.filter(Boolean).length ? ` WHERE ${parts.filter(Boolean).join(' AND ')}` : '';
-
-  // 数据条数 / 最近录入 与「查看数据」的口径保持一致：普通用户只统计自己录入的数据
-  const of = ownerFilter(user, 'd.');
-  const own = of ? ` AND ${of.sql}` : '';
-  const ownArgs = of ? [of.arg] : [];
-
-  // data_count / last_entry 是查询里定义的别名，同样允许排序
-  const sortable = new Set([
-    'project_no', 'product_code', 'project_type', 'description', 'status',
-    'id', 'created_at', 'updated_at',
-    'data_count', 'last_entry',
-  ]);
-  const aliasKeys = new Set(['data_count', 'last_entry']);
-
-  const rows = db
-    .prepare(
-      `SELECT p.*,
-              (SELECT COUNT(*) FROM project_data d WHERE d.project_no = p.project_no AND d.deleted_at IS NULL${own}) AS data_count,
-              (SELECT MAX(d.entry_date) FROM project_data d WHERE d.project_no = p.project_no AND d.deleted_at IS NULL${own}) AS last_entry
-       FROM projects p${where}${buildOrder(params, ' ORDER BY p.id DESC', sortable, 'p.', aliasKeys)}`
-    )
-    .all(...ownArgs, ...ownArgs, ...allArgs);
+  const { rows, error } = queryProjects(params, user);
+  if (error) return fail(res, 400, error);
   ok(res, { rows, total: rows.length });
 }
 
@@ -937,11 +1074,11 @@ function getProject(res, id) {
 
 function createProject(res, body, user) {
   const row = {
-    project_no: (body.project_no || '').trim(),
-    product_code: (body.product_code || '').trim(),
-    project_type: (body.project_type || '').trim(),
-    description: (body.description || '').trim() || null,
-    status: body.status === 0 ? 0 : 1,
+    project_no: cleanText(body.project_no, TEXT_LIMITS.project_no),
+    product_code: cleanText(body.product_code, TEXT_LIMITS.product_code),
+    project_type: cleanText(body.project_type, TEXT_LIMITS.project_type),
+    description: cleanText(body.description, TEXT_LIMITS.description) || null,
+    status: body.status === 0 || body.status === '0' ? 0 : 1,
   };
   if (!row.project_no) return fail(res, 400, '项目编号不能为空');
   if (!row.product_code) return fail(res, 400, '产品代码不能为空');
@@ -962,20 +1099,35 @@ function updateProject(res, id, body, user) {
   if (!cur) return fail(res, 404, '项目不存在');
   const row = {};
   for (const k of ['project_no', 'product_code', 'project_type', 'description', 'status']) {
-    if (k in body) row[k] = typeof body[k] === 'string' ? body[k].trim() || null : body[k];
+    if (!(k in body)) continue;
+    if (k === 'status') {
+      row.status = body.status === 0 || body.status === '0' ? 0 : 1;
+    } else {
+      const v = cleanText(body[k], TEXT_LIMITS[k] || 200);
+      row[k] = v || (k === 'description' ? null : '');
+    }
   }
   if ('project_no' in row) {
     if (!row.project_no) return fail(res, 400, '项目编号不能为空');
     const dup = db.prepare('SELECT id FROM projects WHERE project_no = ? AND id <> ?').get(row.project_no, id);
     if (dup) return fail(res, 409, `项目编号 ${row.project_no} 已存在`);
-    // 同步更新子表项目编号，保持关联
-    if (row.project_no !== cur.project_no) {
+  }
+  if ('product_code' in row && !row.product_code) return fail(res, 400, '产品代码不能为空');
+  if ('project_type' in row && !row.project_type) return fail(res, 400, '项目类型不能为空');
+  // 改项目编号需要同时改写子表，放在同一事务里：任一失败则整体回滚，避免项目与数据脱钩
+  db.exec('BEGIN');
+  try {
+    if (row.project_no && row.project_no !== cur.project_no) {
       db.prepare('UPDATE project_data SET project_no = ?, updated_at = ? WHERE project_no = ?').run(
         row.project_no, nowStr(), cur.project_no
       );
     }
+    update('projects', id, row);
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
   }
-  update('projects', id, row);
   logAudit(user, 'update', 'project', id, `修改项目 ${row.project_no || cur.project_no}`, diffRows(cur, row, Object.keys(row)));
   ok(res);
 }
@@ -1097,22 +1249,11 @@ function hasFullKey(row) {
   });
 }
 
-/** 统计某五元组已存在的记录数（软删除行不参与重复判定） */
-function countByKey(key) {
-  return db
-    .prepare(
-      `SELECT COUNT(*) AS c FROM project_data
-       WHERE deleted_at IS NULL AND project_no = ? AND product_code = ? AND IFNULL(base,'') = ?
-         AND IFNULL(process_code,'') = ? AND IFNULL(work_order,'') = ?`
-    )
-    .get(key.project_no, key.product_code, key.base || '', key.process_code || '', key.work_order || '').c;
-}
-
-/** 查找五元组已存在的记录 */
+/** 查找五元组已存在的记录，并顺带带回总条数（一条 SQL 完成 count + 取样） */
 function findDuplicate(key) {
   return db
     .prepare(
-      `SELECT * FROM project_data
+      `SELECT *, COUNT(*) OVER () AS dup_count FROM project_data
        WHERE deleted_at IS NULL AND project_no = ? AND product_code = ? AND IFNULL(base,'') = ?
          AND IFNULL(process_code,'') = ? AND IFNULL(work_order,'') = ?
        ORDER BY id DESC LIMIT 1`
@@ -1148,28 +1289,23 @@ function createData(res, body, user) {
   // 五项齐全才做重复判定
   const action = String(body.duplicate_action || '').toLowerCase();
   let existing = null;
-  if (hasFullKey(row)) {
-    const dupCount = countByKey(row);
-    if (dupCount > 0) {
-      existing = findDuplicate(row);
-      if (!action) {
-        // 让前端确认：覆盖 or 追加
-        return send(res, 409, {
-          success: false,
-          code: 'DUPLICATE_KEY',
-          message: '系统已有相同数据',
-          duplicate: {
-            id: existing.id,
-            count: dupCount,
-            key: describeKey(row),
-            created_by: existing.created_by,
-            entry_date: existing.entry_date,
-            updated_at: existing.updated_at,
-            owner: existing.created_by_id === user.id,
-          },
-        });
-      }
-    }
+  if (hasFullKey(row)) existing = findDuplicate(row);
+  if (existing && !action) {
+    // 让前端确认：覆盖 or 追加
+    return send(res, 409, {
+      success: false,
+      code: 'DUPLICATE_KEY',
+      message: '系统已有相同数据',
+      duplicate: {
+        id: existing.id,
+        count: existing.dup_count,
+        key: describeKey(row),
+        created_by: existing.created_by,
+        entry_date: existing.entry_date,
+        updated_at: existing.updated_at,
+        owner: existing.created_by_id === user.id,
+      },
+    });
   }
 
   if (existing && action === 'overwrite') {
@@ -1239,6 +1375,7 @@ function bulkDeleteData(res, body, user) {
   if (!isAdmin(user)) return fail(res, 403, '仅管理员可删除数据记录');
   const ids = Array.isArray(body.ids) ? [...new Set(body.ids.map(Number).filter(Number.isFinite))] : [];
   if (ids.length === 0) return fail(res, 400, '请选择要删除的记录');
+  if (ids.length > 500) return fail(res, 400, '单次最多删除 500 条记录');
   const marks = ids.map(() => '?').join(',');
   const rows = db.prepare(`SELECT id, project_no, work_order FROM project_data WHERE id IN (${marks}) AND deleted_at IS NULL`).all(...ids);
   if (rows.length === 0) return fail(res, 404, '数据记录不存在');
@@ -1416,9 +1553,9 @@ function performImport(rows, user, action) {
         row.product_code = projectMap.get(row.project_no); // 以项目档案为准
         if (!row.entry_date) row.entry_date = new Date().toISOString().slice(0, 10);
 
-        // 五项齐全且已存在同键记录 → 视 duplicate_action 决定
+        // 五项齐全且已存在同键记录 → 视 duplicate_action 决定（一次查询取回记录与总数）
         let existing = null;
-        if (hasFullKey(row) && countByKey(row) > 0) existing = findDuplicate(row);
+        if (hasFullKey(row)) existing = findDuplicate(row);
 
         // 覆盖权限：与单条修改一致，普通用户只能覆盖自己录入的记录
         if (existing && !isAdmin(user) && existing.created_by_id !== user.id) {
@@ -1501,6 +1638,9 @@ function performImport(rows, user, action) {
 function importData(res, body, user) {
   const rows = Array.isArray(body.rows) ? body.rows : [];
   if (rows.length === 0) return fail(res, 400, '没有可导入的数据');
+  if (rows.length > MAX_IMPORT_ROWS) {
+    return fail(res, 400, `单次最多导入 ${MAX_IMPORT_ROWS} 行，请拆分后重试`);
+  }
   return finishImport(res, rows, String(body.duplicate_action || '').toLowerCase(), user);
 }
 
@@ -1539,6 +1679,58 @@ function getStats(res, user) {
     .prepare(`SELECT id, project_no, product_code, work_order, entry_date, quantity FROM project_data${w} ORDER BY id DESC LIMIT 8`)
     .all(...args);
   ok(res, { stats: { projectCount, dataCount, typeCount, baseCount, qtySum, byType, byBase, recent } });
+}
+
+/* ---------- 审计日志查询（仅管理员） ---------- */
+
+/** 审计日志列表：按时间倒序分页，支持对象 / 动作 / 关键词 / 日期区间筛选 */
+function listAuditLogs(res, params, user) {
+  if (!isAdmin(user)) return fail(res, 403, '仅管理员可查看审计日志');
+
+  const where = [];
+  const args = [];
+  const entity = (params.get('entity') || '').trim();
+  if (entity) {
+    if (!['project', 'data', 'user'].includes(entity)) return fail(res, 400, 'entity 仅支持 project / data / user');
+    where.push('entity = ?');
+    args.push(entity);
+  }
+  const action = (params.get('action') || '').trim();
+  if (action) {
+    const allowed = ['create', 'update', 'soft_delete', 'restore', 'purge', 'import', 'status'];
+    if (!allowed.includes(action)) return fail(res, 400, 'action 参数不合法');
+    where.push('action = ?');
+    args.push(action);
+  }
+  const q = (params.get('q') || '').trim();
+  if (q) {
+    const like = `%${q}%`;
+    where.push('(IFNULL(username,\'\') LIKE ? OR summary LIKE ?)');
+    args.push(like, like);
+  }
+  const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+  const from = (params.get('date_from') || '').trim();
+  const to = (params.get('date_to') || '').trim();
+  if (from) {
+    if (!DATE_RE.test(from)) return fail(res, 400, 'date_from 需为 YYYY-MM-DD');
+    where.push('created_at >= ?');
+    args.push(`${from} 00:00:00`);
+  }
+  if (to) {
+    if (!DATE_RE.test(to)) return fail(res, 400, 'date_to 需为 YYYY-MM-DD');
+    where.push('created_at <= ?');
+    args.push(`${to} 23:59:59`);
+  }
+
+  const page = Math.max(1, Number(params.get('page') || 1));
+  const pageSize = Math.min(200, Math.max(10, Number(params.get('pageSize') || 50)));
+  const w = where.length ? ` WHERE ${where.join(' AND ')}` : '';
+  const total = db.prepare(`SELECT COUNT(*) AS c FROM audit_logs${w}`).get(...args).c;
+  const rows = db
+    .prepare(`SELECT id, user_id, username, action, entity, entity_id, summary, changes, created_at
+              FROM audit_logs${w} ORDER BY id DESC LIMIT ? OFFSET ?`)
+    .all(...args, pageSize, (page - 1) * pageSize);
+  ok(res, { rows, total, page, pageSize, keepDays: 180 });
 }
 
 /* ---------- 用户批量导入 ---------- */
@@ -1811,9 +2003,14 @@ function updateUser(res, id, body, actor) {
     row.password_hash = hashPassword(body.password, row.salt);
     row.pwd_changed = 1;
   }
+  // 只有「停用 / 变更角色 / 改密」才需要强制下线；
+  // 仅修改姓名或备注不应打断对方正在进行的操作（之前无条件踢人会误伤）。
+  const needKick =
+    ('status' in row && row.status === 0 && cur.status !== 0) ||
+    ('role' in row && row.role !== cur.role) ||
+    !!body.reset_password || !!body.password;
   update('users', id, row, { touch: false });
-  // 停用或改密后，强制该用户重新登录
-  destroyUserSessions(id);
+  if (needKick) destroyUserSessions(id);
   const acts = [];
   if ('status' in row) acts.push(row.status === 1 ? '启用' : '停用');
   if ('role' in row && row.role !== cur.role) acts.push(`角色改为${row.role === 'admin' ? '管理员' : '普通用户'}`);
@@ -1867,6 +2064,12 @@ function login(res, body, req) {
       : { ...cur, count: cur.count + 1 };
     if (next.count >= MAX_FAILS) next.lockedUntil = now + LOCK_MS;
     loginFails.set(username, next);
+    // 兜底：清理已过统计窗口的旧记录，避免长期运行后 Map 无限增长
+    if (loginFails.size > 1000) {
+      for (const [k, v] of loginFails) {
+        if (now - v.firstAt > LOCK_MS && (!v.lockedUntil || now > v.lockedUntil)) loginFails.delete(k);
+      }
+    }
     const left = MAX_FAILS - next.count;
     return fail(res, 401, left > 0 ? `账号或密码错误，还可尝试 ${left} 次` : '密码错误次数过多，请 5 分钟后再试');
   }
@@ -1946,6 +2149,8 @@ async function handleApi(req, res, url) {
 
   if (m === 'GET' && p === '/api/meta') return getMeta(res, user);
   if (m === 'GET' && p === '/api/stats') return getStats(res, user);
+  // 审计日志：只读，保留 180 天
+  if (m === 'GET' && p === '/api/audit-logs') return listAuditLogs(res, q, user);
 
   // 回收站（仅管理员）
   if (p === '/api/recycle' && m === 'GET') return listRecycle(res, user);
@@ -1960,7 +2165,7 @@ async function handleApi(req, res, url) {
       return createProject(res, await readBody(req), user);
     }
   }
-  if (p === '/api/projects/export' && m === 'GET') return exportProjectsXlsx(res, q);
+  if (p === '/api/projects/export' && m === 'GET') return exportProjectsXlsx(res, q, user);
   // 项目列表导入：与数据导入一致，仅管理员可操作（项目档案的增删改本来就是管理员权限）
   if (p === '/api/projects/template' && m === 'GET') {
     if (!isAdmin(user)) return fail(res, 403, '仅管理员可导入项目');
@@ -2041,10 +2246,19 @@ const server = http.createServer(async (req, res) => {
   try {
     if (url.pathname.startsWith('/api/')) {
       await handleApi(req, res, url);
+      // 写操作后让 /api/meta 缓存失效，保证筛选下拉及时反映新增的项目 / 公司 / 工单
+      if (req.method !== 'GET' && req.method !== 'HEAD') invalidateMeta();
     } else {
       serveStatic(req, res, url.pathname);
     }
   } catch (e) {
+    // 客户端错误（非法 JSON、请求体过大等）按自身状态码返回，只有真正的服务端异常才是 500
+    const status = Number(e && e.status);
+    if (status >= 400 && status < 500) {
+      if (!res.headersSent) fail(res, status, e.message || '请求不合法');
+      else res.end();
+      return;
+    }
     console.error('[ERROR]', req.method, url.pathname, e);
     // 只把错误细节写日志，不回传给客户端，避免泄露 SQL / 表结构 / 文件路径等信息
     if (!res.headersSent) fail(res, 500, '服务器内部错误，请稍后重试或联系管理员');
