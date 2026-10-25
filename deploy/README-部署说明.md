@@ -10,7 +10,7 @@
 | `~/apps/stkj` | 代码目录（可通过 `--dir` 改） | `$HOME/apps/stkj` |
 | `~/apps/node-*` | Node.js 运行时目录 | `$HOME/apps/node-v22.23.3-linux-x64` |
 
-> 逐步的安装 / 升级 / 卸载命令见根目录 `README.md` 的「Debian 服务器部署（安装 / 升级 / 卸载）」。
+> 逐步的安装 / 升级 / 卸载命令见根目录 `README.md` 的「Linux 服务器部署（安装 / 升级 / 卸载）」。
 > 日常操作只需要一条命令：`bash ~/apps/stkj/deploy/stkj.sh install|upgrade|uninstall|status`。
 > 本文档侧重**部署形态、目录约定、运维与故障排查**，补充 README 未展开的部分。
 
@@ -66,7 +66,7 @@ sudo apt update && sudo apt install -y curl tar xz-utils ca-certificates
 
 > Node.js **不要用 `apt install nodejs`**：Debian 仓库版本普遍低于 22，缺少 `node:sqlite`。
 > 用官方二进制包或 NodeSource 仓库，或直接跑 `bash deploy/stkj.sh install`（会自动下载）。
-> 安装与升级都用 `curl` 下载代码包，服务器上**不需要安装 git**；只有早期 `git clone` 部署的机器才会走 `git pull`。
+> 安装与升级都用 `curl` 下载代码包。
 
 ---
 

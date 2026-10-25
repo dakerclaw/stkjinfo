@@ -17,7 +17,7 @@ npm start          # 启动服务，访问 http://127.0.0.1:5173
 
 要求 Node.js >= 22.5（内置 SQLite 模块）。
 
-> 要部署到 Debian 服务器？只需一条命令，见下方「[Debian 服务器部署（安装 / 升级 / 卸载）](#debian-服务器部署安装--升级--卸载)」。
+> 要部署到 Linux 服务器？只需一条命令，见下方「[Linux 服务器部署（安装 / 升级 / 卸载）](#linux-服务器部署安装--升级--卸载)」。
 
 ```bash
 node seed.js           # 首次初始化账号与示例数据
@@ -312,16 +312,12 @@ data/app.db          SQLite 数据库（本机默认 ./data；部署时用 DATA_
 | `stkj-backup.service` / `.timer` | 每日 03:00 自动备份 |
 | `README-部署说明.md` | 部署形态、目录约定、运维与故障排查的详细说明 |
 
-## Debian 服务器部署（安装 / 升级 / 卸载）
+## Linux 服务器部署（安装 / 升级 / 卸载）
 
 所有操作由一个脚本完成：`deploy/stkj.sh`，四个子命令 `install`、`upgrade`、`uninstall`、`status`。
 全程**无需 root**：Node.js 装在用户目录，服务以 systemd **用户服务**运行，代码、数据库、备份都在 `~/apps/stkj` 下。
 
-> **更新只走 GitHub**：所有改动先推送到 GitHub，再到服务器执行 `bash ~/apps/stkj/deploy/stkj.sh upgrade`。
-> 不要把本地文件 scp / tar 覆盖到服务器，也不要直接在服务器上改代码（升级会以 GitHub 上的版本为准）。
-> 安装与升级默认用 `curl` 下载代码包，**服务器上不需要安装 git**；只有早期用 `git clone` 部署的机器才会走 `git pull`。
-
-以下命令都用**普通用户**（示例 `mac`）SSH 登录服务器后执行，`~` 指该用户家目录。
+以下命令都用**普通用户** SSH 登录服务器后执行，`~` 指该用户home目录。
 
 ### 一、安装（一条命令，不需要 git）
 
@@ -329,7 +325,7 @@ data/app.db          SQLite 数据库（本机默认 ./data；部署时用 DATA_
 curl -fsSL https://raw.githubusercontent.com/dakerclaw/stkjinfo/main/deploy/stkj.sh | bash -s -- install
 ```
 
-脚本会从 GitHub 下载最新代码包（tar.gz）解压到 `~/apps/stkj`，然后装 Node、建库、装服务。**服务器上不需要安装 git。**
+脚本会从 GitHub 下载最新代码包（tar.gz）解压到 `~/apps/stkj`，然后装 Node、建库、装服务。
 
 看到最后打印的「安装完成」和「首页访问：HTTP 200」就装好了。浏览器打开 `http://<服务器IP>:5173`，用 `admin / admin123` 登录，**登录后立即在右上角修改密码**。
 
@@ -359,7 +355,7 @@ curl -fsSL https://raw.githubusercontent.com/dakerclaw/stkjinfo/main/deploy/stkj
 
 第一次安装前只需确认两件事：
 
-1. 系统有 curl / tar / xz（Debian 最小化安装可能没有）：
+1. 系统有 curl / tar / xz ：
 
 ```bash
 sudo apt update && sudo apt install -y curl tar xz-utils ca-certificates
@@ -450,12 +446,6 @@ rm -f ~/apps/stkj/data/app.db ~/apps/stkj/data/app.db-shm ~/apps/stkj/data/app.d
 cp ~/apps/stkj/backups/app-<时间戳>.db ~/apps/stkj/data/app.db
 systemctl --user start stkj.service
 ```
-
-**4）早期用 `git clone` 部署的机器怎么升级**
-
-`upgrade` 检测到 `~/apps/stkj/.git` 且系统有 git 时，仍按原来的方式 `git pull`（会先把本地改动 `git stash`）。
-想改成下载方式，可以执行一次 `bash ~/apps/stkj/deploy/stkj.sh uninstall`（保留数据），
-再按上面「安装」的一条命令重装，数据库会自动沿用。
 
 ### 附：升级 Node.js 版本
 
