@@ -34,9 +34,8 @@
 │   │   ├── server.js  db.js  ...
 │   │   ├── deploy/                   部署脚本与 systemd 单元模板
 │   │   ├── data/app.db               SQLite 数据库（含 -wal / -shm）
-│   │   ├── backups/                  每日自动备份
+│   │   ├── backups/                  每日自动备份 + code-prev-*.tar.gz（升级前代码）
 │   │   └── logs/app.log              运行日志
-│   └── backups/code-<时间戳>.tar.gz  更新前的代码快照
 └── .config/systemd/user/
     ├── stkj.service
     ├── stkj-backup.service
@@ -55,18 +54,19 @@
 |---|---|---|
 | 系统 | Debian 11+ / Ubuntu 20.04+，x86_64 或 arm64 | `cat /etc/os-release`、`uname -m` |
 | Node.js | **≥ 22.13**（使用内置 `node:sqlite`） | `node -v` |
-| 基础工具 | `curl`、`xz-utils`、`ca-certificates` | `curl --version` |
+| 基础工具 | `curl`、`tar`、`xz-utils`、`ca-certificates`（**不需要 git**） | `curl --version` |
 | 端口 | `<端口>` 未被占用 | `ss -tlnp \| grep <端口>` |
 | 磁盘 | 数据库大小 × 15 以上（自动备份保留 14 份） | `df -h ~` |
 
 补装基础工具：
 
 ```bash
-sudo apt update && sudo apt install -y curl xz-utils ca-certificates
+sudo apt update && sudo apt install -y curl tar xz-utils ca-certificates
 ```
 
 > Node.js **不要用 `apt install nodejs`**：Debian 仓库版本普遍低于 22，缺少 `node:sqlite`。
 > 用官方二进制包或 NodeSource 仓库，或直接跑 `bash deploy/stkj.sh install`（会自动下载）。
+> 安装与升级都用 `curl` 下载代码包，服务器上**不需要安装 git**；只有早期 `git clone` 部署的机器才会走 `git pull`。
 
 ---
 
@@ -93,7 +93,7 @@ SQLite 在 WAL 模式下有几个容易丢数据的坑，本项目已针对性�
 
 - **每日自动**：`stkj-backup.timer` 每天 03:00 用 `VACUUM INTO` 生成在线一致性快照，不影响运行中的服务，默认保留 14 份
 - **手动触发**：`bash deploy/backup.cjs`（`--keep N` 调整保留份数）
-- **更新前**：`bash deploy/stkj.sh upgrade` 会先自动备份数据库，再拉取代码；如需额外留存，可再手动跑一次 `backup.cjs`
+- **更新前**：`bash deploy/stkj.sh upgrade` 会先自动备份数据库，再下载代码；上一版代码同时留在 `backups/code-prev-<时间戳>.tar.gz`（最近 3 份），重启失败会自动回滚
 
 > `VACUUM INTO` 生成的是完整独立的 .db 文件，可直接拿来恢复，不像 `cp` 主库文件那样会漏掉 WAL 里的数据。
 

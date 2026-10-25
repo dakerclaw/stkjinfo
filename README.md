@@ -317,17 +317,19 @@ data/app.db          SQLite 数据库（本机默认 ./data；部署时用 DATA_
 所有操作由一个脚本完成：`deploy/stkj.sh`，四个子命令 `install`、`upgrade`、`uninstall`、`status`。
 全程**无需 root**：Node.js 装在用户目录，服务以 systemd **用户服务**运行，代码、数据库、备份都在 `~/apps/stkj` 下。
 
-> **更新只走 GitHub**：服务器上的代码不要用 scp / tar 直接覆盖，否则 git 工作区会变脏，`upgrade` 会拉取失败。
-> 所有改动先推送到 GitHub，再到服务器执行 `bash ~/apps/stkj/deploy/stkj.sh upgrade`。
+> **更新只走 GitHub**：所有改动先推送到 GitHub，再到服务器执行 `bash ~/apps/stkj/deploy/stkj.sh upgrade`。
+> 不要把本地文件 scp / tar 覆盖到服务器，也不要直接在服务器上改代码（升级会以 GitHub 上的版本为准）。
+> 安装与升级默认用 `curl` 下载代码包，**服务器上不需要安装 git**；只有早期用 `git clone` 部署的机器才会走 `git pull`。
 
 以下命令都用**普通用户**（示例 `mac`）SSH 登录服务器后执行，`~` 指该用户家目录。
 
-### 一、安装（一条命令）
+### 一、安装（一条命令，不需要 git）
 
 ```bash
-mkdir -p ~/apps && git clone git@github.com:dakerclaw/stkjinfo.git ~/apps/stkj \
-  && bash ~/apps/stkj/deploy/stkj.sh install
+curl -fsSL https://raw.githubusercontent.com/dakerclaw/stkjinfo/main/deploy/stkj.sh | bash -s -- install
 ```
+
+脚本会从 GitHub 下载最新代码包（tar.gz）解压到 `~/apps/stkj`，然后装 Node、建库、装服务。**服务器上不需要安装 git。**
 
 看到最后打印的「安装完成」和「首页访问：HTTP 200」就装好了。浏览器打开 `http://<服务器IP>:5173`，用 `admin / admin123` 登录，**登录后立即在右上角修改密码**。
 
@@ -336,7 +338,7 @@ mkdir -p ~/apps && git clone git@github.com:dakerclaw/stkjinfo.git ~/apps/stkj \
 | 步骤 | 说明 |
 |---|---|
 | Node.js | 优先用已有的 `~/apps/node-*`；没有就下载到 `~/apps`（先国内镜像，失败自动换官方源），要求 ≥ v22.13 |
-| 代码 | 克隆到 `~/apps/stkj`；目录里已有代码则执行 `git pull` |
+| 代码 | 用 `curl` 从 GitHub 下载代码包到 `~/apps/stkj`；已有代码则原地更新，`data/backups/logs` 不动 |
 | 数据目录 | 建 `data/`、`backups/`、`logs/`，数据目录权限收紧为 700 |
 | 数据库 | 没有 `data/app.db` 时初始化（含默认管理员与示例数据）；已有则**原样保留** |
 | 服务 | 生成并启用 `stkj.service`（开机自启、崩溃自动重启） |
@@ -350,25 +352,26 @@ mkdir -p ~/apps && git clone git@github.com:dakerclaw/stkjinfo.git ~/apps/stkj \
 | `--port=5173` | 监听端口 |
 | `--host=127.0.0.1` | 仅本机可访问（配合 SSH 隧道更安全） |
 | `--dir=~/apps/stkj` | 安装目录 |
+| `--repo=<地址>` | 换代码来源：tar.gz 下载地址，或 git 地址（git 地址在没装 git 时会自动转成 GitHub 下载地址） |
 | `--node-version=v22.23.3` | 指定 Node 版本（换版本也用它，见文末） |
 | `--no-backup` | 不装每日备份定时器 |
 | `--with-linger` | 自动执行 `sudo loginctl enable-linger`（开机免登录自启） |
 
 第一次安装前只需确认两件事：
 
-1. 系统装了 git / curl / xz（Debian 最小化安装默认没有）：
+1. 系统有 curl / tar / xz（Debian 最小化安装可能没有）：
 
 ```bash
-sudo apt update && sudo apt install -y git curl xz-utils ca-certificates
+sudo apt update && sudo apt install -y curl tar xz-utils ca-certificates
 ```
 
-2. 服务器能读 GitHub 仓库。用 Deploy Key（只读即可）：
+2. 服务器能访问 GitHub（`raw.githubusercontent.com` 与 `codeload.github.com`）。网络受限时可先配代理，或用 `--repo=` 指向能访问的镜像 / 内网地址。
 
-```bash
-cat ~/.ssh/id_ed25519.pub      # 没有这个文件就先 ssh-keygen -t ed25519 -C "stkj-server"
-```
-
-把输出的公钥贴到 GitHub 仓库 → Settings → Deploy keys → Add deploy key。
+> 也可以先把脚本存到本地再执行（方便重复使用）：
+> ```bash
+> curl -fsSL -o ~/stkj.sh https://raw.githubusercontent.com/dakerclaw/stkjinfo/main/deploy/stkj.sh
+> bash ~/stkj.sh install
+> ```
 
 > **开机自启**：systemd 用户服务默认要等该用户登录才启动。执行一次
 > `sudo loginctl enable-linger $(whoami)` 即可（或安装时加 `--with-linger`）。
@@ -379,9 +382,11 @@ cat ~/.ssh/id_ed25519.pub      # 没有这个文件就先 ssh-keygen -t ed25519 
 bash ~/apps/stkj/deploy/stkj.sh upgrade
 ```
 
-脚本自动完成：备份数据库 → 收起服务器上的本地改动（`git stash`）→ `git pull` 最新代码 → 语法检查 → **只有后端代码变了才重启**（纯前端改动会提示刷新即可）→ 自检。
+脚本自动完成：备份数据库 → 从 GitHub 下载最新代码包 → 语法检查 → 替换代码（`data/backups/logs` 不动，上一版代码留一份到 `backups/code-prev-<时间戳>.tar.gz`）→ **只有后端代码变了才重启**（纯前端改动会提示刷新即可）→ 自检。重启失败会自动回滚到升级前的代码。
 
 看到「升级完成」和「HTTP 200」即成功。数据库结构变更由 `db.js` 启动时自动迁移，不需要手动执行 SQL，也不会改动已有数据。
+
+> 服务器上不要直接改代码：下载方式升级会以 GitHub 上的版本为准，本地改动会被覆盖。
 
 ### 三、卸载
 
@@ -406,22 +411,19 @@ bash ~/apps/stkj/deploy/stkj.sh status
 
 ### 常见问题
 
-**1）`git clone` 报 `Permission denied (publickey)`**
+**1）安装或升级时下载失败（`curl: (6)` / `(7)` / 超时）**
 
-服务器公钥没加到 GitHub，按上面「第一次安装前」第 2 步加 Deploy Key。
-
-**2）升级报 `Not possible to fast-forward` 或 `diverged`**
-
-服务器上的代码被手工改过。确认不需要这些改动后（**只影响代码，不动 `data/`**）：
+服务器访问不了 GitHub。先确认网络与 DNS：
 
 ```bash
-cd ~/apps/stkj
-git fetch origin
-git reset --hard origin/main
-systemctl --user restart stkj.service
+curl -I https://codeload.github.com/dakerclaw/stkjinfo/tar.gz/refs/heads/main
 ```
 
-**3）服务起不来**
+不通就配代理，或用 `--repo=<能访问的 tar.gz 地址>` 指定镜像 / 内网地址。
+
+**2）升级后服务起不来**
+
+`upgrade` 发现服务起不来会自动回滚到升级前的代码，并打印日志位置。手动排查：
 
 ```bash
 systemctl --user status stkj.service --no-pager
@@ -429,12 +431,14 @@ journalctl --user -u stkj.service -n 100 --no-pager
 tail -n 50 ~/apps/stkj/logs/app.log
 ```
 
-**4）想回退到上一个版本**
+**3）想回退到上一个版本**
+
+升级时会把旧代码留在 `backups/code-prev-<时间戳>.tar.gz`（只保留最近 3 份），手动回退：
 
 ```bash
 cd ~/apps/stkj
-git log --oneline -10                 # 找到升级前的 commit
-git reset --hard <升级前的 commit>
+ls -1t backups/code-prev-*.tar.gz        # 选一个升级前的时间戳
+tar xzf backups/code-prev-<时间戳>.tar.gz
 systemctl --user restart stkj.service
 ```
 
@@ -446,6 +450,12 @@ rm -f ~/apps/stkj/data/app.db ~/apps/stkj/data/app.db-shm ~/apps/stkj/data/app.d
 cp ~/apps/stkj/backups/app-<时间戳>.db ~/apps/stkj/data/app.db
 systemctl --user start stkj.service
 ```
+
+**4）早期用 `git clone` 部署的机器怎么升级**
+
+`upgrade` 检测到 `~/apps/stkj/.git` 且系统有 git 时，仍按原来的方式 `git pull`（会先把本地改动 `git stash`）。
+想改成下载方式，可以执行一次 `bash ~/apps/stkj/deploy/stkj.sh uninstall`（保留数据），
+再按上面「安装」的一条命令重装，数据库会自动沿用。
 
 ### 附：升级 Node.js 版本
 
