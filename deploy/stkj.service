@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# %code_path% 由 install.sh 按代码布局替换：仓库根即代码时为空，代码在 stkjinfo/ 时为 /stkjinfo
+# %code_path% 由 stkj.sh install 按代码布局替换：仓库根即代码时为空，代码在 stkjinfo/ 时为 /stkjinfo
 WorkingDirectory=%h/apps/stkj%code_path%
 Environment=NODE_ENV=production
 Environment=HOST=0.0.0.0

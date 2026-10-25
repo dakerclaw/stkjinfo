@@ -14,7 +14,7 @@ const path = require('node:path');
 const fs = require('node:fs');
 const { DatabaseSync } = require('node:sqlite');
 
-const HOME = process.env.HOME || process.env.USERPROFILE || '.';
+const HOME = process.env.HOME || '.';
 const DB_FILE = process.env.DB_FILE
   ? path.resolve(process.env.DB_FILE)
   : path.join(HOME, 'apps', 'stkj', 'data', 'app.db');

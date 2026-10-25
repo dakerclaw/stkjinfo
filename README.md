@@ -304,15 +304,13 @@ data/app.db          SQLite 数据库（本机默认 ./data；部署时用 DATA_
 
 | 文件 | 用途 |
 |---|---|
-| `stkj.sh` | **一键脚本（推荐）**：`install` 安装 / `upgrade` 升级 / `uninstall` 卸载 / `status` 查看状态 |
-| `install.sh` | 兼容旧入口，等价于 `stkj.sh install` |
-| `uninstall.sh` | 兼容旧入口，等价于 `stkj.sh uninstall` |
-| `apply-update.sh` | 旧版 tar 覆盖更新脚本（已被 `stkj.sh upgrade` 取代，保留备查） |
+| `stkj.sh` | **一键脚本**：`install` 安装 / `upgrade` 升级 / `uninstall` 卸载 / `status` 查看状态 |
 | `backup.cjs` | 数据库在线备份（`VACUUM INTO`，`--keep N` 控制保留份数） |
 | `harden-db.sh` | 对现有库做 CHECKPOINT 加固与健康检查 |
 | `clear-data.cjs` | 清空业务数据（保留账号与项目档案） |
 | `stkj.service` | systemd 用户服务单元（开机自启 + 崩溃自动重启） |
 | `stkj-backup.service` / `.timer` | 每日 03:00 自动备份 |
+| `README-部署说明.md` | 部署形态、目录约定、运维与故障排查的详细说明 |
 
 ## Debian 服务器部署（安装 / 升级 / 卸载）
 

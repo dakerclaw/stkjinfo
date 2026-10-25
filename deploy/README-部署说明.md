@@ -43,7 +43,7 @@
     └── stkj-backup.timer
 ```
 
-> **两种代码布局都支持**：`install.sh` / `apply-update.sh` 会自动检测 `APP_DIR/server.js` 或
+> **两种代码布局都支持**：`stkj.sh` 会自动检测 `APP_DIR/server.js` 或
 > `APP_DIR/stkjinfo/server.js`，并把 systemd 单元的 `WorkingDirectory` 指到实际代码目录。
 > 数据目录始终是 `APP_DIR/data`，由服务单元的 `DATA_DIR` 环境变量固定，与代码目录解耦。
 
@@ -66,7 +66,7 @@ sudo apt update && sudo apt install -y curl xz-utils ca-certificates
 ```
 
 > Node.js **不要用 `apt install nodejs`**：Debian 仓库版本普遍低于 22，缺少 `node:sqlite`。
-> 用官方二进制包或 NodeSource 仓库，或直接跑 `deploy/install.sh`（会自动下载）。
+> 用官方二进制包或 NodeSource 仓库，或直接跑 `bash deploy/stkj.sh install`（会自动下载）。
 
 ---
 
@@ -93,7 +93,7 @@ SQLite 在 WAL 模式下有几个容易丢数据的坑，本项目已针对性�
 
 - **每日自动**：`stkj-backup.timer` 每天 03:00 用 `VACUUM INTO` 生成在线一致性快照，不影响运行中的服务，默认保留 14 份
 - **手动触发**：`bash deploy/backup.cjs`（`--keep N` 调整保留份数）
-- **更新前**：`apply-update.sh` 自动备份**代码**，但**不备份数据**，重要更新前请手动跑一次 `backup.cjs`
+- **更新前**：`bash deploy/stkj.sh upgrade` 会先自动备份数据库，再拉取代码；如需额外留存，可再手动跑一次 `backup.cjs`
 
 > `VACUUM INTO` 生成的是完整独立的 .db 文件，可直接拿来恢复，不像 `cp` 主库文件那样会漏掉 WAL 里的数据。
 
@@ -236,10 +236,7 @@ journalctl --user -u stkj.service -n 100 --no-pager
 
 | 文件 | 用途 |
 |---|---|
-| `stkj.sh` | **一键脚本（推荐）**：`install` / `upgrade` / `uninstall` / `status`，参数见 `bash stkj.sh help` |
-| `install.sh` | 兼容旧入口，等价于 `stkj.sh install` |
-| `apply-update.sh` | 旧版 tar 覆盖更新脚本（已被 `stkj.sh upgrade` 取代，保留备查） |
-| `uninstall.sh` | 兼容旧入口，等价于 `stkj.sh uninstall` |
+| `stkj.sh` | **一键脚本**：`install` / `upgrade` / `uninstall` / `status`，参数见 `bash stkj.sh help` |
 | `backup.cjs` | 数据库在线备份（`VACUUM INTO`，`--keep N` 控制保留份数） |
 | `stkj.service` | systemd **用户**服务单元模板（`%h` 会自动替换为家目录） |
 | `stkj-backup.service` / `.timer` | 每日 03:00 自动备份 |
