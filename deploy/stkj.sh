@@ -125,13 +125,17 @@ confirm() {
   esac
 }
 
-preflight() {
-  [ "$(id -u)" -ne 0 ] || die "请不要用 root/sudo 运行（systemd 用户服务必须由普通用户管理）"
-  [ -n "${HOME:-}" ] && [ -d "$HOME" ] || die "HOME 目录不可用"
+ensure_user_env() {
   # su / cron 等场景不会带 XDG_RUNTIME_DIR，补上才能连到用户级 systemd
   if [ -z "${XDG_RUNTIME_DIR:-}" ] && [ -d "/run/user/$(id -u)" ]; then
     export XDG_RUNTIME_DIR="/run/user/$(id -u)"
   fi
+}
+
+preflight() {
+  [ "$(id -u)" -ne 0 ] || die "请不要用 root/sudo 运行（systemd 用户服务必须由普通用户管理）"
+  [ -n "${HOME:-}" ] && [ -d "$HOME" ] || die "HOME 目录不可用"
+  ensure_user_env
   have git || die "缺少 git，请先执行：sudo apt update && sudo apt install -y git"
   have curl || die "缺少 curl，请先执行：sudo apt update && sudo apt install -y curl"
   have tar || die "缺少 tar，请先执行：sudo apt update && sudo apt install -y tar"
@@ -534,6 +538,7 @@ cmd_upgrade() {
 cmd_uninstall() {
   [ "$(id -u)" -ne 0 ] || die "请不要用 root/sudo 运行"
   have systemctl || die "系统没有 systemd"
+  ensure_user_env
 
   local mode="仅移除服务（保留代码与数据）"
   if [ "$PURGE_ALL" = "1" ]; then
@@ -627,6 +632,7 @@ cmd_uninstall() {
 
 # ---------------------------------------------------------------- status
 cmd_status() {
+  ensure_user_env
   say ""
   say "stkj 状态"
   say "  安装目录：$APP_DIR"
