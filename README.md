@@ -17,6 +17,8 @@ npm start          # 启动服务，访问 http://127.0.0.1:5173
 
 要求 Node.js >= 22.5（内置 SQLite 模块）。
 
+> 要部署到 Debian 服务器？只需一条命令，见下方「[Debian 服务器部署（安装 / 升级 / 卸载）](#debian-服务器部署安装--升级--卸载)」。
+
 ```bash
 node seed.js           # 首次初始化账号与示例数据
 node seed.js --reset   # 清空项目与数据后重新灌入示例（保留用户）
@@ -302,253 +304,140 @@ data/app.db          SQLite 数据库（本机默认 ./data；部署时用 DATA_
 
 | 文件 | 用途 |
 |---|---|
-| `install.sh` | 全新安装：下载 Node.js → 铺代码 → 建库 → 装服务与定时器 |
-| `apply-update.sh` | 一键更新：备份代码 → 停服 → 覆盖 → 语法检查 → 启服；加 `--git` 可直接从仓库拉取 |
-| `uninstall.sh` | 卸载：默认只摘服务；`--purge` / `--purge-all` 逐级删数据 |
+| `stkj.sh` | **一键脚本（推荐）**：`install` 安装 / `upgrade` 升级 / `uninstall` 卸载 / `status` 查看状态 |
+| `install.sh` | 兼容旧入口，等价于 `stkj.sh install` |
+| `uninstall.sh` | 兼容旧入口，等价于 `stkj.sh uninstall` |
+| `apply-update.sh` | 旧版 tar 覆盖更新脚本（已被 `stkj.sh upgrade` 取代，保留备查） |
 | `backup.cjs` | 数据库在线备份（`VACUUM INTO`，`--keep N` 控制保留份数） |
 | `harden-db.sh` | 对现有库做 CHECKPOINT 加固与健康检查 |
 | `clear-data.cjs` | 清空业务数据（保留账号与项目档案） |
 | `stkj.service` | systemd 用户服务单元（开机自启 + 崩溃自动重启） |
 | `stkj-backup.service` / `.timer` | 每日 03:00 自动备份 |
 
-## Debian 服务器部署
+## Debian 服务器部署（安装 / 升级 / 卸载）
 
-适用于 **Debian 13 (trixie) / Debian 12 (bookworm)**，x86_64 与 arm64。全程**无需 root**，Node.js 装在用户目录，服务以 systemd **用户服务**运行。
+所有操作由一个脚本完成：`deploy/stkj.sh`，四个子命令 `install`、`upgrade`、`uninstall`、`status`。
+全程**无需 root**：Node.js 装在用户目录，服务以 systemd **用户服务**运行，代码、数据库、备份都在 `~/apps/stkj` 下。
 
-以下命令均以普通用户（示例为 `mac`）执行，`~` 指该用户家目录。
+以下命令都用**普通用户**（示例 `mac`）SSH 登录服务器后执行，`~` 指该用户家目录。
 
-### 一、环境准备
-
-Debian 最小化安装缺少 `curl`、`xz`，先补齐：
-
-```bash
-sudo apt update
-sudo apt install -y curl xz-utils ca-certificates
-```
-
-> `ca-certificates` 是 HTTPS 下载 Node.js 的必需依赖，缺失会报 `SSL certificate problem`。
-
-### 二、安装 Node.js（免 root）
-
-本应用需要 **Node.js ≥ 22.13**（使用内置 `node:sqlite`）。推荐 v22 LTS 最新补丁版：
+### 一、安装（一条命令）
 
 ```bash
-NODE_VER=v22.23.3                                  # 按需改版本号
-NODE_ARCH=x64                                      # x86_64 用 x64；ARM 用 arm64
-mkdir -p ~/apps && cd ~/apps
-
-# 国内网络建议用镜像；不通时把 URL 换成 https://nodejs.org/dist/$NODE_VER/...
-curl -fL -o node.tar.xz \
-  https://npmmirror.com/mirrors/node/$NODE_VER/node-$NODE_VER-linux-$NODE_ARCH.tar.xz
-
-tar -xf node.tar.xz && rm -f node.tar.xz
-~/apps/node-$NODE_VER-linux-$NODE_ARCH/bin/node -v    # 应输出 v22.23.3
+mkdir -p ~/apps && git clone git@github.com:dakerclaw/stkjinfo.git ~/apps/stkj \
+  && bash ~/apps/stkj/deploy/stkj.sh install
 ```
 
-确认架构：`uname -m` 输出 `x86_64` 用 `x64`，输出 `aarch64` 用 `arm64`。
+看到最后打印的「安装完成」和「首页访问：HTTP 200」就装好了。浏览器打开 `http://<服务器IP>:5173`，用 `admin / admin123` 登录，**登录后立即在右上角修改密码**。
 
-### 三、获取代码
+安装脚本自动做完这些，不需要手动操作：
 
-```bash
-cd ~/apps
-git clone git@github.com:dakerclaw/stkjinfo.git stkj
-```
+| 步骤 | 说明 |
+|---|---|
+| Node.js | 优先用已有的 `~/apps/node-*`；没有就下载到 `~/apps`（先国内镜像，失败自动换官方源），要求 ≥ v22.13 |
+| 代码 | 克隆到 `~/apps/stkj`；目录里已有代码则执行 `git pull` |
+| 数据目录 | 建 `data/`、`backups/`、`logs/`，数据目录权限收紧为 700 |
+| 数据库 | 没有 `data/app.db` 时初始化（含默认管理员与示例数据）；已有则**原样保留** |
+| 服务 | 生成并启用 `stkj.service`（开机自启、崩溃自动重启） |
+| 备份 | 装每日 03:00 自动备份定时器，默认保留 14 份 |
+| 自检 | 重启服务 → 确认 active → 请求首页确认 HTTP 200 |
 
-### 四、初始化并安装服务
-
-一键脚本（推荐）：
-
-```bash
-cd ~/apps/stkj
-bash deploy/install.sh ~/apps/stkj          # 代码已在目标目录时传该目录
-# 或直接从仓库拉取：bash deploy/install.sh git@github.com:dakerclaw/stkjinfo.git
-```
-
-脚本会依次完成：下载 Node.js → 铺设代码 → 收紧数据目录权限 → 初始化数据库 → 安装并启动服务与备份定时器 → 自检。
-
-常用可选参数：
+可选参数（写在 `install` 后面，可组合）：
 
 | 参数 | 说明 |
 |---|---|
 | `--port=5173` | 监听端口 |
-| `--host=127.0.0.1` | 仅本机可访问（推荐配合 SSH 隧道） |
+| `--host=127.0.0.1` | 仅本机可访问（配合 SSH 隧道更安全） |
 | `--dir=~/apps/stkj` | 安装目录 |
-| `--node-version=v22.23.3` | 指定 Node 版本 |
-| `--no-backup-timer` | 不装每日备份定时器 |
-| `--with-linger` | 自动执行 `sudo loginctl enable-linger` |
+| `--node-version=v22.23.3` | 指定 Node 版本（换版本也用它，见文末） |
+| `--no-backup` | 不装每日备份定时器 |
+| `--with-linger` | 自动执行 `sudo loginctl enable-linger`（开机免登录自启） |
 
-**手动安装**（想逐条确认时）：
+第一次安装前只需确认两件事：
 
-```bash
-cd ~/apps/stkj
-mkdir -p data backups logs
-chmod 700 data backups
-
-# 1. 首次初始化数据库（已有 app.db 会跳过；--reset 可重灌示例数据但保留用户）
-~/apps/node-v22.23.3-linux-x64/bin/node --no-warnings seed.js
-
-# 2. 安装 systemd 用户服务（把示例单元里的路径/端口替换成本机实际值）
-mkdir -p ~/.config/systemd/user
-sed -e "s|%h/apps/stkj|$HOME/apps/stkj|g" \
-    -e "s|%h/apps/node-v22.22.2-linux-x64|$HOME/apps/node-v22.23.3-linux-x64|g" \
-    deploy/stkj.service > ~/.config/systemd/user/stkj.service
-
-# 3. 安装每日备份定时器
-sed -e "s|%h/apps/stkj|$HOME/apps/stkj|g" \
-    -e "s|%h/apps/node-v22.22.2-linux-x64|$HOME/apps/node-v22.23.3-linux-x64|g" \
-    deploy/stkj-backup.service > ~/.config/systemd/user/stkj-backup.service
-cp deploy/stkj-backup.timer ~/.config/systemd/user/
-
-# 4. 生效并启动
-systemctl --user daemon-reload
-systemctl --user enable --now stkj.service
-systemctl --user enable --now stkj-backup.timer
-systemctl --user status stkj.service --no-pager
-```
-
-### 五、开机自启（linger）
-
-systemd **用户服务**默认只在用户登录后运行。要让服务器重启后无需登录自动拉起：
+1. 系统装了 git / curl / xz（Debian 最小化安装默认没有）：
 
 ```bash
-sudo loginctl enable-linger usrsktj        # usrsktj 换成实际用户名
-loginctl show-user usrsktj --property=Linger   # 应显示 Linger=yes
+sudo apt update && sudo apt install -y git curl xz-utils ca-certificates
 ```
 
-### 六、验证安装
+2. 服务器能读 GitHub 仓库。用 Deploy Key（只读即可）：
 
 ```bash
-# 服务状态
-systemctl --user is-active stkj.service          # active
-# 端口监听
-ss -tlnp | grep 5173                             # 0.0.0.0:5173
-# HTTP 可达
-curl -I http://127.0.0.1:5173/                   # 200，且带 CSP 等安全响应头
-# 定时器下次执行时间
-systemctl --user list-timers stkj-backup.timer
+cat ~/.ssh/id_ed25519.pub      # 没有这个文件就先 ssh-keygen -t ed25519 -C "stkj-server"
 ```
 
-浏览器打开 `http://<服务器IP>:5173`，用 `admin / admin123` 登录，**登录后立即在右上角修改密码**。
+把输出的公钥贴到 GitHub 仓库 → Settings → Deploy keys → Add deploy key。
 
-## Debian 服务器更新
+> **开机自启**：systemd 用户服务默认要等该用户登录才启动。执行一次
+> `sudo loginctl enable-linger $(whoami)` 即可（或安装时加 `--with-linger`）。
 
-> 更新方式只有一种：在服务器上从 GitHub 拉取最新代码，然后重启服务。
-> 数据库表结构与字段变更由 `db.js` 在启动时自动迁移（`CREATE TABLE IF NOT EXISTS` + 字段补齐 + 一次性数据修正），**不需要手动执行 SQL**，也不会改动 `data/` 里的数据。
-
-### 一键更新（整段复制，粘贴到服务器终端回车）
-
-先 SSH 登录服务器，然后把下面**整段**命令复制粘贴进去执行：
+### 二、升级（一条命令）
 
 ```bash
-set -euo pipefail
-
-APP_DIR="$HOME/apps/stkj"
-SERVICE="stkj.service"
-
-# 0. 选择 Node：优先用服务正在使用的版本，找不到再自动查找
-NODE_BIN="$(systemctl --user show "$SERVICE" -p ExecStart --value 2>/dev/null \
-  | sed -n 's/.*path=\([^ ;]*\).*/\1/p' | head -n1 || true)"
-if [ ! -x "${NODE_BIN:-}" ]; then
-  for c in "$HOME"/apps/node-*/bin/node /usr/local/bin/node /usr/bin/node; do
-    [ -x "$c" ] && NODE_BIN="$c" && break
-  done
-fi
-[ -x "${NODE_BIN:-}" ] || { echo "找不到 node，请先安装 Node.js"; exit 1; }
-
-echo "==> 代码目录：$APP_DIR"
-echo "==> Node 版本：$("$NODE_BIN" -v)（$NODE_BIN）"
-
-cd "$APP_DIR"
-[ -d .git ] || { echo "$APP_DIR 不是 git 仓库，请按「安装」章节用 git clone 部署"; exit 1; }
-
-# 1. 备份数据库（更新不改 data/，这里只为回滚兜底）
-"$NODE_BIN" --no-warnings deploy/backup.cjs || echo "（备份失败，继续更新，请自行确认 data/app.db 是否可读）"
-
-# 2. 记录更新前版本，便于回滚
-BEFORE="$(git rev-parse --short HEAD)"
-echo "==> 更新前版本：$BEFORE $(git log -1 --pretty=%s)"
-
-# 3. 服务器上如果被手工改过，先收起改动，避免 pull 冲突
-if [ -n "$(git status --porcelain)" ]; then
-  echo "==> 检测到本地改动，先执行 git stash 收起"
-  git stash push -u -m "auto-stash before update $(date +%F-%H%M%S)"
-fi
-
-# 4. 从 GitHub 拉取（只允许快进，不产生合并提交）
-git pull --ff-only origin main
-
-# 5. 语法自检：不通过就不重启，避免服务起不来
-"$NODE_BIN" --check server.js
-"$NODE_BIN" --check db.js
-
-# 6. 重启服务并确认状态
-systemctl --user restart "$SERVICE"
-sleep 2
-systemctl --user is-active "$SERVICE"
-
-# 7. 验证首页与版本
-curl -s -o /dev/null -w "首页 HTTP %{http_code}\n" http://127.0.0.1:5173/ || true
-echo "==> 更新后版本：$(git rev-parse --short HEAD) $(git log -1 --pretty=%s)"
-echo "==> 更新完成，浏览器按 Ctrl+F5 强制刷新即可"
+bash ~/apps/stkj/deploy/stkj.sh upgrade
 ```
 
-看到 `active` 和 `首页 HTTP 200` 就表示更新成功。
+脚本自动完成：备份数据库 → 收起服务器上的本地改动（`git stash`）→ `git pull` 最新代码 → 语法检查 → **只有后端代码变了才重启**（纯前端改动会提示刷新即可）→ 自检。
 
-> 脚本可重复执行：没有新提交时 `git pull` 会提示 `Already up to date.`，其余步骤照常跑一遍，不会影响数据。
-> 如果第 3 步做过 `git stash`，可用 `git stash list` 查看；确认不再需要那些本地改动后，用 `git stash drop` 删掉即可。
+看到「升级完成」和「HTTP 200」即成功。数据库结构变更由 `db.js` 启动时自动迁移，不需要手动执行 SQL，也不会改动已有数据。
 
-### 更新后检查清单
+### 三、卸载
 
-- 浏览器 `Ctrl+F5` 强制刷新，确认页面能正常打开
-- 右上角账号菜单 → 数据是否完整（项目数 / 数据条数没有变化）
-- 本次若有新字段（例如「能耗」），在「项目数据」页应能看到新列，旧记录该列为空属正常
-- 备份文件已生成：`ls -lh ~/apps/stkj/backups/ | tail -5`
+```bash
+bash ~/apps/stkj/deploy/stkj.sh uninstall                    # 只摘服务，代码和数据都保留（可随时重装）
+bash ~/apps/stkj/deploy/stkj.sh uninstall --purge            # 连代码和数据一起删；删前自动备份数据库
+bash ~/apps/stkj/deploy/stkj.sh uninstall --purge-all        # 删除整个安装目录
+bash ~/apps/stkj/deploy/stkj.sh uninstall --purge --dry-run  # 先看看会做什么，不真删
+```
+
+- 加 `--yes` 跳过确认提示
+- `--purge` / `--purge-all` 会先把 `data/` 和 `backups/` 备份到 `~/apps/stkj-uninstall-backup-<时间戳>/`
+- Node.js 运行时（`~/apps/node-*`）不会被删，确认不用了可手动 `rm -rf ~/apps/node-*`
+
+### 四、查看状态
+
+```bash
+bash ~/apps/stkj/deploy/stkj.sh status
+```
+
+输出：代码版本、服务状态与开机自启、监听端口、首页 HTTP 码、项目/数据/账号数量、最近备份、备份份数、磁盘占用。
 
 ### 常见问题
 
-**1）`git pull` 报 `Not possible to fast-forward` 或 `diverged`**
+**1）`git clone` 报 `Permission denied (publickey)`**
 
-说明服务器上的代码被手工改过。确认不需要这些改动后，丢弃本地改动、强制对齐 GitHub（**只影响代码，不影响 `data/` 数据**）：
+服务器公钥没加到 GitHub，按上面「第一次安装前」第 2 步加 Deploy Key。
+
+**2）升级报 `Not possible to fast-forward` 或 `diverged`**
+
+服务器上的代码被手工改过。确认不需要这些改动后（**只影响代码，不动 `data/`**）：
 
 ```bash
 cd ~/apps/stkj
 git fetch origin
 git reset --hard origin/main
 systemctl --user restart stkj.service
-systemctl --user is-active stkj.service
 ```
 
-**2）`Permission denied (publickey)`**
-
-服务器上的 SSH key 没有加到 GitHub。把服务器公钥加为仓库的 Deploy Key（只读即可）：
+**3）服务起不来**
 
 ```bash
-cat ~/.ssh/id_ed25519.pub    # 没有这个文件就先执行 ssh-keygen -t ed25519 -C "stkj-server"
-```
-
-然后到 GitHub 仓库 → Settings → Deploy keys → Add deploy key，粘贴公钥，不要勾选写权限。
-
-**3）服务重启失败（`systemctl --user is-active` 不是 active）**
-
-```bash
+systemctl --user status stkj.service --no-pager
 journalctl --user -u stkj.service -n 100 --no-pager
+tail -n 50 ~/apps/stkj/logs/app.log
 ```
 
-根据日志修复后重新 `systemctl --user restart stkj.service`；若是新版本代码问题，按下面的「回滚」处理。
-
-### 回滚到上一个版本
-
-代码回滚（数据不动）：
+**4）想回退到上一个版本**
 
 ```bash
 cd ~/apps/stkj
-git log --oneline -10                 # 找到更新前的 commit
-git reset --hard <更新前的 commit>
+git log --oneline -10                 # 找到升级前的 commit
+git reset --hard <升级前的 commit>
 systemctl --user restart stkj.service
-systemctl --user is-active stkj.service
 ```
 
-如果新版本已经改过数据库结构、回滚后启动异常，再把数据库也回退（`data/` 里三个文件要一起换）：
+如果新版本已经改过数据库结构、回退后启动异常，再把数据库也退回去（`data/` 里三个文件要一起换）：
 
 ```bash
 systemctl --user stop stkj.service
@@ -557,77 +446,22 @@ cp ~/apps/stkj/backups/app-<时间戳>.db ~/apps/stkj/data/app.db
 systemctl --user start stkj.service
 ```
 
-### 附：Node.js 版本升级（非日常更新，按需执行）
+### 附：升级 Node.js 版本
 
 ```bash
-cd ~/apps
-NODE_VER=v22.23.3
-curl -fL -o node.tar.xz https://npmmirror.com/mirrors/node/$NODE_VER/node-$NODE_VER-linux-x64.tar.xz
-tar -xf node.tar.xz && rm -f node.tar.xz
-
-# 改两个单元文件里的 ExecStart 路径后重启
-sed -i "s|node-v22.22.2-linux-x64|node-$NODE_VER-linux-x64|g" ~/.config/systemd/user/stkj*.service
-systemctl --user daemon-reload
-systemctl --user restart stkj.service
+bash ~/apps/stkj/deploy/stkj.sh install --node-version=v22.23.3
 ```
 
-## Debian 服务器卸载
+会自动下载新版本、改写服务单元并重启；数据库不受影响。
 
-按需要选择三种粒度，**默认只摘服务、保留数据**。
-
-### 1. 仅移除服务（保留代码与数据库，可随时重装）
+### 附：手动查看服务与日志
 
 ```bash
-bash ~/apps/stkj/deploy/uninstall.sh
+systemctl --user status stkj.service --no-pager    # 服务状态
+ss -tlnp | grep 5173                               # 端口监听
+systemctl --user list-timers stkj-backup.timer     # 下次备份时间
+ls -lh ~/apps/stkj/backups | tail -5               # 最近的备份文件
 ```
-
-服务与定时器被移除，`~/apps/stkj` 原样保留。重装时直接跑 `install.sh` 即可继续用原有数据。
-
-### 2. 删除代码（数据和最近的备份单独存出）
-
-```bash
-bash ~/apps/stkj/deploy/uninstall.sh --purge
-```
-
-会先把 `data/` 和 `backups/` 复制到 `~/apps/stkj-uninstall-backup-<时间戳>/`，再删除 `data/` 与 `logs/`。
-
-### 3. 彻底删除（不可恢复）
-
-```bash
-bash ~/apps/stkj/deploy/uninstall.sh --purge-all
-```
-
-同样先备份到 `~/apps/stkj-uninstall-backup-<时间戳>/`，然后删除整个 `~/apps/stkj`。**确认备份文件已经拷走**，再手动删掉该备份目录。
-
-> 加 `--dry-run` 可先看脚本会做什么，不做任何修改。
-
-### 手动卸载步骤
-
-```bash
-# 1. 停服并禁用
-systemctl --user stop stkj.service stkj-backup.timer
-systemctl --user disable stkj.service stkj-backup.timer
-
-# 2. 删除单元文件
-rm -f ~/.config/systemd/user/stkj.service \
-      ~/.config/systemd/user/stkj-backup.service \
-      ~/.config/systemd/user/stkj-backup.timer
-systemctl --user daemon-reload
-systemctl --user reset-failed
-
-# 3.（可选）备份并删除数据
-cp -a ~/apps/stkj/data ~/stkj-data-backup
-rm -rf ~/apps/stkj
-
-# 4.（可选）删除 Node.js 运行时
-rm -rf ~/apps/node-*
-
-# 5.（可选）关闭 linger
-sudo loginctl disable-linger usrsktj
-```
-
-卸载脚本**不会**删除 Node.js 运行时（`~/apps/node-*`），因为可能还有其他应用在用，需要时手动删（上面的第 4 步）。
-
 
 ## 已知限制
 

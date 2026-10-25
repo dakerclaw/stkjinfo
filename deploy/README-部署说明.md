@@ -10,7 +10,8 @@
 | `~/apps/stkj` | 代码目录（可通过 `--dir` 改） | `$HOME/apps/stkj` |
 | `~/apps/node-*` | Node.js 运行时目录 | `$HOME/apps/node-v22.23.3-linux-x64` |
 
-> 逐步的安装 / 更新 / 卸载命令见根目录 `README.md` 的「Debian 服务器部署 / 更新 / 卸载」三节。
+> 逐步的安装 / 升级 / 卸载命令见根目录 `README.md` 的「Debian 服务器部署（安装 / 升级 / 卸载）」。
+> 日常操作只需要一条命令：`bash ~/apps/stkj/deploy/stkj.sh install|upgrade|uninstall|status`。
 > 本文档侧重**部署形态、目录约定、运维与故障排查**，补充 README 未展开的部分。
 
 ---
@@ -235,9 +236,10 @@ journalctl --user -u stkj.service -n 100 --no-pager
 
 | 文件 | 用途 |
 |---|---|
-| `install.sh` | 全新安装：下载 Node.js → 铺代码 → 建库 → 装服务与备份定时器 |
-| `apply-update.sh` | 一键更新：备份代码 → 停服 → 覆盖 → 语法检查 → 启服；加 `--git` 可直接从仓库拉取 |
-| `uninstall.sh` | 卸载：默认只摘服务；`--purge` / `--purge-all` 逐级删数据 |
+| `stkj.sh` | **一键脚本（推荐）**：`install` / `upgrade` / `uninstall` / `status`，参数见 `bash stkj.sh help` |
+| `install.sh` | 兼容旧入口，等价于 `stkj.sh install` |
+| `apply-update.sh` | 旧版 tar 覆盖更新脚本（已被 `stkj.sh upgrade` 取代，保留备查） |
+| `uninstall.sh` | 兼容旧入口，等价于 `stkj.sh uninstall` |
 | `backup.cjs` | 数据库在线备份（`VACUUM INTO`，`--keep N` 控制保留份数） |
 | `stkj.service` | systemd **用户**服务单元模板（`%h` 会自动替换为家目录） |
 | `stkj-backup.service` / `.timer` | 每日 03:00 自动备份 |
@@ -245,4 +247,4 @@ journalctl --user -u stkj.service -n 100 --no-pager
 | `clear-data.cjs` | 清空业务数据（保留账号与项目档案） |
 | `README-部署说明.md` | 本文件 |
 
-单元模板中的 `%h` 由 systemd 自动展开为当前用户家目录；`install.sh` 在安装时会把它替换成实际路径并写入 `~/.config/systemd/user/`。
+单元模板中的 `%h` 由 systemd 自动展开为当前用户家目录；`stkj.sh install` 在安装时会把它替换成实际路径并写入 `~/.config/systemd/user/`。

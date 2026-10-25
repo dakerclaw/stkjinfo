@@ -3,6 +3,8 @@ Description=stkj 数据库每日备份
 
 [Service]
 Type=oneshot
-ExecStart=%h/apps/node/bin/node --no-warnings %h/apps/stkj/deploy/backup.cjs
+ExecStart=%h/apps/node/bin/node --no-warnings %h/apps/stkj%code_path%/deploy/backup.cjs
+Environment=DB_FILE=%h/apps/stkj/data/app.db
+Environment=BACKUP_DIR=%h/apps/stkj/backups
 StandardOutput=append:%h/apps/stkj/logs/backup.log
 StandardError=append:%h/apps/stkj/logs/backup.log

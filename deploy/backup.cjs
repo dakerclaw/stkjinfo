@@ -32,7 +32,11 @@ if (!fs.existsSync(DB_FILE)) {
 fs.mkdirSync(BACKUP_DIR, { recursive: true });
 
 const stamp = new Date().toISOString().replace(/[T:]/g, '-').slice(0, 19);
-const target = path.join(BACKUP_DIR, `app-${stamp}.db`);
+let target = path.join(BACKUP_DIR, `app-${stamp}.db`);
+// 同一秒内多次备份（例如连续升级）时加序号，避免 VACUUM INTO 因文件已存在而失败
+for (let i = 2; fs.existsSync(target); i++) {
+  target = path.join(BACKUP_DIR, `app-${stamp}-${i}.db`);
+}
 
 const t0 = Date.now();
 const src = new DatabaseSync(DB_FILE, { readOnly: true });
@@ -48,7 +52,7 @@ if (size < 4096) {
 /* 只保留最近 KEEP 份 */
 const files = fs
   .readdirSync(BACKUP_DIR)
-  .filter((f) => /^app-\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}\.db$/.test(f))
+  .filter((f) => /^app-\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}(-\d+)?\.db$/.test(f))
   .sort()
   .reverse();
 const removed = [];
