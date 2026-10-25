@@ -104,6 +104,7 @@ function makeRow(pno, pcode, i) {
     hgi: rnd(55, 80),
     efficiency: rnd(92, 98.5),
     yield_rate: rnd(86, 96),
+    energy: rnd(3200, 5600, 1),
     quantity: rnd(12, 180, 1),
     entry_date: date,
     remark: i % 5 === 0 ? '抽检复测，数据正常' : null,

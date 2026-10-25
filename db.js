@@ -120,6 +120,7 @@ CREATE TABLE IF NOT EXISTS project_data (
   hgi           REAL,                                 -- 哈氏可磨指数
   efficiency    REAL,                                 -- 效率
   yield_rate    REAL,                                 -- 收率
+  energy        REAL,                                 -- 能耗
   quantity      REAL,                                 -- 生产数量
   remark        TEXT,                                 -- 备注
   entry_date    TEXT,                                 -- 录入日期
@@ -152,6 +153,7 @@ ensureColumn('project_data', 'created_by', 'TEXT');
 ensureColumn('project_data', 'created_by_id', 'INTEGER');
 ensureColumn('project_data', 'updated_by', 'TEXT');
 ensureColumn('project_data', 'coke_type', 'TEXT');
+ensureColumn('project_data', 'energy', 'REAL'); // 能耗：加在收率与生产数量之间（显示顺序由 FIELDS 决定）
 // 软删除：删除仅打标记，30 天内可在回收站恢复，超期由服务端定时物理清理
 ensureColumn('projects', 'deleted_at', 'TEXT');
 ensureColumn('project_data', 'deleted_at', 'TEXT');
@@ -226,6 +228,7 @@ const FIELDS = [
   { key: 'hgi',            label: '哈氏可磨指数', type: 'number' },
   { key: 'efficiency',     label: '效率',       type: 'number' },
   { key: 'yield_rate',     label: '收率',       type: 'number' },
+  { key: 'energy',         label: '能耗',       type: 'number' },
   { key: 'quantity',       label: '生产数量',   type: 'number' },
   { key: 'remark',         label: '备注',       type: 'text' },
   { key: 'entry_date',     label: '录入日期',   type: 'date' },

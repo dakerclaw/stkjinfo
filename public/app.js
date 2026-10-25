@@ -907,7 +907,7 @@ function openDataModal(id, opts = {}) {
       { title: '电化学性能', keys: ['capacity', 'lithium_inter', 'lithium_deint', 'first_eff'] },
       { title: '粉压 (5点法)', keys: ['press_0_5t', 'press_1t', 'press_1_5t', 'press_2t', 'press_5t'] },
       { title: '工业分析', keys: ['moisture_fp', 'ash', 'volatile', 'moisture', 'sulfur', 'caking_index', 'coking_value'] },
-      { title: '生产信息', keys: ['efficiency', 'yield_rate', 'quantity', 'entry_date', 'remark'] },
+      { title: '生产信息', keys: ['efficiency', 'yield_rate', 'energy', 'quantity', 'entry_date', 'remark'] },
     ];
     const fieldMap = new Map(F().map((f) => [f.key, f]));
     const used = new Set(groups.flatMap((g) => g.keys));
@@ -1366,7 +1366,7 @@ function openTemplatePicker() {
     { title: '电化学', keys: ['capacity', 'lithium_inter', 'lithium_deint', 'first_eff'] },
     { title: '粉压', keys: ['press_0_5t', 'press_1t', 'press_1_5t', 'press_2t', 'press_5t'] },
     { title: '工业分析', keys: ['moisture_fp', 'ash', 'volatile', 'moisture', 'sulfur', 'caking_index', 'coking_value'] },
-    { title: '生产', keys: ['efficiency', 'yield_rate', 'quantity', 'entry_date', 'remark'] },
+    { title: '生产', keys: ['efficiency', 'yield_rate', 'energy', 'quantity', 'entry_date', 'remark'] },
   ];
   const fm = new Map(F().map((f) => [f.key, f]));
   const required = new Set(['project_no', 'product_code']);
