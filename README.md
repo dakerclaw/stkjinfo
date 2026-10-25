@@ -319,6 +319,9 @@ data/app.db          SQLite 数据库（本机默认 ./data；部署时用 DATA_
 所有操作由一个脚本完成：`deploy/stkj.sh`，四个子命令 `install`、`upgrade`、`uninstall`、`status`。
 全程**无需 root**：Node.js 装在用户目录，服务以 systemd **用户服务**运行，代码、数据库、备份都在 `~/apps/stkj` 下。
 
+> **更新只走 GitHub**：服务器上的代码不要用 scp / tar 直接覆盖，否则 git 工作区会变脏，`upgrade` 会拉取失败。
+> 所有改动先推送到 GitHub，再到服务器执行 `bash ~/apps/stkj/deploy/stkj.sh upgrade`。
+
 以下命令都用**普通用户**（示例 `mac`）SSH 登录服务器后执行，`~` 指该用户家目录。
 
 ### 一、安装（一条命令）
