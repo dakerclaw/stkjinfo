@@ -432,52 +432,123 @@ systemctl --user list-timers stkj-backup.timer
 
 ## Debian 服务器更新
 
-### 方式一：git pull + 重启（最简单）
+> 更新方式只有一种：在服务器上从 GitHub 拉取最新代码，然后重启服务。
+> 数据库表结构与字段变更由 `db.js` 在启动时自动迁移（`CREATE TABLE IF NOT EXISTS` + 字段补齐 + 一次性数据修正），**不需要手动执行 SQL**，也不会改动 `data/` 里的数据。
+
+### 一键更新（整段复制，粘贴到服务器终端回车）
+
+先 SSH 登录服务器，然后把下面**整段**命令复制粘贴进去执行：
+
+```bash
+set -euo pipefail
+
+APP_DIR="$HOME/apps/stkj"
+SERVICE="stkj.service"
+
+# 0. 选择 Node：优先用服务正在使用的版本，找不到再自动查找
+NODE_BIN="$(systemctl --user show "$SERVICE" -p ExecStart --value 2>/dev/null \
+  | sed -n 's/.*path=\([^ ;]*\).*/\1/p' | head -n1 || true)"
+if [ ! -x "${NODE_BIN:-}" ]; then
+  for c in "$HOME"/apps/node-*/bin/node /usr/local/bin/node /usr/bin/node; do
+    [ -x "$c" ] && NODE_BIN="$c" && break
+  done
+fi
+[ -x "${NODE_BIN:-}" ] || { echo "找不到 node，请先安装 Node.js"; exit 1; }
+
+echo "==> 代码目录：$APP_DIR"
+echo "==> Node 版本：$("$NODE_BIN" -v)（$NODE_BIN）"
+
+cd "$APP_DIR"
+[ -d .git ] || { echo "$APP_DIR 不是 git 仓库，请按「安装」章节用 git clone 部署"; exit 1; }
+
+# 1. 备份数据库（更新不改 data/，这里只为回滚兜底）
+"$NODE_BIN" --no-warnings deploy/backup.cjs || echo "（备份失败，继续更新，请自行确认 data/app.db 是否可读）"
+
+# 2. 记录更新前版本，便于回滚
+BEFORE="$(git rev-parse --short HEAD)"
+echo "==> 更新前版本：$BEFORE $(git log -1 --pretty=%s)"
+
+# 3. 服务器上如果被手工改过，先收起改动，避免 pull 冲突
+if [ -n "$(git status --porcelain)" ]; then
+  echo "==> 检测到本地改动，先执行 git stash 收起"
+  git stash push -u -m "auto-stash before update $(date +%F-%H%M%S)"
+fi
+
+# 4. 从 GitHub 拉取（只允许快进，不产生合并提交）
+git pull --ff-only origin main
+
+# 5. 语法自检：不通过就不重启，避免服务起不来
+"$NODE_BIN" --check server.js
+"$NODE_BIN" --check db.js
+
+# 6. 重启服务并确认状态
+systemctl --user restart "$SERVICE"
+sleep 2
+systemctl --user is-active "$SERVICE"
+
+# 7. 验证首页与版本
+curl -s -o /dev/null -w "首页 HTTP %{http_code}\n" http://127.0.0.1:5173/ || true
+echo "==> 更新后版本：$(git rev-parse --short HEAD) $(git log -1 --pretty=%s)"
+echo "==> 更新完成，浏览器按 Ctrl+F5 强制刷新即可"
+```
+
+看到 `active` 和 `首页 HTTP 200` 就表示更新成功。
+
+> 脚本可重复执行：没有新提交时 `git pull` 会提示 `Already up to date.`，其余步骤照常跑一遍，不会影响数据。
+> 如果第 3 步做过 `git stash`，可用 `git stash list` 查看；确认不再需要那些本地改动后，用 `git stash drop` 删掉即可。
+
+### 更新后检查清单
+
+- 浏览器 `Ctrl+F5` 强制刷新，确认页面能正常打开
+- 右上角账号菜单 → 数据是否完整（项目数 / 数据条数没有变化）
+- 本次若有新字段（例如「能耗」），在「项目数据」页应能看到新列，旧记录该列为空属正常
+- 备份文件已生成：`ls -lh ~/apps/stkj/backups/ | tail -5`
+
+### 常见问题
+
+**1）`git pull` 报 `Not possible to fast-forward` 或 `diverged`**
+
+说明服务器上的代码被手工改过。确认不需要这些改动后，丢弃本地改动、强制对齐 GitHub（**只影响代码，不影响 `data/` 数据**）：
 
 ```bash
 cd ~/apps/stkj
-git pull --ff-only
-~/apps/node-v22.23.3-linux-x64/bin/node --check server.js    # 语法自检
+git fetch origin
+git reset --hard origin/main
 systemctl --user restart stkj.service
 systemctl --user is-active stkj.service
 ```
 
-> 数据库表结构与字段变更由 `db.js` 在启动时自动迁移（`CREATE TABLE IF NOT EXISTS` + 字段补齐 + 一次性数据修正），**不需要手动执行 SQL**。
+**2）`Permission denied (publickey)`**
 
-### 方式二：用更新脚本（自动备份当前代码再覆盖）
+服务器上的 SSH key 没有加到 GitHub。把服务器公钥加为仓库的 Deploy Key（只读即可）：
 
 ```bash
-# 开发机打包并上传
-cd /path/to/stkj
-tar czf stkj-update.tar.gz --exclude=data --exclude=node_modules --exclude='*.db*' \
-    server.js db.js xlsx.js import-map.js seed.js package.json public deploy README.md
-scp stkj-update.tar.gz usrsktj@<服务器IP>:~/
-
-# 服务器上执行：备份 → 停服 → 覆盖 → 语法检查 → 启服
-bash ~/apps/stkj/deploy/apply-update.sh ~/stkj-update.tar.gz
+cat ~/.ssh/id_ed25519.pub    # 没有这个文件就先执行 ssh-keygen -t ed25519 -C "stkj-server"
 ```
 
-脚本会把旧代码备份到 `~/apps/backups/code-<时间戳>.tar.gz`，**不会改动 `data/` 数据库**。
+然后到 GitHub 仓库 → Settings → Deploy keys → Add deploy key，粘贴公钥，不要勾选写权限。
 
-### 更新前请务必备份
-
-更新脚本只备份**代码**，不备份数据。执行更新前建议手动备份一次数据库：
+**3）服务重启失败（`systemctl --user is-active` 不是 active）**
 
 ```bash
-~/apps/node-v22.23.3-linux-x64/bin/node --no-warnings ~/apps/stkj/deploy/backup.cjs
-# 生成 ~/apps/stkj/backups/app-<UTC时间>.db
+journalctl --user -u stkj.service -n 100 --no-pager
 ```
 
-### 回滚
+根据日志修复后重新 `systemctl --user restart stkj.service`；若是新版本代码问题，按下面的「回滚」处理。
+
+### 回滚到上一个版本
+
+代码回滚（数据不动）：
 
 ```bash
-systemctl --user stop stkj.service
 cd ~/apps/stkj
-tar -xzf ~/apps/backups/code-<时间戳>.tar.gz -C ~/apps/stkj
-systemctl --user start stkj.service
+git log --oneline -10                 # 找到更新前的 commit
+git reset --hard <更新前的 commit>
+systemctl --user restart stkj.service
+systemctl --user is-active stkj.service
 ```
 
-如果新版本已经改过数据结构、回滚后启动异常，再把数据库也回退（`data/` 里三个文件要一起换）：
+如果新版本已经改过数据库结构、回滚后启动异常，再把数据库也回退（`data/` 里三个文件要一起换）：
 
 ```bash
 systemctl --user stop stkj.service
@@ -486,15 +557,16 @@ cp ~/apps/stkj/backups/app-<时间戳>.db ~/apps/stkj/data/app.db
 systemctl --user start stkj.service
 ```
 
-### 升级 Node.js
+### 附：Node.js 版本升级（非日常更新，按需执行）
 
 ```bash
 cd ~/apps
-curl -fL -o node.tar.xz https://npmmirror.com/mirrors/node/v22.23.3/node-v22.23.3-linux-x64.tar.xz
+NODE_VER=v22.23.3
+curl -fL -o node.tar.xz https://npmmirror.com/mirrors/node/$NODE_VER/node-$NODE_VER-linux-x64.tar.xz
 tar -xf node.tar.xz && rm -f node.tar.xz
 
 # 改两个单元文件里的 ExecStart 路径后重启
-sed -i 's|node-v22.22.2-linux-x64|node-v22.23.3-linux-x64|g' ~/.config/systemd/user/stkj*.service
+sed -i "s|node-v22.22.2-linux-x64|node-$NODE_VER-linux-x64|g" ~/.config/systemd/user/stkj*.service
 systemctl --user daemon-reload
 systemctl --user restart stkj.service
 ```
