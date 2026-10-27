@@ -136,6 +136,8 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
 }
 .card-head h3 { margin: 0; font-size: 14px; font-weight: 620; }
 .card-head .sub { font-size: 12px; color: var(--text-3); margin-left: 8px; font-weight: 400; }
+/* 卡片头里的按钮（28px）比标题行高（22px）高，用负边距抵消，保证同一行卡片头等高 */
+.card-head .btn-sm { margin: -6px 0; }
 .card-body { padding: 16px 18px; }
 
 /* 统计卡片 */
@@ -275,11 +277,30 @@ th.col-sticky { z-index: 3; background: var(--surface-2); }
 
 /* 进度条（分布统计） */
 .bar-list { display: flex; flex-direction: column; gap: 12px; }
-.bar-item .bar-label { display: flex; justify-content: space-between; font-size: 12.5px; margin-bottom: 5px; color: var(--text-2); }
+.bar-item .bar-label { display: flex; justify-content: space-between; font-size: 12.5px; line-height: 18px; margin-bottom: 5px; color: var(--text-2); }
 .bar-item .bar-label b { color: var(--text); font-weight: 600; }
 .bar-track { height: 7px; border-radius: 4px; background: #eef2f8; overflow: hidden; }
 .bar-fill { height: 100%; border-radius: 4px; background: linear-gradient(90deg, #4f8bff, #2563eb); transition: width .4s ease; }
 .bar-fill.muted { background: linear-gradient(90deg, #cbd5e1, #94a3b8); }
+
+/* 分布列表固定行高：一行 = 18(标签) + 5(间距) + 7(进度条) = 30px，行间距 12px */
+.bar-item { flex: 0 0 auto; }
+.bar-list.rows-3 { height: 114px; overflow-y: auto; }   /* 固定 3 行 */
+.bar-list.rows-10 { height: 408px; overflow-y: auto; }  /* 固定 10 行 */
+.bar-list.rows-3::-webkit-scrollbar, .bar-list.rows-10::-webkit-scrollbar { width: 6px; }
+.bar-list.rows-3::-webkit-scrollbar-thumb, .bar-list.rows-10::-webkit-scrollbar-thumb { background: #d7deea; border-radius: 3px; }
+
+/* 总览「最近录入」：与 10 行分布卡片等高 */
+.recent-list { height: 408px; overflow-y: auto; }
+.recent-list::-webkit-scrollbar { width: 6px; }
+.recent-list::-webkit-scrollbar-thumb { background: #d7deea; border-radius: 3px; }
+.recent-list .recent-item { flex: 0 0 auto; }
+/* 卡片变窄（总览里占 1/3 栏）时保持单行：工单号超出用省略号，右侧日期/数量不压缩 */
+.recent-main { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; gap: 6px; overflow: hidden; }
+.recent-main > * { flex: 0 0 auto; white-space: nowrap; }
+.recent-main > .recent-wo { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.recent-code { font-weight: 550; }
+.recent-side { flex: 0 0 auto; white-space: nowrap; }
 
 /* ---------------------------------------------------------- 弹窗 */
 .modal-root { position: fixed; inset: 0; display: none; z-index: 100; }

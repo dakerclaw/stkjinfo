@@ -1747,7 +1747,7 @@ function getStats(res, user) {
     { name: '已归档', value: statusMap.get(0) || 0, status: 0 },
   ];
   const recent = db
-    .prepare(`SELECT id, project_no, product_code, work_order, entry_date, quantity FROM project_data${w} ORDER BY id DESC LIMIT 8`)
+    .prepare(`SELECT id, project_no, product_code, work_order, entry_date, quantity FROM project_data${w} ORDER BY id DESC LIMIT 10`)
     .all(...args);
   ok(res, { stats: { projectCount, dataCount, typeCount, baseCount, qtySum, byType, byProduct, byDate, byStatus, recent } });
 }

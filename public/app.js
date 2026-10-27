@@ -188,30 +188,19 @@ async function renderDashboard() {
     <div class="stat-grid">
       ${statCard('项目总数', stats.projectCount, '个', '项目库中登记的项目')}
       ${statCard('项目数据记录', stats.dataCount, '条', '所有检测/生产数据')}
-      ${statCard('项目类型', stats.typeCount, '类', '已覆盖的项目类型')}
       ${statCard('累计生产数量', stats.qtySum.toLocaleString('zh-CN', { maximumFractionDigits: 2 }), '', `覆盖 ${stats.baseCount} 家所属公司`)}
     </div>
     <div class="grid-2">
       <div class="card">
-        <div class="card-head"><h3>最近录入的数据</h3><button class="btn btn-sm btn-ghost" onclick="navigate('data')">查看全部 →</button></div>
-        <div class="card-body" style="padding-top:6px;padding-bottom:6px">
-          ${stats.recent.length
-            ? stats.recent.map((r) => `
-              <div class="recent-item">
-                <div>
-                  <span class="code-chip">${esc(r.project_no)}</span>
-                  <span style="margin-left:8px;font-weight:550">${esc(r.product_code)}</span>
-                  ${r.work_order ? `<span class="meta" style="margin-left:8px">工单 ${esc(r.work_order)}</span>` : ''}
-                </div>
-                <div class="meta">${esc(r.entry_date || '')} · ${fmtNum(r.quantity)}</div>
-              </div>`).join('')
-            : `<div class="empty" style="padding:32px"><p>暂无数据记录</p><span>前往「项目数据」新增第一条记录</span></div>`}
+        <div class="card-head"><h3>项目状态分布</h3></div>
+        <div class="card-body">
+          <div class="bar-list rows-3">${stats.byStatus.map((r) => barItem(r.name, r.value, maxStatus, r.status === 1 ? '' : 'muted')).join('')}</div>
         </div>
       </div>
       <div class="card">
         <div class="card-head"><h3>项目类型分布</h3></div>
         <div class="card-body">
-          ${stats.byType.length ? `<div class="bar-list">${stats.byType.map((r) => barItem(r.name, r.value, maxType)).join('')}</div>`
+          ${stats.byType.length ? `<div class="bar-list rows-3">${stats.byType.map((r) => barItem(r.name, r.value, maxType)).join('')}</div>`
             : `<div class="empty" style="padding:24px"><p>暂无项目</p></div>`}
         </div>
       </div>
@@ -220,21 +209,33 @@ async function renderDashboard() {
       <div class="card">
         <div class="card-head"><h3>产品代码数据分布</h3></div>
         <div class="card-body">
-          ${stats.byProduct.length ? `<div class="bar-list">${stats.byProduct.map((r) => barItem(r.name, r.value, maxProduct)).join('')}</div>`
+          ${stats.byProduct.length ? `<div class="bar-list rows-10">${stats.byProduct.map((r) => barItem(r.name, r.value, maxProduct)).join('')}</div>`
             : `<div class="empty" style="padding:24px"><p>暂无数据记录</p></div>`}
         </div>
       </div>
       <div class="card">
         <div class="card-head"><h3>统计日期数据分布</h3>${stats.byDate.length > dates.length ? `<span class="meta">近 ${dates.length} 个日期</span>` : ''}</div>
         <div class="card-body">
-          ${dates.length ? `<div class="bar-list">${dates.map((r) => barItem(r.name, r.value, maxDate)).join('')}</div>`
+          ${dates.length ? `<div class="bar-list rows-10">${dates.map((r) => barItem(r.name, r.value, maxDate)).join('')}</div>`
             : `<div class="empty" style="padding:24px"><p>暂无数据记录</p></div>`}
         </div>
       </div>
       <div class="card">
-        <div class="card-head"><h3>项目状态分布</h3></div>
+        <div class="card-head"><h3>最近录入的数据</h3><button class="btn btn-sm btn-ghost" onclick="navigate('data')">查看全部 →</button></div>
         <div class="card-body">
-          <div class="bar-list">${stats.byStatus.map((r) => barItem(r.name, r.value, maxStatus, r.status === 1 ? '' : 'muted')).join('')}</div>
+          ${stats.recent.length
+            ? `<div class="recent-list rows-10">
+              ${stats.recent.map((r) => `
+                <div class="recent-item">
+                  <div class="recent-main">
+                    <span class="code-chip">${esc(r.project_no)}</span>
+                    <span class="recent-code">${esc(r.product_code)}</span>
+                    ${r.work_order ? `<span class="meta recent-wo">工单 ${esc(r.work_order)}</span>` : ''}
+                  </div>
+                  <div class="meta recent-side">${esc(r.entry_date || '')} · ${fmtNum(r.quantity)}</div>
+                </div>`).join('')}
+            </div>`
+            : `<div class="empty" style="padding:32px"><p>暂无数据记录</p><span>前往「项目数据」新增第一条记录</span></div>`}
         </div>
       </div>
     </div>`;
