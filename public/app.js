@@ -127,16 +127,30 @@ const VIEWS = {
 function navigate(view) {
   // 元数据还没就绪（例如会话失效后刷新）时不渲染，避免读空 meta 报错
   if (!state.meta) return;
+  const def = VIEWS[view];
+  // 浏览器 / CDN 缓存了旧版 app.js 时，新页面里的新导航会点不开：给出明确提示而不是静默失败
+  if (!def) {
+    state.view = view;
+    el('#viewTitle').textContent = '页面需要刷新';
+    el('#viewSub').textContent = '当前前端脚本是旧版本';
+    actions().innerHTML = '';
+    content().innerHTML = `<div class="card"><div class="card-body" style="text-align:center;padding:40px 0">
+      <p style="margin:0 0 6px;color:var(--danger);font-weight:600">当前页面使用的是旧版前端脚本</p>
+      <p style="margin:0 0 14px;color:var(--text-3);font-size:13px">系统刚更新过，浏览器或 CDN 还留着旧文件，刷新一次即可</p>
+      <button class="btn btn-primary" onclick="location.reload()">刷新页面</button>
+    </div></div>`;
+    return;
+  }
   state.view = view;
   // 数据页改为「只有表格内部滚动」，避免整页再出现一条滚动条
   content().classList.toggle('fit', view === 'data');
   document.querySelectorAll('.nav-item').forEach((n) => n.classList.toggle('active', n.dataset.view === view));
-  el('#viewTitle').textContent = VIEWS[view].title;
-  el('#viewSub').textContent = VIEWS[view].sub;
+  el('#viewTitle').textContent = def.title;
+  el('#viewSub').textContent = def.sub;
   actions().innerHTML = '';
   // 各视图的 render 都是 async：统一兜住异常，避免接口失败后页面停在骨架屏
   try {
-    const r = VIEWS[view].render();
+    const r = def.render();
     if (r && typeof r.catch === 'function') r.catch(showViewError);
   } catch (e) {
     showViewError(e);

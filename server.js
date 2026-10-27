@@ -943,9 +943,35 @@ function sendStaticEntry(req, res, entry) {
   res.end(req.method === 'HEAD' ? undefined : body);
 }
 
+const INDEX_FILE = path.join(PUBLIC_DIR, 'index.html');
+
+/**
+ * 静态资源版本号：由 app.js / styles.css 的体积与 mtime 算出。
+ * index.html 是 no-cache，每次都会取最新；它引用的资源带上 ?v=<版本>，
+ * 这样即使 CDN（Cloudflare 默认会把 .js/.css 缓存 4 小时）或浏览器还留着旧文件，
+ * 新页面也会引用一个新 URL，升级后立即生效。
+ */
+function assetVersion() {
+  const h = crypto.createHash('sha1');
+  for (const f of ['app.js', 'styles.css']) {
+    try {
+      const st = fs.statSync(path.join(PUBLIC_DIR, f));
+      h.update(`${f}:${st.size}:${Math.floor(st.mtimeMs)}`);
+    } catch { /* 文件缺失时忽略 */ }
+  }
+  return h.digest('hex').slice(0, 10);
+}
+const ASSET_VERSION = assetVersion();
+
+function injectAssetVersion(html) {
+  return String(html)
+    .replace(/(href="\/styles\.css)(\?[^"]*)?(")/g, `$1?v=${ASSET_VERSION}$3`)
+    .replace(/(src="\/app\.js)(\?[^"]*)?(")/g, `$1?v=${ASSET_VERSION}$3`);
+}
+
 /** SPA 回退：未知路径统一返回 index.html */
 function serveIndex(req, res) {
-  const filePath = path.join(PUBLIC_DIR, 'index.html');
+  const filePath = INDEX_FILE;
   fs.stat(filePath, (err, stat) => {
     if (err || !stat.isFile()) return fail(res, 404, '页面不存在');
     const cached = staticCache.get(filePath);
@@ -954,7 +980,8 @@ function serveIndex(req, res) {
     }
     fs.readFile(filePath, (e2, html) => {
       if (e2) return fail(res, 404, '页面不存在');
-      sendStaticEntry(req, res, buildStaticEntry(filePath, html, stat));
+      const body = Buffer.from(injectAssetVersion(html.toString('utf8')), 'utf8');
+      sendStaticEntry(req, res, buildStaticEntry(filePath, body, stat));
     });
   });
 }
@@ -981,7 +1008,8 @@ function serveStatic(req, res, pathname) {
     }
     fs.readFile(filePath, (e2, data) => {
       if (e2) return serveIndex(req, res);
-      sendStaticEntry(req, res, buildStaticEntry(filePath, data, stat));
+      const body = filePath === INDEX_FILE ? Buffer.from(injectAssetVersion(data.toString('utf8')), 'utf8') : data;
+      sendStaticEntry(req, res, buildStaticEntry(filePath, body, stat));
     });
   });
 }
