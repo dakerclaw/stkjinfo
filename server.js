@@ -8,7 +8,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const zlib = require('node:zlib');
-const { db, DB_FILE, FIELDS } = require('./db');
+const { db, DB_FILE, DATA_DIR, FIELDS } = require('./db');
+const { DatabaseSync } = require('node:sqlite');
 const xlsx = require('./xlsx');
 const { normHeader, buildHeaderMap, isBlank, USER_IMPORT_FIELDS } = require('./import-map');
 
@@ -1053,6 +1054,7 @@ function getMeta(res, user) {
       canManageUsers: admin,
       canManageAdmins: isSysAdmin(user),
       canViewAudit: isSysAdmin(user),
+      canManageDatabase: isSysAdmin(user),
       seeAllData: admin,
     },
   };
@@ -1732,13 +1734,15 @@ function listAuditLogs(res, params, user) {
   const args = [];
   const entity = (params.get('entity') || '').trim();
   if (entity) {
-    if (!['project', 'data', 'user'].includes(entity)) return fail(res, 400, 'entity 仅支持 project / data / user');
+    if (!['project', 'data', 'user', 'database'].includes(entity)) {
+      return fail(res, 400, 'entity 仅支持 project / data / user / database');
+    }
     where.push('entity = ?');
     args.push(entity);
   }
   const action = (params.get('action') || '').trim();
   if (action) {
-    const allowed = ['create', 'update', 'soft_delete', 'restore', 'purge', 'import', 'status'];
+    const allowed = ['create', 'update', 'soft_delete', 'restore', 'purge', 'import', 'status', 'export', 'backup'];
     if (!allowed.includes(action)) return fail(res, 400, 'action 参数不合法');
     where.push('action = ?');
     args.push(action);
@@ -1772,6 +1776,384 @@ function listAuditLogs(res, params, user) {
               FROM audit_logs${w} ORDER BY id DESC LIMIT ? OFFSET ?`)
     .all(...args, pageSize, (page - 1) * pageSize);
   ok(res, { rows, total, page, pageSize, keepDays: 180 });
+}
+
+/* ============================================================ 数据库维护（仅系统管理员） */
+/**
+ * 导出：VACUUM INTO 生成一致性快照，不锁库、不中断服务。
+ * 备份：写入 <应用目录>/backups/app-<时间>.db，与 deploy/backup.cjs 命名一致，共用 14 份轮转。
+ * 导入：不替换数据库文件、不重启服务；逐表按列名交集复制，事务提交，导入前自动备份。
+ */
+
+const BACKUP_DIR = process.env.BACKUP_DIR
+  ? path.resolve(process.env.BACKUP_DIR)
+  : path.join(path.dirname(DATA_DIR), 'backups');
+const DB_TMP_DIR = path.join(DATA_DIR, '.tmp');
+const BACKUP_KEEP = Math.max(1, Number(process.env.BACKUP_KEEP || 14));
+const MAX_DB_IMPORT_BYTES = 20 * 1024 * 1024;
+const DB_TABLES = ['users', 'projects', 'project_data', 'audit_logs'];
+const BACKUP_NAME_RE = /^app-\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}(-\d+)?\.db$/;
+const DB_IMPORT_TTL = 30 * 60 * 1000;
+
+function ensureDir(p) {
+  if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
+}
+
+/** 与 deploy/backup.cjs 一致：UTC 时间，冒号换成短横线 */
+function dbStamp(d = new Date()) {
+  return d.toISOString().replace(/[T:]/g, '-').slice(0, 19);
+}
+function localStamp(d = new Date()) {
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+/** 生成一份一致性快照（SQLite 原生 VACUUM INTO） */
+function vacuumInto(target) {
+  db.exec(`VACUUM INTO '${String(target).replace(/'/g, "''")}'`);
+}
+
+function uniqueBackupPath() {
+  ensureDir(BACKUP_DIR);
+  const stamp = dbStamp();
+  let target = path.join(BACKUP_DIR, `app-${stamp}.db`);
+  for (let i = 2; fs.existsSync(target); i++) {
+    target = path.join(BACKUP_DIR, `app-${stamp}-${i}.db`);
+  }
+  return target;
+}
+
+function listBackups() {
+  ensureDir(BACKUP_DIR);
+  return fs
+    .readdirSync(BACKUP_DIR)
+    .filter((f) => BACKUP_NAME_RE.test(f))
+    .sort()
+    .reverse()
+    .map((name) => {
+      const st = fs.statSync(path.join(BACKUP_DIR, name));
+      return { name, size: st.size, mtime: localStamp(st.mtime) };
+    });
+}
+
+/** 只保留最近 BACKUP_KEEP 份（与自动备份共用同一套命名） */
+function pruneBackups() {
+  const files = fs.readdirSync(BACKUP_DIR).filter((f) => BACKUP_NAME_RE.test(f)).sort().reverse();
+  const removed = [];
+  for (const f of files.slice(BACKUP_KEEP)) {
+    try { fs.unlinkSync(path.join(BACKUP_DIR, f)); removed.push(f); } catch { /* ignore */ }
+  }
+  return { kept: Math.min(files.length, BACKUP_KEEP), removed };
+}
+
+/** 输出二进制下载 */
+function sendFile(res, buffer, filename, type = 'application/octet-stream') {
+  res.writeHead(200, {
+    'Content-Type': type,
+    'Content-Disposition':
+      `attachment; filename="stkj-db.db"; filename*=UTF-8''${encodeURIComponent(filename)}`,
+    'Content-Length': buffer.length,
+    'Cache-Control': 'no-store',
+    ...SECURITY_HEADERS,
+  });
+  res.end(buffer);
+}
+
+function databaseCounts() {
+  return {
+    users: db.prepare('SELECT COUNT(*) AS c FROM users').get().c,
+    projects: db.prepare('SELECT COUNT(*) AS c FROM projects').get().c,
+    projectData: db.prepare('SELECT COUNT(*) AS c FROM project_data').get().c,
+    auditLogs: db.prepare('SELECT COUNT(*) AS c FROM audit_logs').get().c,
+    sessions: db.prepare('SELECT COUNT(*) AS c FROM sessions').get().c,
+  };
+}
+
+function getDatabaseInfo(res) {
+  const st = fs.statSync(DB_FILE);
+  ok(res, {
+    size: st.size,
+    mtime: localStamp(st.mtime),
+    counts: databaseCounts(),
+    backups: listBackups(),
+    keep: BACKUP_KEEP,
+  });
+}
+
+function exportDatabase(res, user) {
+  ensureDir(DB_TMP_DIR);
+  const file = path.join(DB_TMP_DIR, `export-${crypto.randomBytes(8).toString('hex')}.db`);
+  try {
+    vacuumInto(file);
+    const buf = fs.readFileSync(file);
+    logAudit(user, 'export', 'database', null, `导出数据库（${(buf.length / 1024).toFixed(1)} KB）`);
+    sendFile(res, buf, `stkj-${dbStamp()}.db`, 'application/x-sqlite3');
+  } finally {
+    try { fs.unlinkSync(file); } catch { /* ignore */ }
+  }
+}
+
+function createBackup(res, user) {
+  const target = uniqueBackupPath();
+  vacuumInto(target);
+  const size = fs.statSync(target).size;
+  const pruned = pruneBackups();
+  logAudit(user, 'backup', 'database', null, `手动备份数据库（${(size / 1024).toFixed(1)} KB）`, {
+    file: path.basename(target), size,
+  });
+  ok(res, { file: path.basename(target), size, backups: listBackups(), keep: BACKUP_KEEP, removed: pruned.removed });
+}
+
+function downloadBackup(res, rawName) {
+  let name = rawName;
+  try { name = decodeURIComponent(rawName); } catch { /* 保持原样 */ }
+  if (!BACKUP_NAME_RE.test(name)) return fail(res, 400, '备份文件名不合法');
+  const file = path.join(BACKUP_DIR, name);
+  if (!fs.existsSync(file)) return fail(res, 404, '备份文件不存在');
+  sendFile(res, fs.readFileSync(file), name, 'application/x-sqlite3');
+}
+
+/* ---------- 导入 ---------- */
+
+const dbImportBatches = new Map(); // token -> { file, user, at }
+
+function cleanupDbImportBatches() {
+  const now = Date.now();
+  for (const [token, b] of dbImportBatches) {
+    if (now - b.at > DB_IMPORT_TTL) {
+      try { fs.unlinkSync(b.file); } catch { /* ignore */ }
+      dbImportBatches.delete(token);
+    }
+  }
+}
+
+/** 启动时清理上次残留的临时文件（超过 1 小时） */
+try {
+  if (fs.existsSync(DB_TMP_DIR)) {
+    const now = Date.now();
+    for (const f of fs.readdirSync(DB_TMP_DIR)) {
+      const p = path.join(DB_TMP_DIR, f);
+      try { if (now - fs.statSync(p).mtimeMs > 3600e3) fs.unlinkSync(p); } catch { /* ignore */ }
+    }
+  }
+} catch { /* ignore */ }
+
+function openReadOnly(file) {
+  try { return new DatabaseSync(file, { readOnly: true }); }
+  catch { return new DatabaseSync(file); }
+}
+
+/**
+ * 校验上传的 .db 并读出摘要：
+ *   文件头 / integrity_check / 必要表 / 账号与数据量 / 是否存在管理员
+ * 任何不满足都抛 HttpError(400)，由调用方转成可读提示。
+ */
+function inspectSourceDatabase(file) {
+  if (!fs.existsSync(file)) throw new HttpError(400, '文件不存在或已被清理');
+  const size = fs.statSync(file).size;
+  if (size < 4096) throw new HttpError(400, '文件过小，不是有效的 SQLite 数据库');
+  const fd = fs.openSync(file, 'r');
+  try {
+    const head = Buffer.alloc(16);
+    fs.readSync(fd, head, 0, 16, 0);
+    if (head.toString('utf8') !== 'SQLite format 3\u0000') {
+      throw new HttpError(400, '不是有效的 SQLite 数据库文件（.db）');
+    }
+  } finally { fs.closeSync(fd); }
+
+  let sdb;
+  try { sdb = openReadOnly(file); }
+  catch (e) { throw new HttpError(400, `无法打开数据库：${e.message}`); }
+  try {
+    const check = sdb.prepare('PRAGMA integrity_check').all();
+    const result = check[0] ? Object.values(check[0])[0] : '';
+    if (String(result).toLowerCase() !== 'ok') {
+      throw new HttpError(400, `数据库完整性检查未通过：${String(result).slice(0, 160)}`);
+    }
+    const tables = new Set(
+      sdb.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((r) => r.name)
+    );
+    const missing = ['users', 'projects', 'project_data'].filter((t) => !tables.has(t));
+    if (missing.length) throw new HttpError(400, `数据库缺少必要的数据表：${missing.join('、')}`);
+
+    const counts = {};
+    for (const t of DB_TABLES) {
+      counts[t] = tables.has(t) ? sdb.prepare(`SELECT COUNT(*) AS c FROM ${t}`).get().c : 0;
+    }
+    const users = sdb
+      .prepare('SELECT username, real_name, role, status FROM users ORDER BY id')
+      .all()
+      .map((u) => ({
+        ...u,
+        role: u.username === 'admin' && u.role === 'admin'
+          ? 'sys_admin'
+          : ['sys_admin', 'admin', 'user'].includes(u.role) ? u.role : 'user',
+      }));
+    const admins = users.filter((u) => u.role === 'sys_admin' || u.role === 'admin');
+    if (!admins.length) {
+      throw new HttpError(400, '该数据库中没有可用的管理员账号，导入后将无法登录，已拒绝导入');
+    }
+    return {
+      size,
+      counts,
+      userTotal: users.length,
+      admins: admins.map((u) => u.username),
+      users: users.slice(0, 50),
+    };
+  } finally {
+    try { sdb.close(); } catch { /* ignore */ }
+  }
+}
+
+async function previewDatabaseImport(res, req, user) {
+  cleanupDbImportBatches();
+  let buf;
+  try {
+    buf = await readRawBody(req, MAX_DB_IMPORT_BYTES);
+  } catch (e) {
+    return fail(res, e.status || 400, e.message || '文件读取失败，请重试');
+  }
+  if (!buf.length) return fail(res, 400, '没有收到文件内容');
+
+  ensureDir(DB_TMP_DIR);
+  const token = crypto.randomBytes(16).toString('hex');
+  const file = path.join(DB_TMP_DIR, `import-${token}.db`);
+  fs.writeFileSync(file, buf);
+  try {
+    const summary = inspectSourceDatabase(file);
+    dbImportBatches.set(token, { file, user: user.username, at: Date.now() });
+    ok(res, { token, summary });
+  } catch (e) {
+    try { fs.unlinkSync(file); } catch { /* ignore */ }
+    return fail(res, e.status || 400, e.message || '无法解析该数据库文件');
+  }
+}
+
+/** 把源库逐表复制进当前库：按列名取交集，兼容旧版本缺列；整段事务，失败自动回滚 */
+function applyDatabaseImport(file, user, { keepAdmin = true } = {}) {
+  const summary = inspectSourceDatabase(file);
+  const before = databaseCounts();
+  // 当前操作人的完整账号行：keepAdmin 时用它保证导入后仍能登录
+  const currentAdmin = db.prepare('SELECT * FROM users WHERE id = ?').get(user.id);
+  const sdb = openReadOnly(file);
+  let backupPath;
+  try {
+    const payload = {};
+    for (const t of DB_TABLES) {
+      const srcCols = sdb.prepare(`PRAGMA table_info(${t})`).all().map((c) => c.name);
+      const dstCols = db.prepare(`PRAGMA table_info(${t})`).all().map((c) => c.name);
+      // 旧版本可能没有 audit_logs 表：按空表处理（导入后审计日志为空）
+      if (!srcCols.length) {
+        payload[t] = { cols: [], rows: [] };
+        continue;
+      }
+      const cols = dstCols.filter((c) => srcCols.includes(c));
+      if (!cols.length) throw new HttpError(400, `数据表 ${t} 与当前版本结构不兼容`);
+      const quoted = cols.map((c) => `"${c}"`).join(', ');
+      payload[t] = { cols, rows: sdb.prepare(`SELECT ${quoted} FROM ${t}`).all() };
+    }
+
+    // 先备份当前数据，再动库：即使导入失败或回滚，也有可恢复的副本
+    backupPath = uniqueBackupPath();
+    vacuumInto(backupPath);
+
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      // 子表在前，避免未来加外键后删除顺序出错
+      for (const t of ['project_data', 'projects', 'audit_logs', 'sessions', 'users']) {
+        db.exec(`DELETE FROM ${t}`);
+      }
+      for (const t of DB_TABLES) {
+        const { cols, rows } = payload[t];
+        if (!rows.length) continue;
+        const sql = `INSERT INTO ${t} (${cols.map((c) => `"${c}"`).join(',')}) VALUES (${cols
+          .map(() => '?')
+          .join(',')})`;
+        const stmt = db.prepare(sql);
+        for (const row of rows) {
+          stmt.run(...cols.map((c) => (typeof row[c] === 'bigint' ? Number(row[c]) : row[c])));
+        }
+      }
+      // 与 db.js 启动时的规范化保持一致
+      db.exec(`UPDATE users SET role = 'sys_admin' WHERE username = 'admin' AND role = 'admin'`);
+      db.exec(`UPDATE users SET role = 'user' WHERE role NOT IN ('sys_admin','admin','user')`);
+      // 旧库没有归属人的数据：挂到最早的管理员账号下（与 db.js 启动逻辑一致）
+      const orphan = db.prepare('SELECT COUNT(*) AS c FROM project_data WHERE created_by_id IS NULL').get().c;
+      if (orphan > 0) {
+        const owner = db
+          .prepare(`SELECT id, username FROM users WHERE role IN ('sys_admin','admin') ORDER BY id LIMIT 1`)
+          .get();
+        if (owner) {
+          db.prepare('UPDATE project_data SET created_by_id = ?, created_by = ? WHERE created_by_id IS NULL')
+            .run(owner.id, owner.username);
+        }
+      }
+      // 保证导入后仍能用当前密码登录：保留导入操作人的账号（密码 / 盐 / 状态），并确保为系统管理员
+      if (keepAdmin && currentAdmin) {
+        const existing = db.prepare('SELECT id FROM users WHERE username = ?').get(currentAdmin.username);
+        if (existing) {
+          db.prepare(
+            `UPDATE users SET password_hash = ?, salt = ?, role = 'sys_admin', status = 1, pwd_changed = ? WHERE id = ?`
+          ).run(currentAdmin.password_hash, currentAdmin.salt, currentAdmin.pwd_changed, existing.id);
+        } else {
+          db.prepare(
+            `INSERT INTO users (username, password_hash, salt, real_name, role, status, remark, pwd_changed, created_at, last_login)
+             VALUES (?, ?, ?, ?, 'sys_admin', 1, ?, ?, ?, ?)`
+          ).run(
+            currentAdmin.username, currentAdmin.password_hash, currentAdmin.salt, currentAdmin.real_name,
+            currentAdmin.remark, currentAdmin.pwd_changed, currentAdmin.created_at, currentAdmin.last_login
+          );
+        }
+      }
+      db.exec('COMMIT');
+    } catch (e) {
+      try { db.exec('ROLLBACK'); } catch { /* ignore */ }
+      throw e;
+    }
+  } finally {
+    try { sdb.close(); } catch { /* ignore */ }
+  }
+
+  // 事务已提交：清理缓存、轮转备份、记录审计
+  invalidateMeta();
+  pruneBackups();
+  const after = databaseCounts();
+  logAudit(
+    { username: user.username }, 'import', 'database', null,
+    `导入数据库：用户 ${after.users} / 项目 ${after.projects} / 数据 ${after.projectData} 条`,
+    { before, after, backup: path.basename(backupPath), source: '上传 .db 文件', keepAdmin: !!keepAdmin }
+  );
+  return {
+    backup: path.basename(backupPath),
+    before,
+    after,
+    admins: summary.admins,
+    keepAdmin: !!keepAdmin && !!currentAdmin,
+    keptAdmin: currentAdmin ? currentAdmin.username : null,
+  };
+}
+
+function confirmDatabaseImport(res, body, user) {
+  const token = String(body.token || '');
+  const item = dbImportBatches.get(token);
+  if (!item) return fail(res, 400, '导入批次已过期，请重新选择数据库文件');
+  if (item.user !== user.username) return fail(res, 403, '无权导入该批次');
+  dbImportBatches.delete(token);
+
+  let out;
+  try {
+    out = applyDatabaseImport(item.file, user, { keepAdmin: body.keep_admin !== false });
+  } catch (e) {
+    const status = Number(e && e.status) || 500;
+    const msg = status >= 400 && status < 500 ? e.message : `导入失败：${e.message}`;
+    return fail(res, status, msg);
+  } finally {
+    try { fs.unlinkSync(item.file); } catch { /* ignore */ }
+  }
+  // 所有会话已被清空（导入的账号体系生效），顺手清掉当前浏览器的 Cookie
+  return send(res, 200, { success: true, ...out }, {
+    'Set-Cookie': 'sid=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0',
+  });
 }
 
 /* ---------- 用户批量导入 ---------- */
@@ -2192,6 +2574,23 @@ async function handleApi(req, res, url) {
   if (m === 'GET' && p === '/api/stats') return getStats(res, user);
   // 审计日志：只读，保留 180 天
   if (m === 'GET' && p === '/api/audit-logs') return listAuditLogs(res, q, user);
+
+  // 数据库维护（导出 / 导入 / 备份，仅系统管理员）
+  if (p.startsWith('/api/admin/db/')) {
+    if (!isSysAdmin(user)) return fail(res, 403, '仅系统管理员可维护数据库');
+    if (p === '/api/admin/db/info' && m === 'GET') return getDatabaseInfo(res);
+    if (p === '/api/admin/db/export' && m === 'GET') return exportDatabase(res, user);
+    if (p === '/api/admin/db/import-preview' && m === 'POST') return previewDatabaseImport(res, req, user);
+    if (p === '/api/admin/db/import-confirm' && m === 'POST') {
+      return confirmDatabaseImport(res, await readBody(req), user);
+    }
+    if (p === '/api/admin/db/backup' && m === 'POST') return createBackup(res, user);
+    if (p === '/api/admin/db/backups' && m === 'GET') return ok(res, { backups: listBackups(), keep: BACKUP_KEEP });
+    if (seg[0] === 'admin' && seg[1] === 'db' && seg[2] === 'backups' && seg[3] && m === 'GET') {
+      return downloadBackup(res, seg[3]);
+    }
+    return fail(res, 404, '接口不存在');
+  }
 
   // 回收站（仅管理员）
   if (p === '/api/recycle' && m === 'GET') return listRecycle(res, user);

@@ -74,6 +74,7 @@ const canDeleteData = () => !!can().canDeleteData;
 const canManageUsers = () => !!can().canManageUsers;
 const canManageAdmins = () => !!can().canManageAdmins;
 const canViewAudit = () => !!can().canViewAudit;
+const canManageDatabase = () => !!can().canManageDatabase;
 const seeAllData = () => !!can().seeAllData;
 
 const el = (sel) => document.querySelector(sel);
@@ -120,6 +121,7 @@ const VIEWS = {
   users: { title: '用户管理', sub: '系统账号与权限信息', render: renderUsers },
   recycle: { title: '回收站', sub: '已删除的项目与数据，30 天内可恢复，超期自动清除', render: renderRecycle },
   audit: { title: '审计日志', sub: '记录项目、数据与账号的新增 / 修改 / 删除 / 导入操作，保留 180 天', render: renderAudit },
+  database: { title: '数据库维护', sub: '导出、导入数据库与手动备份（仅系统管理员）', render: renderDatabase },
 };
 
 function navigate(view) {
@@ -537,6 +539,37 @@ function downloadFile(url) {
   document.body.appendChild(a);
   a.click();
   a.remove();
+}
+
+/** 通过 fetch 下载：能拿到 4xx/5xx 的可读错误，再用 Blob 触发保存 */
+async function downloadViaFetch(url, fallbackName) {
+  const res = await fetch(url, { credentials: 'same-origin' });
+  if (!res.ok) {
+    let j = {};
+    try { j = await res.json(); } catch { /* ignore */ }
+    if (res.status === 401) showLogin('登录已失效，请重新登录');
+    throw new Error(j.message || `下载失败（HTTP ${res.status}）`);
+  }
+  const blob = await res.blob();
+  let name = fallbackName || 'download.db';
+  const m = /filename\*=UTF-8''([^;]+)/i.exec(res.headers.get('content-disposition') || '');
+  if (m) { try { name = decodeURIComponent(m[1]); } catch { /* ignore */ } }
+  const objUrl = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = objUrl;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(objUrl), 3000);
+  return { name, size: blob.size };
+}
+
+function fmtBytes(n) {
+  const v = Number(n) || 0;
+  if (v >= 1024 * 1024) return (v / 1024 / 1024).toFixed(2) + ' MB';
+  if (v >= 1024) return (v / 1024).toFixed(1) + ' KB';
+  return v + ' B';
 }
 
 /* ---------- 项目弹窗 ---------- */
@@ -1857,8 +1890,9 @@ function confirmRecyclePurge(entity, id, label, dataCount) {
 const AUDIT_ACTIONS = [
   ['create', '新增'], ['update', '修改'], ['soft_delete', '删除'],
   ['restore', '恢复'], ['purge', '彻底删除'], ['import', '导入'], ['status', '状态变更'],
+  ['export', '导出'], ['backup', '备份'],
 ];
-const AUDIT_ENTITIES = [['project', '项目'], ['data', '数据'], ['user', '用户']];
+const AUDIT_ENTITIES = [['project', '项目'], ['data', '数据'], ['user', '用户'], ['database', '数据库']];
 const auditActionLabel = (k) => (AUDIT_ACTIONS.find(([v]) => v === k) || [null, k || '—'])[1];
 const auditEntityLabel = (k) => (AUDIT_ENTITIES.find(([v]) => v === k) || [null, k || '—'])[1];
 
@@ -2050,6 +2084,249 @@ function openAuditDetail(row) {
     narrow: true,
     body: blocks.join(''),
     footer: `<button class="btn" onclick="closeModal()">关闭</button>`,
+  });
+}
+
+/* ============================================================
+   数据库维护（仅系统管理员）
+   ============================================================ */
+async function renderDatabase() {
+  if (!canManageDatabase()) {
+    actions().innerHTML = '';
+    content().innerHTML = `<div class="card"><div class="card-body" style="text-align:center;padding:40px 0">
+      <p style="margin:0 0 6px;color:var(--danger);font-weight:600">无权维护数据库</p>
+      <p style="margin:0;color:var(--text-3);font-size:13px">数据库导出、导入与备份仅对系统管理员开放</p>
+    </div></div>`;
+    return;
+  }
+  actions().innerHTML = `<button class="btn" onclick="renderDatabase()">
+    <svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.6-6.4M21 3v6h-6"/></svg>刷新</button>`;
+  content().innerHTML = `<div class="card"><div class="card-body"><div class="skeleton" style="height:220px"></div></div></div>`;
+
+  let info;
+  try {
+    info = await API.get('/api/admin/db/info');
+  } catch (e) {
+    content().innerHTML = `<div class="card"><div class="card-body"><p class="muted">${esc(e.message)}</p></div></div>`;
+    return;
+  }
+
+  const c = info.counts || {};
+  content().innerHTML = `
+    <div class="stat-grid">
+      ${statCard('用户账号', c.users ?? 0, '个', '系统管理员 / 管理员 / 普通用户')}
+      ${statCard('项目', c.projects ?? 0, '个', '项目库中的全部项目')}
+      ${statCard('数据记录', c.projectData ?? 0, '条', '项目数据表的全部记录')}
+      ${statCard('数据库大小', fmtBytes(info.size), '', `最近写入 ${info.mtime}`)}
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-head"><h3>导出数据库</h3><span class="sub">下载完整副本</span></div>
+        <div class="card-body">
+          <p style="margin:0 0 14px;color:var(--text-2);font-size:13px;line-height:1.75">
+            导出包含<b>全部账号、项目、数据与审计日志</b>的 SQLite 文件（<code>.db</code>）。
+            使用 <code>VACUUM INTO</code> 生成一致性快照，不会中断正在使用的用户。
+          </p>
+          <button class="btn btn-primary" id="dbExport">
+            <svg viewBox="0 0 24 24"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M4 21h16"/></svg>
+            导出并下载
+          </button>
+          <p style="margin:12px 0 0;color:var(--text-3);font-size:12px">文件名形如 stkj-2026-10-27-18-30-00.db</p>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h3>导入数据库</h3><span class="sub">替换全部数据</span></div>
+        <div class="card-body">
+          <p style="margin:0 0 12px;color:var(--text-2);font-size:13px;line-height:1.75">
+            选择从其他服务器导出的 <code>.db</code> 文件，导入前会先校验文件并显示来源数据摘要。
+            来源服务器仍在运行时，请先停止服务或使用其「导出数据库」功能，避免漏掉 WAL 中尚未落盘的数据。
+          </p>
+          <div style="padding:10px 12px;margin-bottom:12px;border:1px solid #f3c9c9;background:var(--danger-weak);border-radius:8px;color:var(--text-2);font-size:12.5px;line-height:1.7">
+            <b style="color:var(--danger)">导入会覆盖现有数据</b>：当前账号、项目、数据与审计日志将被来源数据库完全替换；
+            导入前会自动备份一份到 <code>backups/</code>；所有登录会话立即失效，需要用来源数据库中的账号重新登录。
+          </div>
+          <input type="file" class="input" id="dbFile" accept=".db,application/x-sqlite3,application/octet-stream" />
+          <p style="margin:8px 0 0;color:var(--text-3);font-size:12px">仅支持 SQLite 数据库文件，单个文件不超过 20 MB。</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:14px">
+      <div class="card-head">
+        <h3>备份</h3>
+        <span class="sub">保留最近 ${info.keep} 份 · 每天凌晨自动备份</span>
+      </div>
+      <div class="card-body">
+        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px">
+          <button class="btn btn-primary" id="dbBackup">
+            <svg viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><path d="M17 21v-8H7v8"/><path d="M7 3v5h8"/></svg>
+            立即备份
+          </button>
+          <span style="color:var(--text-3);font-size:12.5px">备份文件存放在服务器 <code>backups/</code> 目录，可直接下载</span>
+        </div>
+        <div id="dbBackupList">${renderBackupList(info.backups)}</div>
+      </div>
+    </div>`;
+
+  el('#dbExport').addEventListener('click', async (ev) => {
+    const btn = ev.currentTarget;
+    const html = btn.innerHTML;
+    btn.disabled = true;
+    btn.textContent = '正在生成…';
+    try {
+      const r = await downloadViaFetch('/api/admin/db/export', 'stkj-db.db');
+      toast(`已导出 ${r.name}（${fmtBytes(r.size)}）`, 'ok');
+      renderDatabase();
+    } catch (e) {
+      toast(e.message, 'err');
+      btn.disabled = false;
+      btn.innerHTML = html;
+    }
+  });
+
+  el('#dbBackup').addEventListener('click', async (ev) => {
+    const btn = ev.currentTarget;
+    const html = btn.innerHTML;
+    btn.disabled = true;
+    btn.textContent = '正在备份…';
+    try {
+      const r = await API.post('/api/admin/db/backup');
+      toast(`备份完成：${r.file}（${fmtBytes(r.size)}）`, 'ok');
+      renderDatabase();
+    } catch (e) {
+      toast(e.message, 'err');
+      btn.disabled = false;
+      btn.innerHTML = html;
+    }
+  });
+
+  el('#dbFile').addEventListener('change', (ev) => {
+    const f = ev.target.files && ev.target.files[0];
+    ev.target.value = '';
+    if (f) previewDbImport(f);
+  });
+
+  document.querySelectorAll('[data-db-backup]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const name = btn.dataset.dbBackup;
+      try {
+        await downloadViaFetch('/api/admin/db/backups/' + encodeURIComponent(name), name);
+      } catch (e) { toast(e.message, 'err'); }
+    });
+  });
+}
+
+function renderBackupList(backups) {
+  if (!backups || !backups.length) {
+    return `<div class="empty" style="padding:30px 20px"><p>暂无备份</p><span>点击「立即备份」创建第一份，或等待每天凌晨的自动备份</span></div>`;
+  }
+  return `<div class="table-wrap" style="max-height:none">
+    <table class="data-table">
+      <thead><tr><th>备份文件</th><th>时间</th><th>大小</th><th style="width:90px">操作</th></tr></thead>
+      <tbody>
+        ${backups.map((b) => `<tr>
+          <td><span class="code-chip">${esc(b.name)}</span></td>
+          <td>${esc(b.mtime)}</td>
+          <td>${fmtBytes(b.size)}</td>
+          <td><button class="btn btn-sm btn-ghost" data-db-backup="${esc(b.name)}">下载</button></td>
+        </tr>`).join('')}
+      </tbody>
+    </table>
+  </div>`;
+}
+
+/** 选择 .db 后先上传校验，拿到摘要再二次确认 */
+async function previewDbImport(file) {
+  if (file.size > 20 * 1024 * 1024) return toast('文件超过 20 MB，无法导入', 'err');
+  const name = file.name || '';
+  if (name && !/\.(db|sqlite|sqlite3)$/i.test(name)) {
+    return toast('请选择 .db 格式的 SQLite 数据库文件', 'err');
+  }
+  toast('正在校验数据库文件…');
+  let r;
+  try {
+    const buf = await file.arrayBuffer();
+    r = await API.postRaw('/api/admin/db/import-preview', buf);
+  } catch (e) {
+    return toast(e.message, 'err');
+  }
+  openDbImportConfirm(r);
+}
+
+function openDbImportConfirm(r) {
+  const s = r.summary || {};
+  const c = s.counts || {};
+  const admins = (s.admins || []).join('、');
+  openModal({
+    title: '确认导入数据库',
+    sub: '导入前请核对来源数据',
+    narrow: true,
+    body: `
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 14px;margin-bottom:14px;font-size:13px;color:var(--text-2)">
+        <div>用户账号：<b>${c.users ?? 0}</b> 个</div>
+        <div>项目：<b>${c.projects ?? 0}</b> 个</div>
+        <div>数据记录：<b>${c.project_data ?? 0}</b> 条</div>
+        <div>审计日志：<b>${c.audit_logs ?? 0}</b> 条</div>
+        <div>文件大小：<b>${fmtBytes(s.size)}</b></div>
+        <div>管理员：<b>${esc(admins || '—')}</b></div>
+      </div>
+      <div style="padding:10px 12px;margin-bottom:14px;border:1px solid #f3c9c9;background:var(--danger-weak);border-radius:8px;color:var(--text-2);font-size:12.5px;line-height:1.75">
+        <b style="color:var(--danger)">此操作不可撤销</b>：当前全部账号、项目、数据与审计日志会被来源数据库替换。
+        系统会先自动备份当前数据；导入完成后所有会话失效，需要重新登录（默认保留当前管理员密码，见下方选项）。
+      </div>
+      <label style="display:flex;gap:8px;align-items:flex-start;margin-bottom:14px;font-size:12.5px;color:var(--text-2);line-height:1.6">
+        <input type="checkbox" id="dbKeepAdmin" checked style="margin-top:2px" />
+        <span>保留当前系统管理员账号 <b>${esc((state.user && state.user.username) || '')}</b> 的密码（推荐，避免来源库密码未知导致无法登录）</span>
+      </label>
+      <label style="display:block;margin-bottom:6px;font-size:12.5px;color:var(--text-2)">请输入「<b>导入</b>」两个字确认</label>
+      <input class="input" id="dbConfirmText" placeholder="导入" autocomplete="off" />`,
+    footer: `<button class="btn" onclick="closeModal()">取消</button>
+      <button class="btn btn-danger" id="dbImportGo" disabled>确认导入</button>`,
+  });
+
+  const input = el('#dbConfirmText');
+  const go = el('#dbImportGo');
+  const sync = () => { go.disabled = input.value.trim() !== '导入'; };
+  input.addEventListener('input', sync);
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !go.disabled) { e.preventDefault(); go.click(); }
+  });
+  setTimeout(() => input.focus(), 60);
+
+  go.addEventListener('click', async () => {
+    go.disabled = true;
+    go.textContent = '正在导入…';
+    let out;
+    try {
+      out = await API.post('/api/admin/db/import-confirm', {
+        token: r.token,
+        keep_admin: !!(el('#dbKeepAdmin') && el('#dbKeepAdmin').checked),
+      });
+    } catch (e) {
+      toast(e.message, 'err');
+      go.disabled = false;
+      go.textContent = '确认导入';
+      return;
+    }
+    const after = out.after || {};
+    closeModal();
+    openModal({
+      title: '数据库导入完成',
+      narrow: true,
+      body: `
+        <p style="margin:0 0 8px;color:var(--text-2)">已导入：用户 <b>${after.users ?? 0}</b> 个、项目 <b>${after.projects ?? 0}</b> 个、数据 <b>${after.projectData ?? 0}</b> 条。</p>
+        <p style="margin:0 0 8px;color:var(--text-2)">导入前的数据已自动备份为 <code>${esc(out.backup || '')}</code>，可在「备份」列表中下载。</p>
+        <p style="margin:0;color:var(--danger);font-size:13px">所有登录会话已失效。${out.keepAdmin
+          ? `当前管理员账号 <b>${esc(out.keptAdmin || '')}</b> 的密码已保留，可直接用原密码重新登录。`
+          : `请使用来源数据库中的账号重新登录${admins ? `（管理员：${esc(admins)}）` : ''}。`}</p>`,
+      footer: `<button class="btn btn-primary" id="dbRelogin">重新登录</button>`,
+    });
+    el('#dbRelogin').addEventListener('click', () => {
+      state.user = null;
+      location.reload();
+    });
   });
 }
 
