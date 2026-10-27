@@ -194,6 +194,9 @@ preflight() {
   [ "$(id -u)" -ne 0 ] || die "请不要用 root/sudo 运行（systemd 用户服务必须由普通用户管理）"
   [ -n "${HOME:-}" ] && [ -d "$HOME" ] || die "HOME 目录不可用"
   ensure_user_env
+  # 从 su / runuser / cron 启动时初始工作目录可能是 /root 等无权访问的目录，
+  # 会让 find、tar 之类在子进程里报 "Failed to restore initial working directory"
+  cd "$HOME" 2>/dev/null || die "无法进入 HOME 目录：$HOME"
   # 注意：不要求 git。安装与升级默认用 curl 下载代码包，git 只在沿用旧 git 部署时才需要
   have curl || die "缺少 curl，请先执行：sudo apt update && sudo apt install -y curl"
   have tar || die "缺少 tar，请先执行：sudo apt update && sudo apt install -y tar"
