@@ -188,24 +188,23 @@ async function renderDashboard() {
     <div class="stat-grid">
       ${statCard('项目总数', stats.projectCount, '个', '项目库中登记的项目')}
       ${statCard('项目数据记录', stats.dataCount, '条', '所有检测/生产数据')}
-      ${statCard('累计生产数量', stats.qtySum.toLocaleString('zh-CN', { maximumFractionDigits: 2 }), '', `覆盖 ${stats.baseCount} 家所属公司`)}
     </div>
-    <div class="grid-2">
-      <div class="card">
-        <div class="card-head"><h3>项目状态分布</h3></div>
-        <div class="card-body">
-          <div class="bar-list rows-3">${stats.byStatus.map((r) => barItem(r.name, r.value, maxStatus, r.status === 1 ? '' : 'muted')).join('')}</div>
+    <div class="grid-4">
+      <div class="col-stack">
+        <div class="card">
+          <div class="card-head"><h3>项目状态分布</h3></div>
+          <div class="card-body">
+            <div class="bar-list rows-3">${stats.byStatus.map((r) => barItem(r.name, r.value, maxStatus, r.status === 1 ? '' : 'muted')).join('')}</div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3>项目类型分布</h3></div>
+          <div class="card-body">
+            ${stats.byType.length ? `<div class="bar-list rows-3">${stats.byType.map((r) => barItem(r.name, r.value, maxType)).join('')}</div>`
+              : `<div class="empty" style="padding:24px"><p>暂无项目</p></div>`}
+          </div>
         </div>
       </div>
-      <div class="card">
-        <div class="card-head"><h3>项目类型分布</h3></div>
-        <div class="card-body">
-          ${stats.byType.length ? `<div class="bar-list rows-3">${stats.byType.map((r) => barItem(r.name, r.value, maxType)).join('')}</div>`
-            : `<div class="empty" style="padding:24px"><p>暂无项目</p></div>`}
-        </div>
-      </div>
-    </div>
-    <div class="grid-3" style="margin-top:14px">
       <div class="card">
         <div class="card-head"><h3>产品代码数据分布</h3></div>
         <div class="card-body">

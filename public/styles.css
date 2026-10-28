@@ -158,8 +158,16 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
 
 .grid-2 { display: grid; grid-template-columns: 1.15fr .85fr; gap: 14px; }
 @media (max-width: 1100px) { .grid-2 { grid-template-columns: 1fr; } }
-.grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
-@media (max-width: 1100px) { .grid-3 { grid-template-columns: 1fr; } }
+/* 总览：四列等宽；第一列上下叠放「项目状态分布」「项目类型分布」两张小卡 */
+.grid-4 { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; align-items: stretch; }
+.col-stack { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.col-stack > .card { flex: 1 1 0; display: flex; flex-direction: column; }
+.col-stack > .card > .card-body { flex: 1 1 auto; }
+@media (max-width: 1200px) {
+  .grid-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .grid-4 .col-stack { display: contents; }   /* 窄屏拆开：两张小卡各占一格 */
+}
+@media (max-width: 820px) { .grid-4 { grid-template-columns: 1fr; } }
 
 /* 筛选条 */
 .filters {
