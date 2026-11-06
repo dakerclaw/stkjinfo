@@ -133,7 +133,9 @@ node seed.js --reset   # 清空项目与数据后重新灌入示例（保留用�
 
 指标字段（共 46 个字段，其中数值型可为空表示未检测）：
 
-> **精度约定**：粒度、物性、电化学、粉压、工业分析及效率/收率等全部指标字段统一为**浮点数保留 2 位小数**。手工录入、编辑、Excel 导入时服务端自动四舍五入（如 `12.3456 → 12.35`、`-0.005 → 0`），列表页固定显示 2 位小数。仅**生产数量**（`quantity`）保留原始精度。
+> **精度约定**：所有数值型指标（粒度、物性、电化学、粉压、工业分析、效率/收率、能耗、生产数量）统一为**浮点数保留 2 位小数**。手工录入、编辑、Excel 导入时服务端自动四舍五入（如 `12.3456 → 12.35`、`-0.005 → 0`），列表页固定显示 2 位小数。
+>
+> 升级旧数据库时会在首次启动做一次全表归一（`PRAGMA user_version` 记录版本，只执行一次）；之后不再每次启动改写历史数据，只在写入 / 导入 / 数据库导入时处理。
 
 - **粒度**：dx0、dx1、dx10、dx50、dx90、dx99、dx100、k_value
 - **物性**：tap_density 振实密度、true_density 真密度、ssa_domestic 比表-国产、ssa_mic 比表-麦克、graphitization 石墨化度、magnetic 磁性物质、ph_value、oversize 筛上物、oil_absorption 吸油值、hgi 哈氏可磨指数
@@ -157,7 +159,8 @@ node seed.js --reset   # 清空项目与数据后重新灌入示例（保留用�
 - **用户管理**：账号增删改、重置密码、角色分级授权、Excel 批量导入
 - **审计日志**：新增 / 修改（含字段级 from→to）/ 删除 / 恢复 / 导入等关键操作自动落库，保留 180 天；**仅系统管理员**可查看
 - **数据库维护**：导出完整 `.db`、导入其他服务器的 `.db`、手动备份与下载备份；**仅系统管理员**可见。导入前自动备份当前数据，导入后所有会话失效并需用来源数据库的账号重新登录
-- **回收站**：项目与数据删除改为软删除，30 天内可在「回收站」页恢复，超期自动物理清理；彻底删除不可恢复
+- **用户名不区分大小写**：`Admin` 与 `admin` 视为同一账号；新建、登录、导入判重均按不区分大小写处理，数据库层有 NOCASE 唯一索引兜底
+- **回收站**：项目与数据删除改为软删除，30 天内可在「回收站」页恢复，超期自动物理清理；恢复项目只恢复「随该项目一起删除」的数据，不会复活更早单独删除的记录；彻底删除不可恢复
 - **键盘操作**：录入弹窗内 Enter 跳下一字段，最后一个字段 Enter 或 Ctrl+S / Ctrl+Enter 直接保存
 - 修改项目编号时自动同步更新其数据记录的项目编号，保持关联一致
 
@@ -167,7 +170,8 @@ node seed.js --reset   # 清空项目与数据后重新灌入示例（保留用�
 
 - 表头支持中文列名、字段名及常见别名：`Dx（50）`、`振实密度(g/cm³)`、`首效`、`磁性异物`、`工单号`、`首效`、`粘结指数` 等均可识别
 - 空值写法一律视为未提供：空串、空格、`-`、`/`、`N/A`、`未检测`、`未测`
-- 数值列若为 `16.5 mg`、`约1.08`、`<50`、`95.2%` 会自动提取数字；纯文本（如 `abc`）留空
+- 数值列若为 `16.5 mg`、`约1.08`、`<50`、`95.2%` 会自动提取数字；纯文本（如 `abc`）留空。含比较符、区间或百分号的写法会在导入结果中列出「原始值 → 实际保存值」，避免静默改变含义
+- Excel 中真正的「日期」格式单元格（存储为序列号，如 45231）会自动转换为 `YYYY-MM-DD`；录入日期也接受 `YYYY/MM/DD`、`YYYY.MM.DD`、`YYYYMMDD`
 - 导入前预览显示：识别到几个字段、哪些字段将留空、无法识别的列；缺少必填表头时会拦截
 - 「选择字段生成模板」可按需勾选指标，下载只含所需列的 Excel 模板
 - 上传的 Excel 由**服务端解析**：先预览（识别字段数 / 将留空的字段 / 无法识别的列），确认后再整批写入
@@ -264,12 +268,13 @@ node seed.js --reset   # 清空项目与数据后重新灌入示例（保留用�
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | /api/auth/login | 登录 `{username,password}`，成功后下发 HttpOnly Cookie |
+| POST | /api/auth/login | 登录 `{username,password}`，成功后下发 HttpOnly Cookie（用户名不区分大小写） |
 | POST | /api/auth/logout | 注销，清除会话 |
 | GET | /api/auth/me | 当前登录用户 |
 | POST | /api/auth/password | 自助修改密码 `{old_password,new_password}` |
+| GET | /healthz | 健康检查（免登录）：数据库可用时返回 `{success:true,status:"ok"}` |
 | GET | /api/meta | 字段定义、筛选下拉、角色列表、当前用户权限位 |
-| GET | /api/stats | 总览统计（普通用户仅统计自己的数据）：`byType` / `byProduct` / `byDate` / `byStatus` 分布 |
+| GET | /api/stats | 总览统计（普通用户仅统计自己的数据）：`projectCount` / `dataCount` / `byType` / `byProduct` / `byDate` / `byStatus` / `recent` |
 | GET | /api/audit-logs | 审计日志分页查询（**仅系统管理员**，其他角色 403）：`page` / `pageSize`（≤200）/ `entity` / `action` / `q` / `date_from` / `date_to`，保留 180 天 |
 | GET | /api/admin/db/info | 数据库大小、各表计数与备份列表（**仅系统管理员**） |
 | GET | /api/admin/db/export | 导出完整 SQLite 数据库文件（**仅系统管理员**） |
@@ -285,7 +290,7 @@ node seed.js --reset   # 清空项目与数据后重新灌入示例（保留用�
 | GET/POST | /api/data | 数据列表（分页，普通用户仅自己的）/ 新建（五项重复时 409） |
 | GET/PUT/DELETE | /api/data/:id | 详情 / 更新（本人或管理员）/ 删除（管理员） |
 | POST | /api/data/bulk-delete | 批量删除 `{ids:[]}`（管理员） |
-| POST | /api/data/import | JSON 导入 `{rows:[], duplicate_action?}`，允许部分字段；返回留空字段清单 |
+| POST | /api/data/import | JSON 导入 `{rows:[], duplicate_action?}`，允许部分字段；返回留空字段清单与 `warnings`（被转换的原始写法） |
 | GET | /api/data/export | 导出检测数据为 Excel，按筛选条件；传 `ids` 时只导出勾选的记录 |
 | GET | /api/data/facets | 筛选联动：按当前筛选条件返回「所属公司 / 工序 / 工单号 / 焦种」的可选值（每列排除自身条件） |
 | GET | /api/data/template | 下载导入模板 Excel，`?fields=a,b,c` 可只含指定字段 |
@@ -315,6 +320,7 @@ node seed.js --reset   # 清空项目与数据后重新灌入示例（保留用�
 server.js            后端服务与 API
 db.js                建表语句与字段定义（前后端共用字段元数据）
 xlsx.js              极简 XLSX 读写（零第三方依赖：手写 ZIP + XML）
+vacuum.cjs           子进程数据库快照（导出 / 备份不阻塞请求）
 import-map.js        导入表头识别（中文列名 / 字段名 / 别名 → 字段 key）
 seed.js              初始化账号与示例数据
 public/index.html    页面骨架

@@ -224,7 +224,65 @@ function parseSharedStrings(xml) {
   return list;
 }
 
-function parseSheet(xml, sharedStrings) {
+/* ---------- 日期样式识别：真实日期单元格是数字序列号（如 45231），不是字符串 ---------- */
+
+/** Excel 内置日期 / 时间格式 ID（14–22、27–36、45–47、50–58、71–81） */
+const BUILTIN_DATE_FMTS = new Set([
+  ...Array.from({ length: 9 }, (_, i) => 14 + i),
+  ...Array.from({ length: 10 }, (_, i) => 27 + i),
+  45, 46, 47,
+  ...Array.from({ length: 9 }, (_, i) => 50 + i),
+  ...Array.from({ length: 11 }, (_, i) => 71 + i),
+]);
+
+/** 自定义格式是否含日期 / 时间占位符（去掉引号文本、转义字符与颜色/条件段） */
+function isDateFormatCode(code) {
+  if (!code) return false;
+  const s = String(code)
+    .replace(/"[^"]*"/g, '')
+    .replace(/\\./g, '')
+    .replace(/\[[^\]]*\]/g, '');
+  if (/AM\/PM|上午|下午/i.test(code)) return true;
+  return /[ymdhs]/i.test(s) && !/[#?]/.test(s);
+}
+
+/** 返回 cellXfs 下标 → 是否日期格式 */
+function parseDateStyles(xml) {
+  const styles = [];
+  if (!xml) return styles;
+  const custom = new Map();
+  const numFmtRe = /<numFmt\b([^>]*?)\/?>/g;
+  let nm;
+  while ((nm = numFmtRe.exec(xml))) {
+    const id = /numFmtId="(\d+)"/.exec(nm[1]);
+    const code = /formatCode="([^"]*)"/.exec(nm[1]);
+    if (id) custom.set(Number(id[1]), code ? decodeXml(code[1]) : '');
+  }
+  const block = /<cellXfs\b[^>]*>([\s\S]*?)<\/cellXfs>/.exec(xml);
+  if (!block) return styles;
+  const xfRe = /<xf\b([^>]*?)(?:\/>|>[\s\S]*?<\/xf>)/g;
+  let xf;
+  while ((xf = xfRe.exec(block[1]))) {
+    const id = /numFmtId="(\d+)"/.exec(xf[1]);
+    const fmtId = id ? Number(id[1]) : 0;
+    if (BUILTIN_DATE_FMTS.has(fmtId)) styles.push(true);
+    else if (custom.has(fmtId)) styles.push(isDateFormatCode(custom.get(fmtId)));
+    else styles.push(false);
+  }
+  return styles;
+}
+
+/** Excel 日期序列号 → YYYY-MM-DD */
+function excelSerialToDate(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return v;
+  const ms = Date.UTC(1899, 11, 30) + Math.round(n * 86400000);
+  const d = new Date(ms);
+  const p = (x) => String(x).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())}`;
+}
+
+function parseSheet(xml, sharedStrings, dateStyles = []) {
   const rows = [];
   const rowRe = /<row\b[^>]*>([\s\S]*?)<\/row>|<row\b[^>]*\/>/g;
   let rm;
@@ -238,6 +296,7 @@ function parseSheet(xml, sharedStrings) {
       const body = cm[2] || '';
       const rAttr = /(?:^|\s)r="([^"]*)"/.exec(attrs);
       const tAttr = /(?:^|\s)t="([^"]*)"/.exec(attrs);
+      const sAttr = /(?:^|\s)s="(\d+)"/.exec(attrs);
       const ci = colIndex(rAttr ? rAttr[1] : '');
       if (ci < 0) continue;
 
@@ -253,6 +312,9 @@ function parseSheet(xml, sharedStrings) {
           v = sharedStrings[Number(v)] !== undefined ? sharedStrings[Number(v)] : '';
         } else if (type === 'b') {
           v = v === '1' ? 'TRUE' : 'FALSE';
+        } else if (type === 'n' && v !== '' && sAttr && dateStyles[Number(sAttr[1])]) {
+          // 日期单元格：Excel 存的是序列号，按样式转成 YYYY-MM-DD
+          v = excelSerialToDate(v);
         }
       }
       cells[ci] = v;
@@ -273,6 +335,8 @@ function parse(input) {
 
   const ssXml = entries['xl/sharedStrings.xml'];
   const shared = ssXml ? parseSharedStrings(ssXml.toString('utf8')) : [];
+  const stXml = entries['xl/styles.xml'];
+  const dateStyles = stXml ? parseDateStyles(stXml.toString('utf8')) : [];
 
   let sheetName = 'xl/worksheets/sheet1.xml';
   if (!entries[sheetName]) {
@@ -280,7 +344,7 @@ function parse(input) {
   }
   if (!sheetName) throw new Error('Excel 文件中没有找到工作表');
 
-  let rows = parseSheet(entries[sheetName].toString('utf8'), shared);
+  let rows = parseSheet(entries[sheetName].toString('utf8'), shared, dateStyles);
 
   // 补齐每行列数（跳过列会留下空洞），并去掉尾部全空行
   const width = rows.reduce((m, r) => Math.max(m, r.length), 0);

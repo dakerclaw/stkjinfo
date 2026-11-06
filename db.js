@@ -157,6 +157,10 @@ ensureColumn('project_data', 'energy', 'REAL'); // 能耗：加在收率与生�
 // 软删除：删除仅打标记，30 天内可在回收站恢复，超期由服务端定时物理清理
 ensureColumn('projects', 'deleted_at', 'TEXT');
 ensureColumn('project_data', 'deleted_at', 'TEXT');
+// 删除批次：删除项目时给随项目一起删除的数据打同一批次，恢复时只恢复本批次，
+// 不会把「更早单独删除」的数据一并复活。
+ensureColumn('projects', 'deleted_batch', 'TEXT');
+ensureColumn('project_data', 'deleted_batch', 'TEXT');
 db.exec('CREATE INDEX IF NOT EXISTS idx_data_owner ON project_data(created_by_id)');
 db.exec('CREATE INDEX IF NOT EXISTS idx_data_coke ON project_data(coke_type)');
 // 会话按用户检索（踢下线、清理过期）与按最后活跃时间清理
@@ -165,9 +169,19 @@ db.exec('CREATE INDEX IF NOT EXISTS idx_sessions_seen ON sessions(last_seen)');
 // 回收站清理按删除时间检索
 db.exec('CREATE INDEX IF NOT EXISTS idx_projects_deleted ON projects(deleted_at)');
 db.exec('CREATE INDEX IF NOT EXISTS idx_data_deleted ON project_data(deleted_at)');
+db.exec('CREATE INDEX IF NOT EXISTS idx_data_delete_batch ON project_data(deleted_batch)');
+// 日期筛选 / 归属 + 日期组合（去掉 IFNULL 包裹后可以真正命中索引）
+db.exec('CREATE INDEX IF NOT EXISTS idx_data_entry_date ON project_data(entry_date) WHERE deleted_at IS NULL');
+db.exec('CREATE INDEX IF NOT EXISTS idx_data_owner_date ON project_data(created_by_id, entry_date) WHERE deleted_at IS NULL');
+// 导入查重五元组：普通复合索引会被 IFNULL(base,'') 阻断，必须用同样的表达式建索引
+db.exec(
+  `CREATE INDEX IF NOT EXISTS idx_data_key5
+   ON project_data(project_no, product_code, IFNULL(base,''), IFNULL(process_code,''), IFNULL(work_order,''))
+   WHERE deleted_at IS NULL`
+);
 
-// 角色规范化：用户名 admin 固定为系统管理员
-db.exec(`UPDATE users SET role = 'sys_admin' WHERE username = 'admin' AND role = 'admin'`);
+// 角色规范化：用户名 admin 固定为系统管理员（用户名统一不区分大小写）
+db.exec(`UPDATE users SET role = 'sys_admin' WHERE username = 'admin' COLLATE NOCASE AND role = 'admin'`);
 db.exec(`UPDATE users SET role = 'user' WHERE role NOT IN ('sys_admin','admin','user')`);
 
 // 存量数据无归属人时，统一挂到最早的管理员账号下，避免普通用户看不到历史数据
@@ -234,22 +248,111 @@ const FIELDS = [
   { key: 'entry_date',     label: '录入日期',   type: 'date' },
 ];
 
-// 指标字段统一保留 2 位小数（写入/导入时四舍五入）；生产数量不做限定
-const ROUND2_KEYS = new Set(
-  FIELDS.filter((f) => f.type === 'number' && f.key !== 'quantity').map((f) => f.key)
-);
+// 指标字段统一保留 2 位小数（写入/导入时四舍五入）；生产数量同样保留 2 位
+const ROUND2_KEYS = new Set(FIELDS.filter((f) => f.type === 'number').map((f) => f.key));
 for (const f of FIELDS) if (ROUND2_KEYS.has(f.key)) f.round2 = true;
 
-// 存量数据一次性修正为 2 位小数：
-// 合并成一条 UPDATE（原来 36 条语句要扫表 36 遍，5 万行时启动多花 ~150ms）。
-// WHERE 里 OR 掉「已合规」的行，正常情况下不产生任何写入，不会撑大 WAL。
-const roundKeys = [...ROUND2_KEYS];
-if (roundKeys.length) {
-  const setSql = roundKeys.map((k) => `${k} = round(${k}, 2)`).join(', ');
-  const whereSql = roundKeys
-    .map((k) => `(${k} IS NOT NULL AND ${k} != round(${k}, 2))`)
-    .join(' OR ');
-  db.exec(`UPDATE project_data SET ${setSql} WHERE ${whereSql}`);
+/* --------------------------------------------------------------- 迁移 */
+/**
+ * 版本号只用于「结构性 / 历史数据一次性整理」，不参与每次启动。
+ *   1：所有数值字段归一到 2 位小数；回收站补删除批次；用户名大小写唯一。
+ * 之后新增/导入时的精度处理在 server.js 的写入路径完成，不再全表改写。
+ */
+const SCHEMA_VERSION = 1;
+
+/** 把指定数值列一次性四舍五入到 2 位；Where 排除已合规行，避免无意义写入撑大 WAL */
+function normalizeNumbers(handle = db) {
+  const keys = [...ROUND2_KEYS];
+  if (keys.length === 0) return 0;
+  const setSql = keys.map((k) => `${k} = round(${k}, 2)`).join(', ');
+  const whereSql = keys.map((k) => `(${k} IS NOT NULL AND ${k} != round(${k}, 2))`).join(' OR ');
+  return handle.prepare(`UPDATE project_data SET ${setSql} WHERE ${whereSql}`).run().changes;
 }
 
-module.exports = { db, DB_FILE, DATA_DIR, FIELDS };
+/** 给旧版本已软删除的项目 / 数据补删除批次，使恢复逻辑与新数据一致 */
+function backfillDeleteBatches(handle = db) {
+  const pros = handle
+    .prepare(`SELECT id, project_no FROM projects WHERE deleted_at IS NOT NULL AND (deleted_batch IS NULL OR deleted_batch = '')`)
+    .all();
+  for (const p of pros) {
+    const batch = `legacy-${p.id}`;
+    handle.prepare('UPDATE projects SET deleted_batch = ? WHERE id = ?').run(batch, p.id);
+    handle
+      .prepare(
+        `UPDATE project_data SET deleted_batch = ?
+         WHERE project_no = ? AND deleted_at IS NOT NULL AND (deleted_batch IS NULL OR deleted_batch = '')`
+      )
+      .run(batch, p.project_no);
+  }
+  // 单独删除的数据：每行一个批次，避免恢复时互相牵连
+  handle
+    .prepare(
+      `UPDATE project_data SET deleted_batch = 'legacy-data-' || id
+       WHERE deleted_at IS NOT NULL AND (deleted_batch IS NULL OR deleted_batch = '')`
+    )
+    .run();
+}
+
+/**
+ * 用户名统一不区分大小写：
+ *   1. 历史库中仅大小写不同的重复账号，保留权限最高 / id 最小者，其余重命名并同步归属字段；
+ *   2. 建立 NOCASE 唯一索引，之后应用层与数据库双重保证不会出现 Admin / admin 并存。
+ */
+function migrateUsernames(handle = db) {
+  const groups = handle
+    .prepare('SELECT username AS name FROM users GROUP BY username COLLATE NOCASE HAVING COUNT(*) > 1')
+    .all();
+  for (const g of groups) {
+    const list = handle
+      .prepare(
+        `SELECT id, username, role FROM users WHERE username = ? COLLATE NOCASE
+         ORDER BY CASE WHEN username = 'admin' THEN 0 ELSE 1 END,
+                  CASE role WHEN 'sys_admin' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, id`
+      )
+      .all(g.name);
+    const keep = list[0];
+    for (const u of list.slice(1)) {
+      const base = String(u.username).slice(0, 26);
+      let candidate = `${base}_${u.id}`;
+      let n = 1;
+      while (handle.prepare('SELECT 1 FROM users WHERE username = ? COLLATE NOCASE').get(candidate)) {
+        candidate = `${base}_${u.id}_${n++}`;
+      }
+      handle.prepare('UPDATE users SET username = ? WHERE id = ?').run(candidate, u.id);
+      // 归属字段是冗余账号名，重命名后同步，避免界面显示已不存在的账号
+      handle.prepare('UPDATE project_data SET created_by = ? WHERE created_by = ?').run(candidate, u.username);
+      handle.prepare('UPDATE project_data SET updated_by = ? WHERE updated_by = ?').run(candidate, u.username);
+      handle.prepare('UPDATE audit_logs SET username = ? WHERE username = ?').run(candidate, u.username);
+      console.warn(`[migrate] 账号「${u.username}」与「${keep.username}」仅大小写不同，已重命名为「${candidate}」`);
+    }
+  }
+  handle.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_nocase ON users(username COLLATE NOCASE)');
+}
+
+const currentVersion = Number((db.prepare('PRAGMA user_version').get() || {}).user_version || 0);
+if (currentVersion < SCHEMA_VERSION) {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    normalizeNumbers(db);
+    backfillDeleteBatches(db);
+    migrateUsernames(db);
+    db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    db.exec('COMMIT');
+    console.log(`[db] 已完成数据结构升级（user_version ${currentVersion} → ${SCHEMA_VERSION}）`);
+  } catch (e) {
+    try { db.exec('ROLLBACK'); } catch { /* ignore */ }
+    throw e;
+  }
+}
+
+// 让查询计划拿到统计信息；PRAGMA optimize 本身很轻，不做全库 ANALYZE
+try { db.exec('PRAGMA optimize'); } catch { /* 不影响启动 */ }
+
+module.exports = {
+  db, DB_FILE, DATA_DIR, FIELDS,
+  SCHEMA_VERSION,
+  ROUND2_KEYS,
+  normalizeNumbers,
+  backfillDeleteBatches,
+  migrateUsernames,
+};

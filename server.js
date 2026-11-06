@@ -8,7 +8,9 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const zlib = require('node:zlib');
-const { db, DB_FILE, DATA_DIR, FIELDS } = require('./db');
+const { execFile } = require('node:child_process');
+const { promisify } = require('node:util');
+const { db, DB_FILE, DATA_DIR, FIELDS, normalizeNumbers, backfillDeleteBatches } = require('./db');
 const { DatabaseSync } = require('node:sqlite');
 const xlsx = require('./xlsx');
 const { normHeader, buildHeaderMap, isBlank, USER_IMPORT_FIELDS } = require('./import-map');
@@ -20,9 +22,26 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 /* ============================================================ 工具函数 */
 
 const nowStr = () => new Date().toLocaleString('sv-SE').replace('T', ' ');
+/** 本地日期（YYYY-MM-DD）。不能用 toISOString：那是 UTC，东八区 0–8 点会变成前一天 */
+function localDate(d = new Date()) {
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+const todayStr = () => localDate();
+const newBatchId = () => `${Date.now().toString(36)}-${crypto.randomBytes(6).toString('hex')}`;
+
+/** 账号 / 密码长度上限：防止超长输入让 scrypt 消耗大量内存与 CPU */
+const MAX_USERNAME_LEN = 32;
+const MAX_PASSWORD_LEN = 128;
 
 function hashPassword(password, salt) {
   return crypto.scryptSync(password, salt, 64).toString('hex');
+}
+/** 异步 scrypt：登录 / 改密不再阻塞事件循环 */
+function hashPasswordAsync(password, salt) {
+  return new Promise((resolve, reject) => {
+    crypto.scrypt(password, salt, 64, (err, key) => (err ? reject(err) : resolve(key.toString('hex'))));
+  });
 }
 function makeSalt() {
   return crypto.randomBytes(16).toString('hex');
@@ -33,6 +52,58 @@ function safeEqual(a, b) {
   const bb = Buffer.from(String(b));
   if (ba.length !== bb.length) return false;
   return crypto.timingSafeEqual(ba, bb);
+}
+/** 账号不存在时也跑一次 scrypt，避免通过响应时间枚举账号 */
+const DUMMY_SALT = makeSalt();
+const DUMMY_HASH = hashPassword('not-a-real-password', DUMMY_SALT);
+async function verifyPassword(password, salt, hash) {
+  if (!salt || !hash) {
+    await hashPasswordAsync(password, DUMMY_SALT);
+    return false;
+  }
+  const got = await hashPasswordAsync(password, salt);
+  return safeEqual(got, hash);
+}
+
+const FIELD_MAP = new Map(FIELDS.map((f) => [f.key, f]));
+
+/** 预编译语句缓存：INSERT / UPDATE 的列组合固定，避免每次请求重复解析 SQL */
+const stmtCache = new Map();
+function cachedStmt(sql) {
+  let stmt = stmtCache.get(sql);
+  if (!stmt) {
+    if (stmtCache.size > 500) stmtCache.clear();
+    stmt = db.prepare(sql);
+    stmtCache.set(sql, stmt);
+  }
+  return stmt;
+}
+
+/* ---------- 读缓存：写操作后由 invalidateMeta() 统一失效 ---------- */
+const CACHE_TTL = 30 * 1000;
+const dataCaches = { projects: new Map(), stats: new Map(), facets: new Map() };
+
+function paramsKey(params) {
+  return [...params.entries()]
+    .sort((a, b) => (a[0] === b[0] ? a[1].localeCompare(b[1]) : a[0].localeCompare(b[0])))
+    .map(([k, v]) => `${k}=${v}`)
+    .join('&');
+}
+function cacheGet(map, key, version) {
+  const hit = map.get(key);
+  if (!hit) return undefined;
+  if (hit.version !== version || Date.now() - hit.at > CACHE_TTL) {
+    map.delete(key);
+    return undefined;
+  }
+  return hit.data;
+}
+function cacheSet(map, key, version, data) {
+  if (map.size > 300) map.clear();
+  map.set(key, { version, at: Date.now(), data });
+}
+function clearDataCaches() {
+  for (const m of Object.values(dataCaches)) m.clear();
 }
 
 /**
@@ -177,13 +248,23 @@ const SECURITY_HEADERS = {
 };
 
 function send(res, status, data, headers = {}) {
-  const body = JSON.stringify(data);
-  res.writeHead(status, {
+  let body = Buffer.from(JSON.stringify(data), 'utf8');
+  const out = {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
     ...SECURITY_HEADERS,
     ...headers,
-  });
+  };
+  // JSON 响应压缩：列表 / 统计接口在数据量大时能省 70% 以上带宽
+  const req = res.req;
+  const ae = String((req && req.headers && req.headers['accept-encoding']) || '');
+  if (body.length > 1024 && /\bgzip\b/.test(ae) && !out['Content-Encoding']) {
+    body = zlib.gzipSync(body, { level: 6 });
+    out['Content-Encoding'] = 'gzip';
+    out.Vary = 'Accept-Encoding';
+  }
+  out['Content-Length'] = body.length;
+  res.writeHead(status, out);
   res.end(body);
 }
 const ok = (res, data = {}) => send(res, 200, { success: true, ...data });
@@ -261,8 +342,32 @@ function sendXlsx(res, buffer, filename) {
   res.end(buffer);
 }
 
-const todayStr = () => new Date().toISOString().slice(0, 10);
 const cell = (v) => (v === null || v === undefined ? '' : v);
+
+/** 把各种日期写法归一成 YYYY-MM-DD；无法识别返回 null */
+function normalizeDate(v) {
+  if (v === null || v === undefined) return null;
+  if (v instanceof Date && !Number.isNaN(v.getTime())) return localDate(v);
+  const s = String(v).trim();
+  if (!s) return null;
+
+  // Excel 日期序列号（1900 日期系统）：45231 → 2023-10-...
+  if (/^\d+(\.\d+)?$/.test(s)) {
+    const n = Number(s);
+    if (n > 20000 && n < 80000) {
+      const ms = Date.UTC(1899, 11, 30) + Math.round(n * 86400000);
+      const dt = new Date(ms);
+      const p = (x) => String(x).padStart(2, '0');
+      return `${dt.getUTCFullYear()}-${p(dt.getUTCMonth() + 1)}-${p(dt.getUTCDate())}`;
+    }
+  }
+  const m = /^(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})日?/.exec(s) || /^(\d{4})(\d{2})(\d{2})$/.exec(s);
+  if (!m) return null;
+  const y = Number(m[1]); const mo = Number(m[2]); const d = Number(m[3]);
+  const dt = new Date(y, mo - 1, d);
+  if (dt.getFullYear() !== y || dt.getMonth() !== mo - 1 || dt.getDate() !== d) return null;
+  return localDate(dt);
+}
 
 /** 把查询条件构建从分页列表里抽出来，供导出复用 */
 function buildDataWhere(params, user) {
@@ -272,8 +377,9 @@ function buildDataWhere(params, user) {
 
   const from = params.get('date_from');
   const to = params.get('date_to');
-  if (from) { where.push("IFNULL(entry_date,'') >= ?"); args.push(from); }
-  if (to) { where.push("IFNULL(entry_date,'') <= ?"); args.push(to); }
+  // 直接比较 entry_date，才能命中 idx_data_entry_date；空日期在区间筛选时自然被排除
+  if (from) { where.push('entry_date >= ?'); args.push(from); }
+  if (to) { where.push('entry_date <= ?'); args.push(to); }
 
   const kw = params.get('q');
   if (kw && kw.trim()) {
@@ -328,6 +434,10 @@ function exportDataXlsx(res, params, user) {
  * 并对普通用户按 created_by_id 过滤，避免导出时泄露他人数据的数量与时间。
  */
 function queryProjects(params, user) {
+  const cacheKey = `projects|${user.id}|${paramsKey(params)}`;
+  const cached = cacheGet(dataCaches.projects, cacheKey, metaVersion);
+  if (cached) return cached;
+
   const { clause, args } = buildFilters(params, ['project_no', 'product_code', 'project_type']);
   // 软删除行不出现；条件无占位符，追加在 clause 之后不影响参数顺序
   const parts = [clause ? clause.replace(/^ WHERE /, '') : '', 'p.deleted_at IS NULL'];
@@ -374,7 +484,9 @@ function queryProjects(params, user) {
        GROUP BY p.id${order}`
     )
     .all(...ownArgs, ...allArgs);
-  return { rows };
+  const result = { rows };
+  cacheSet(dataCaches.projects, cacheKey, metaVersion, result);
+  return result;
 }
 
 /** 导出项目档案为 Excel（与列表同口径：同样的筛选、排序与归属统计） */
@@ -420,12 +532,24 @@ const importTokens = new Map(); // token -> { kind:'data'|'project', rows, user,
 const IMPORT_TTL = 30 * 60 * 1000;
 /** 单次导入行数上限：防止「合法但超大」的表格把内存与事务打满 */
 const MAX_IMPORT_ROWS = 50000;
+/** 所有待确认批次合计行数上限：防止开 100 个批次把几百万行对象留在内存里 */
+const MAX_IMPORT_TOTAL_ROWS = 200000;
 
 function newImportToken(rows, user, kind = 'data', lines = null) {
   // 清理过期批次
   const now = Date.now();
-  for (const [k, v] of importTokens) if (now - v.at > IMPORT_TTL) importTokens.delete(k);
-  // 上限保护：超过 100 个批次时淘汰最旧的
+  let totalRows = 0;
+  for (const [k, v] of importTokens) {
+    if (now - v.at > IMPORT_TTL) importTokens.delete(k);
+    else totalRows += v.rows.length;
+  }
+  // 淘汰最旧批次，直到剩余批次 + 本批次不超总行数上限
+  while (importTokens.size > 0 && totalRows + rows.length > MAX_IMPORT_TOTAL_ROWS) {
+    const oldest = [...importTokens.entries()].sort((a, b) => a[1].at - b[1].at)[0];
+    if (!oldest) break;
+    importTokens.delete(oldest[0]);
+    totalRows -= oldest[1].rows.length;
+  }
   if (importTokens.size >= 100) {
     const oldest = [...importTokens.entries()].sort((a, b) => a[1].at - b[1].at)[0];
     if (oldest) importTokens.delete(oldest[0]);
@@ -504,11 +628,13 @@ async function previewImportFile(res, req, user) {
   const p = await parseUpload(req, FIELDS, ['项目编号', '产品代码']);
   if (p.error) return fail(res, 400, p.error);
 
-  const rows = p.rows.filter((o) => o.project_no || o.product_code);
+  const keep = p.rows.map((o, i) => (o.project_no || o.product_code ? i : -1)).filter((i) => i >= 0);
+  const rows = keep.map((i) => p.rows[i]);
+  const lines = keep.map((i) => p.lines[i]);
   // 缺必填表头时仍返回预览（行数为 0），让界面明确提示缺少哪些列
   if (!rows.length && !p.missingRequired.length) return fail(res, 400, '没有可导入的有效数据行');
 
-  const token = newImportToken(rows, user, 'data');
+  const token = newImportToken(rows, user, 'data', lines);
   ok(res, {
     token,
     rowCount: rows.length,
@@ -558,7 +684,7 @@ function importByToken(res, body, user) {
     return ok(res, out.result);
   }
 
-  const out = performImport(item.rows, user, String(body.duplicate_action || '').toLowerCase());
+  const out = performImport(item.rows, user, String(body.duplicate_action || '').toLowerCase(), item.lines);
   if (out.dup) {
     // 重复待确认，保留批次，等用户选择覆盖/追加
     return send(res, 409, {
@@ -623,12 +749,13 @@ async function previewProjectImportFile(res, req, user) {
   });
 }
 
-/** 状态文本 → 1/0 */
+/** 状态文本 → 1/0；空值默认 1；无法识别返回 null，由调用方给出明确错误 */
 function parseStatus(v) {
   const s = String(v === null || v === undefined ? '' : v).trim();
   if (!s) return 1;
   if (/^(0|停用|已停|归档|已归档|关闭|否|no|false|n)$/i.test(s)) return 0;
-  return 1;
+  if (/^(1|启用|进行中|正常|是|yes|true|y)$/i.test(s)) return 1;
+  return null;
 }
 
 /**
@@ -639,7 +766,7 @@ function parseStatus(v) {
 function performProjectImport(rows, action, actor = null) {
   // 唯一索引覆盖软删除行：回收站里的同编号项目也按「已存在」处理，避免 INSERT 撞 UNIQUE
   const existMap = new Map(
-    db.prepare('SELECT id, project_no, deleted_at FROM projects').all().map((p) => [p.project_no, p])
+    db.prepare('SELECT id, project_no, product_code, deleted_at FROM projects').all().map((p) => [p.project_no, p])
   );
   let inserted = 0;
   let overwritten = 0;
@@ -680,12 +807,24 @@ function performProjectImport(rows, action, actor = null) {
           if (v === null || v === undefined || String(v).trim() === '') continue;
           patch[k] = String(v).trim();
         }
-        if ('status' in raw && String(raw.status).trim() !== '') patch.status = parseStatus(raw.status);
+        if ('status' in raw && String(raw.status).trim() !== '') {
+          const st = parseStatus(raw.status);
+          if (st === null) {
+            errors.push(`第 ${line} 行：状态「${String(raw.status).trim()}」无法识别`);
+            return;
+          }
+          patch.status = st;
+        }
         patch.updated_at = nowStr();
         // 覆盖到回收站里的同名项目时顺带复活（从回收站移回）
-        if (exist.deleted_at) patch.deleted_at = null;
+        if (exist.deleted_at) { patch.deleted_at = null; patch.deleted_batch = null; }
         if (Object.keys(patch).length > (exist.deleted_at ? 1 : 0)) {
           update('projects', exist.id, patch, { touch: false });
+          // 产品代码以项目档案为准：同步到已有数据，避免数据页继续显示旧代码
+          if (patch.product_code && patch.product_code !== exist.product_code) {
+            db.prepare('UPDATE project_data SET product_code = ?, updated_at = ? WHERE project_no = ?')
+              .run(patch.product_code, nowStr(), project_no);
+          }
           overwritten++;
         } else {
           skipped++;
@@ -693,12 +832,18 @@ function performProjectImport(rows, action, actor = null) {
         return;
       }
 
+      const statusGiven = 'status' in raw && String(raw.status).trim() !== '';
+      const status = statusGiven ? parseStatus(raw.status) : 1;
+      if (status === null) {
+        errors.push(`第 ${line} 行：状态「${String(raw.status).trim()}」无法识别`);
+        return;
+      }
       const row = {
         project_no,
         product_code: String(raw.product_code || '').trim(),
         project_type: String(raw.project_type || '').trim(),
         description: String(raw.description || '').trim() || null,
-        status: 'status' in raw ? parseStatus(raw.status) : 1,
+        status,
       };
       const miss = [];
       if (!row.product_code) miss.push('产品代码');
@@ -781,11 +926,15 @@ function pickData(body, { requireNo = true } = {}) {
       row[key] = null;
       continue;
     }
-    const meta = FIELDS.find((f) => f.key === key);
+    const meta = FIELD_MAP.get(key);
     if (meta.type === 'number') {
       const n = Number(v);
-      // 指标字段统一保留 2 位小数（四舍五入），见 db.js ROUND2_KEYS
-      row[key] = Number.isFinite(n) ? (meta.round2 ? Math.round(n * 100) / 100 : n) : null;
+      // 所有数值指标统一保留 2 位小数（四舍五入）
+      row[key] = Number.isFinite(n) ? Math.round((n + Number.EPSILON) * 100) / 100 : null;
+    } else if (meta.type === 'date') {
+      const d = normalizeDate(v);
+      if (!d) throw new Error('录入日期格式不正确，请使用 YYYY-MM-DD');
+      row[key] = d;
     } else {
       // 文本字段统一清洗：去控制字符、截断超长内容，避免脏数据进入列表与导出
       row[key] = cleanText(v, TEXT_LIMITS[key] || 200);
@@ -801,8 +950,7 @@ function insert(table, row, conflictNoop = false) {
   const sql = `INSERT ${conflictNoop ? 'OR IGNORE ' : ''}INTO ${table} (${keys.join(',')}) VALUES (${keys
     .map(() => '?')
     .join(',')})`;
-  const info = db.prepare(sql).run(...keys.map((k) => row[k]));
-  return info;
+  return cachedStmt(sql).run(...keys.map((k) => row[k]));
 }
 
 function update(table, id, row, { touch = true } = {}) {
@@ -811,7 +959,7 @@ function update(table, id, row, { touch = true } = {}) {
   // users 表没有 updated_at 列
   const tail = touch ? ', updated_at = ?' : '';
   const args = touch ? [...keys.map((k) => row[k]), nowStr(), id] : [...keys.map((k) => row[k]), id];
-  db.prepare(`UPDATE ${table} SET ${keys.map((k) => `${k} = ?`).join(', ')}${tail} WHERE id = ?`).run(...args);
+  cachedStmt(`UPDATE ${table} SET ${keys.map((k) => `${k} = ?`).join(', ')}${tail} WHERE id = ?`).run(...args);
 }
 
 /* ============================================================ 审计日志 */
@@ -1027,6 +1175,7 @@ const metaCache = new Map(); // `${userId}` -> { version, data }
 function invalidateMeta() {
   metaVersion += 1;
   metaCache.clear();
+  clearDataCaches();
 }
 
 const cmpText = (a, b) => String(a).localeCompare(String(b), 'zh-CN');
@@ -1147,13 +1296,15 @@ function updateProject(res, id, body, user) {
   }
   if ('product_code' in row && !row.product_code) return fail(res, 400, '产品代码不能为空');
   if ('project_type' in row && !row.project_type) return fail(res, 400, '项目类型不能为空');
-  // 改项目编号需要同时改写子表，放在同一事务里：任一失败则整体回滚，避免项目与数据脱钩
+  // 改项目编号 / 产品代码需要同时改写子表，放在同一事务里：任一失败则整体回滚，避免项目与数据脱钩
   db.exec('BEGIN');
   try {
-    if (row.project_no && row.project_no !== cur.project_no) {
-      db.prepare('UPDATE project_data SET project_no = ?, updated_at = ? WHERE project_no = ?').run(
-        row.project_no, nowStr(), cur.project_no
-      );
+    const nextNo = row.project_no || cur.project_no;
+    const nextPc = row.product_code || cur.product_code;
+    if (nextNo !== cur.project_no || nextPc !== cur.product_code) {
+      db.prepare(
+        'UPDATE project_data SET project_no = ?, product_code = ?, updated_at = ? WHERE project_no = ?'
+      ).run(nextNo, nextPc, nowStr(), cur.project_no);
     }
     update('projects', id, row);
     db.exec('COMMIT');
@@ -1198,23 +1349,23 @@ function bulkDeleteProjects(res, body, user) {
   if (ids.length > 500) return fail(res, 400, '单次最多删除 500 个项目');
   const marks = ids.map(() => '?').join(',');
   const pros = db.prepare(`SELECT id, project_no FROM projects WHERE id IN (${marks}) AND deleted_at IS NULL`).all(...ids);
-  const pnos = pros.map((p) => p.project_no);
   let removedData = 0;
+  let removed = 0;
   db.exec('BEGIN');
   try {
     const now = nowStr();
-    for (const pno of pnos) {
-      removedData += db.prepare('SELECT COUNT(*) AS c FROM project_data WHERE project_no = ? AND deleted_at IS NULL').get(pno).c;
+    for (const p of pros) {
+      const batch = newBatchId();
+      removedData += db.prepare('SELECT COUNT(*) AS c FROM project_data WHERE project_no = ? AND deleted_at IS NULL').get(p.project_no).c;
+      db.prepare('UPDATE project_data SET deleted_at = ?, deleted_batch = ? WHERE project_no = ? AND deleted_at IS NULL')
+        .run(now, batch, p.project_no);
+      removed += db.prepare('UPDATE projects SET deleted_at = ?, deleted_batch = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL')
+        .run(now, batch, now, p.id).changes;
     }
-    if (pnos.length) {
-      const pm = pnos.map(() => '?').join(',');
-      db.prepare(`UPDATE project_data SET deleted_at = ? WHERE project_no IN (${pm}) AND deleted_at IS NULL`).run(now, ...pnos);
-    }
-    const info = db.prepare(`UPDATE projects SET deleted_at = ?, updated_at = ? WHERE id IN (${marks}) AND deleted_at IS NULL`).run(now, now, ...ids);
     db.exec('COMMIT');
     logAudit(user, 'soft_delete', 'project', null,
-      `批量删除 ${info.changes} 个项目（${pros.map((p) => p.project_no).join('、')}）及其 ${removedData} 条数据`, { ids });
-    ok(res, { removed: info.changes, removedData });
+      `批量删除 ${removed} 个项目（${pros.map((p) => p.project_no).join('、')}）及其 ${removedData} 条数据`, { ids });
+    ok(res, { removed, removedData });
   } catch (e) {
     db.exec('ROLLBACK');
     throw e;
@@ -1226,10 +1377,11 @@ function deleteProject(res, id, user) {
   if (!cur) return fail(res, 404, '项目不存在');
   const cnt = db.prepare('SELECT COUNT(*) AS c FROM project_data WHERE project_no = ? AND deleted_at IS NULL').get(cur.project_no).c;
   const now = nowStr();
+  const batch = newBatchId();
   db.exec('BEGIN');
   try {
-    db.prepare('UPDATE projects SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL').run(now, now, id);
-    db.prepare('UPDATE project_data SET deleted_at = ? WHERE project_no = ? AND deleted_at IS NULL').run(now, cur.project_no);
+    db.prepare('UPDATE projects SET deleted_at = ?, deleted_batch = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL').run(now, batch, now, id);
+    db.prepare('UPDATE project_data SET deleted_at = ?, deleted_batch = ? WHERE project_no = ? AND deleted_at IS NULL').run(now, batch, cur.project_no);
     db.exec('COMMIT');
   } catch (e) {
     db.exec('ROLLBACK');
@@ -1260,6 +1412,10 @@ function listData(res, params, user) {
  * 其余条件（含关键词 / 日期 / 权限）全部参与过滤，因此结果与选择顺序无关。
  */
 function dataFacets(res, params, user) {
+  const cacheKey = `facets|${user.id}|${paramsKey(params)}`;
+  const cached = cacheGet(dataCaches.facets, cacheKey, metaVersion);
+  if (cached) return ok(res, cached);
+
   const dims = [
     ['projectNos', 'project_no'],
     ['productCodes', 'product_code'],
@@ -1276,7 +1432,9 @@ function dataFacets(res, params, user) {
     const sql = `SELECT DISTINCT ${col} AS v FROM project_data${w} AND ${col} IS NOT NULL AND ${col} <> ''`;
     options[name] = db.prepare(sql).all(...args).map((r) => r.v).sort(cmpText);
   }
-  ok(res, { options });
+  const data = { options };
+  cacheSet(dataCaches.facets, cacheKey, metaVersion, data);
+  ok(res, data);
 }
 
 function getData(res, id, user) {
@@ -1309,14 +1467,17 @@ function hasFullKey(row) {
 
 /** 查找五元组已存在的记录，并顺带带回总条数（一条 SQL 完成 count + 取样） */
 function findDuplicate(key) {
-  return db
-    .prepare(
-      `SELECT *, COUNT(*) OVER () AS dup_count FROM project_data
-       WHERE deleted_at IS NULL AND project_no = ? AND product_code = ? AND IFNULL(base,'') = ?
-         AND IFNULL(process_code,'') = ? AND IFNULL(work_order,'') = ?
-       ORDER BY id DESC LIMIT 1`
-    )
-    .get(key.project_no, key.product_code, key.base || '', key.process_code || '', key.work_order || '');
+  return cachedStmt(
+    `SELECT *, COUNT(*) OVER () AS dup_count FROM project_data
+     WHERE deleted_at IS NULL AND project_no = ? AND product_code = ? AND IFNULL(base,'') = ?
+       AND IFNULL(process_code,'') = ? AND IFNULL(work_order,'') = ?
+     ORDER BY id DESC LIMIT 1`
+  ).get(key.project_no, key.product_code, key.base || '', key.process_code || '', key.work_order || '');
+}
+
+/** 五元组的稳定字符串键，用于导入时在内存里判重 */
+function dupKey(row) {
+  return [row.project_no || '', row.product_code || '', row.base || '', row.process_code || '', row.work_order || ''].join('\u0001');
 }
 
 /** 拼出五元组的可读描述 */
@@ -1342,7 +1503,7 @@ function createData(res, body, user) {
   const proj = requireProject(row.project_no);
   if (!proj) return fail(res, 400, `项目编号 ${row.project_no} 不存在，请先在项目列表中创建该项目`);
   row.product_code = proj.product_code; // 以项目档案为准，避免不一致
-  if (!('entry_date' in row) || !row.entry_date) row.entry_date = new Date().toISOString().slice(0, 10);
+  if (!('entry_date' in row) || !row.entry_date) row.entry_date = localDate();
 
   // 五项齐全才做重复判定
   const action = String(body.duplicate_action || '').toLowerCase();
@@ -1424,7 +1585,9 @@ function deleteData(res, id, user) {
   // 软删除：仅打标记，可在回收站恢复
   const cur = db.prepare('SELECT * FROM project_data WHERE id = ? AND deleted_at IS NULL').get(id);
   if (!cur) return fail(res, 404, '数据记录不存在');
-  db.prepare('UPDATE project_data SET deleted_at = ? WHERE id = ?').run(nowStr(), id);
+  const now = nowStr();
+  db.prepare('UPDATE project_data SET deleted_at = ?, deleted_batch = ?, updated_at = ? WHERE id = ?')
+    .run(now, newBatchId(), now, id);
   logAudit(user, 'soft_delete', 'data', id, `删除数据（${cur.project_no} / 工单 ${cur.work_order || '-'} / 日期 ${cur.entry_date}）`);
   ok(res);
 }
@@ -1437,11 +1600,12 @@ function bulkDeleteData(res, body, user) {
   const marks = ids.map(() => '?').join(',');
   const rows = db.prepare(`SELECT id, project_no, work_order FROM project_data WHERE id IN (${marks}) AND deleted_at IS NULL`).all(...ids);
   if (rows.length === 0) return fail(res, 404, '数据记录不存在');
-  const stmt = db.prepare('UPDATE project_data SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL');
+  const stmt = db.prepare('UPDATE project_data SET deleted_at = ?, deleted_batch = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL');
   let n = 0;
   db.exec('BEGIN');
   try {
-    for (const id of ids) n += stmt.run(nowStr(), id).changes;
+    const now = nowStr();
+    for (const id of ids) n += stmt.run(now, newBatchId(), now, id).changes;
     db.exec('COMMIT');
   } catch (e) {
     db.exec('ROLLBACK');
@@ -1458,18 +1622,24 @@ function listRecycle(res, user) {
   if (!isAdmin(user)) return fail(res, 403, '仅管理员可查看回收站');
   const projects = db
     .prepare(
-      `SELECT p.id, p.project_no, p.product_code, p.project_type, p.status, p.deleted_at,
-              (SELECT COUNT(*) FROM project_data d WHERE d.project_no = p.project_no AND d.deleted_at IS NOT NULL) AS data_count
+      `SELECT p.id, p.project_no, p.product_code, p.project_type, p.status, p.deleted_at, p.deleted_batch,
+              (SELECT COUNT(*) FROM project_data d
+               WHERE d.project_no = p.project_no AND d.deleted_at IS NOT NULL
+                 AND (p.deleted_batch IS NULL OR d.deleted_batch = p.deleted_batch)) AS data_count
        FROM projects p WHERE p.deleted_at IS NOT NULL ORDER BY p.deleted_at DESC`
     )
     .all();
   const datas = db
     .prepare(
-      `SELECT id, project_no, product_code, work_order, entry_date, created_by, deleted_at
-       FROM project_data
-       WHERE deleted_at IS NOT NULL
-         AND project_no NOT IN (SELECT project_no FROM projects WHERE deleted_at IS NOT NULL)
-       ORDER BY deleted_at DESC LIMIT 1000`
+      `SELECT d.id, d.project_no, d.product_code, d.work_order, d.entry_date, d.created_by, d.deleted_at
+       FROM project_data d
+       WHERE d.deleted_at IS NOT NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM projects p
+           WHERE p.deleted_at IS NOT NULL AND p.project_no = d.project_no
+             AND (p.deleted_batch IS NULL OR d.deleted_batch = p.deleted_batch)
+         )
+       ORDER BY d.deleted_at DESC LIMIT 1000`
     )
     .all();
   ok(res, { projects, datas, keepDays: SOFT_DELETE_KEEP_DAYS });
@@ -1486,26 +1656,44 @@ function restoreRecycle(res, body, user) {
   const marks = ids.map(() => '?').join(',');
 
   if (entity === 'project') {
-    const pros = db.prepare(`SELECT id, project_no FROM projects WHERE id IN (${marks}) AND deleted_at IS NOT NULL`).all(...ids);
+    const pros = db.prepare(`SELECT id, project_no, deleted_batch FROM projects WHERE id IN (${marks}) AND deleted_at IS NOT NULL`).all(...ids);
     if (pros.length === 0) return fail(res, 404, '项目不存在或不在回收站中');
-    const pnos = pros.map((p) => p.project_no);
-    const pm = pnos.map(() => '?').join(',');
     db.exec('BEGIN');
     try {
       const now = nowStr();
-      const p = db.prepare(`UPDATE projects SET deleted_at = NULL, updated_at = ? WHERE id IN (${marks}) AND deleted_at IS NOT NULL`).run(now, ...ids);
-      // 项目恢复时，随它一起被软删除的数据一并恢复
-      const d = db.prepare(`UPDATE project_data SET deleted_at = NULL WHERE project_no IN (${pm}) AND deleted_at IS NOT NULL`).run(...pnos);
+      let restored = 0;
+      let restoredData = 0;
+      const stmtP = db.prepare(
+        'UPDATE projects SET deleted_at = NULL, deleted_batch = NULL, updated_at = ? WHERE id = ? AND deleted_at IS NOT NULL'
+      );
+      for (const p of pros) {
+        // 有批次：只恢复随该项目一起删除的数据；更早单独删除的数据保持原状
+        const d = p.deleted_batch
+          ? db.prepare(
+            `UPDATE project_data SET deleted_at = NULL, deleted_batch = NULL, updated_at = ?
+             WHERE project_no = ? AND deleted_at IS NOT NULL AND deleted_batch = ?`
+          ).run(now, p.project_no, p.deleted_batch)
+          : db.prepare(
+            `UPDATE project_data SET deleted_at = NULL, deleted_batch = NULL, updated_at = ?
+             WHERE project_no = ? AND deleted_at IS NOT NULL`
+          ).run(now, p.project_no);
+        restoredData += d.changes;
+        restored += stmtP.run(now, p.id).changes;
+      }
       db.exec('COMMIT');
-      logAudit(user, 'restore', 'project', null, `从回收站恢复 ${p.changes} 个项目（${pnos.join('、')}）及其 ${d.changes} 条数据`, { ids });
-      return ok(res, { restored: p.changes, restoredData: d.changes });
+      logAudit(user, 'restore', 'project', null,
+        `从回收站恢复 ${restored} 个项目（${pros.map((p) => p.project_no).join('、')}）及其 ${restoredData} 条数据`, { ids });
+      return ok(res, { restored, restoredData });
     } catch (e) {
       db.exec('ROLLBACK');
       throw e;
     }
   }
 
-  const n = db.prepare(`UPDATE project_data SET deleted_at = NULL WHERE id IN (${marks}) AND deleted_at IS NOT NULL`).run(...ids).changes;
+  const n = db.prepare(
+    `UPDATE project_data SET deleted_at = NULL, deleted_batch = NULL, updated_at = ?
+     WHERE id IN (${marks}) AND deleted_at IS NOT NULL`
+  ).run(nowStr(), ...ids).changes;
   if (n === 0) return fail(res, 404, '数据记录不存在或不在回收站中');
   logAudit(user, 'restore', 'data', null, `从回收站恢复 ${n} 条数据`, { ids });
   ok(res, { restored: n, restoredData: 0 });
@@ -1522,17 +1710,26 @@ function purgeRecycle(res, body, user) {
   const marks = ids.map(() => '?').join(',');
 
   if (entity === 'project') {
-    const pros = db.prepare(`SELECT id, project_no FROM projects WHERE id IN (${marks}) AND deleted_at IS NOT NULL`).all(...ids);
+    const pros = db.prepare(`SELECT id, project_no, deleted_batch FROM projects WHERE id IN (${marks}) AND deleted_at IS NOT NULL`).all(...ids);
     if (pros.length === 0) return fail(res, 404, '项目不存在或不在回收站中');
-    const pnos = pros.map((p) => p.project_no);
-    const pm = pnos.map(() => '?').join(',');
     db.exec('BEGIN');
     try {
-      const d = db.prepare(`DELETE FROM project_data WHERE project_no IN (${pm}) AND deleted_at IS NOT NULL`).run(...pnos);
-      const p = db.prepare(`DELETE FROM projects WHERE id IN (${marks}) AND deleted_at IS NOT NULL`).run(...ids);
+      let purged = 0;
+      let purgedData = 0;
+      const stmtP = db.prepare(`DELETE FROM projects WHERE id = ? AND deleted_at IS NOT NULL`);
+      for (const p of pros) {
+        const d = p.deleted_batch
+          ? db.prepare(`DELETE FROM project_data WHERE project_no = ? AND deleted_at IS NOT NULL AND deleted_batch = ?`)
+            .run(p.project_no, p.deleted_batch)
+          : db.prepare(`DELETE FROM project_data WHERE project_no = ? AND deleted_at IS NOT NULL`)
+            .run(p.project_no);
+        purgedData += d.changes;
+        purged += stmtP.run(p.id).changes;
+      }
       db.exec('COMMIT');
-      logAudit(user, 'purge', 'project', null, `彻底删除 ${p.changes} 个项目（${pnos.join('、')}）及其 ${d.changes} 条数据`, { ids });
-      return ok(res, { purged: p.changes, purgedData: d.changes });
+      logAudit(user, 'purge', 'project', null,
+        `彻底删除 ${purged} 个项目（${pros.map((p) => p.project_no).join('、')}）及其 ${purgedData} 条数据`, { ids });
+      return ok(res, { purged, purgedData });
     } catch (e) {
       db.exec('ROLLBACK');
       throw e;
@@ -1548,25 +1745,31 @@ function purgeRecycle(res, body, user) {
 /**
  * 归一化导入值：
  *  - 空值（空串 / 空格 / - / N/A / 未检测 等）→ undefined（留空）
- *  - 数值字段包含非数字字符（如 "12.3abc"、"<0.01"）→ 尝试提取数字，失败则留空
+ *  - 数值字段包含非数字字符（如 "12.3abc"、"<0.01"）→ 提取数字；语义被改变的写法返回 warning
+ * 返回 { value, warning? }
  */
 const BLANK_RE = /^(|\s*|-{1,2}|\/|—|n\/?a|null|nan|无|未检|未检测|未测|待检)$/i;
 
 function normalizeImportValue(key, value) {
-  const meta = FIELDS.find((f) => f.key === key);
-  if (value === null || value === undefined) return undefined;
+  const meta = FIELD_MAP.get(key);
+  if (value === null || value === undefined) return { value: undefined };
   const s = String(value).trim();
-  if (BLANK_RE.test(s)) return undefined;
+  if (BLANK_RE.test(s)) return { value: undefined };
 
   if (meta && meta.type === 'number') {
     // 去掉千分位、百分号、空白与比较符，保留数字、小数点、负号、科学计数
     const cleaned = s.replace(/[,，\s%]/g, '').replace(/^[<>≤≥约~]+/, '');
     const m = cleaned.match(/-?\d+(\.\d+)?(e[-+]?\d+)?/i);
-    if (!m) return undefined; // 纯文本 → 留空
+    if (!m) return { value: undefined, warning: `无法识别为数字，已留空` };
     const n = Number(m[0]);
-    return Number.isFinite(n) ? n : undefined;
+    if (!Number.isFinite(n)) return { value: undefined, warning: `无法识别为数字，已留空` };
+    let warning = '';
+    if (/^[<>≤≥]/.test(s)) warning = `原始值「${s}」含比较符，已按 ${n} 写入`;
+    else if (/^\s*-?\d+(\.\d+)?\s*(?:~|～|至|-)\s*-?\d/.test(s)) warning = `原始值「${s}」为区间，已取第一个数 ${n}`;
+    else if (s.includes('%')) warning = `原始值「${s}」含百分号，按 ${n} 保存（不除以 100）`;
+    return { value: n, warning };
   }
-  return s;
+  return { value: s };
 }
 
 /**
@@ -1574,12 +1777,13 @@ function normalizeImportValue(key, value) {
  * duplicate_action：
  *   'overwrite' 覆盖已有记录；'append' 全部追加；未指定时若命中重复则返回 409 让前端询问
  */
-function performImport(rows, user, action) {
+function performImport(rows, user, action, lines = null) {
   const labelMap = new Map(FIELDS.map((f) => [f.label, f.key]));
   const keySet = new Set(DATA_KEYS);
   let inserted = 0;
   let overwritten = 0;
   const errors = [];
+  const warnings = [];      // 语义被转换的单元格（比较符 / 区间 / 百分号等），导入后提示
   const dupRows = [];       // 命中的重复行（供前端确认）
   const filledCount = {};   // 每个字段被成功填充的次数
   let blankTotal = 0;       // 留空的单元格总数
@@ -1589,16 +1793,58 @@ function performImport(rows, user, action) {
     db.prepare('SELECT project_no, product_code FROM projects').all().map((p) => [p.project_no, p.product_code])
   );
 
+  // 五元组判重按项目惰性预取：每个项目只查一次，导入 5 万行不再逐行回表
+  const dupCache = new Map(); // project_no -> Map(key -> { row, count })
+  function loadDup(projectNo) {
+    const map = new Map();
+    const rs = db.prepare(
+      `SELECT *, COUNT(*) OVER (PARTITION BY IFNULL(base,''), IFNULL(process_code,''), IFNULL(work_order,'')) AS dup_count
+       FROM project_data WHERE deleted_at IS NULL AND project_no = ? ORDER BY id DESC`
+    ).all(projectNo);
+    for (const r of rs) {
+      const k = dupKey(r);
+      if (!map.has(k)) map.set(k, { row: r, count: Number(r.dup_count) || 1 });
+    }
+    dupCache.set(projectNo, map);
+    return map;
+  }
+  function lookupDup(row) {
+    const map = dupCache.get(row.project_no) || loadDup(row.project_no);
+    const hit = map.get(dupKey(row));
+    return hit ? { ...hit.row, dup_count: hit.count } : null;
+  }
+  function remember(row, id) {
+    const map = dupCache.get(row.project_no);
+    if (!map) return;
+    const k = dupKey(row);
+    const hit = map.get(k);
+    if (hit) {
+      hit.count += 1;
+      hit.row = { ...hit.row, ...row, id };
+    } else {
+      map.set(k, { row: { ...row, id }, count: 1 });
+    }
+  }
+
+  const lineOf = (i) => (lines && lines[i]) || i + 2;
+  const warn = (line, key, message) => {
+    if (warnings.length >= 50) return;
+    const label = (FIELD_MAP.get(key) && FIELD_MAP.get(key).label) || key;
+    warnings.push(`第 ${line} 行「${label}」：${message}`);
+  };
+
   db.exec('BEGIN');
   try {
     rows.forEach((raw, i) => {
+      const line = lineOf(i);
       const mapped = {};
       for (const [k, v] of Object.entries(raw)) {
         const key = labelMap.get(String(k).trim()) || (keySet.has(k) ? k : null);
         if (!key) continue;
         const norm = normalizeImportValue(key, v);
-        if (norm === undefined) continue; // 留空，不写入
-        mapped[key] = norm;
+        if (norm.warning) warn(line, key, norm.warning);
+        if (norm.value === undefined) continue; // 留空，不写入
+        mapped[key] = norm.value;
       }
       blankTotal += DATA_KEYS.filter((k) => !(k in mapped)).length;
 
@@ -1609,22 +1855,22 @@ function performImport(rows, user, action) {
           throw new Error(`项目编号 ${row.project_no} 不存在`);
         }
         row.product_code = projectMap.get(row.project_no); // 以项目档案为准
-        if (!row.entry_date) row.entry_date = new Date().toISOString().slice(0, 10);
+        if (!row.entry_date) row.entry_date = localDate();
 
-        // 五项齐全且已存在同键记录 → 视 duplicate_action 决定（一次查询取回记录与总数）
+        // 五项齐全且已存在同键记录 → 视 duplicate_action 决定
         let existing = null;
-        if (hasFullKey(row)) existing = findDuplicate(row);
+        if (hasFullKey(row)) existing = lookupDup(row);
 
         // 覆盖权限：与单条修改一致，普通用户只能覆盖自己录入的记录
         if (existing && !isAdmin(user) && existing.created_by_id !== user.id) {
-          errors.push(`第 ${i + 2} 行：该记录由「${existing.created_by || '他人'}」录入，无权覆盖；如需修改请联系管理员`);
+          errors.push(`第 ${line} 行：该记录由「${existing.created_by || '他人'}」录入，无权覆盖；如需修改请联系管理员`);
           return;
         }
 
         if (existing && !action) {
           // 先不写库，交给前端确认；继续收集其余重复行
           dupRows.push({
-            line: i + 2,
+            line,
             project_no: row.project_no,
             base: row.base,
             process_code: row.process_code,
@@ -1643,6 +1889,11 @@ function performImport(rows, user, action) {
           delete patch.created_by_id;
           patch.updated_by = user.username;
           update('project_data', existing.id, patch);
+          if (dupCache.has(row.project_no)) {
+            const map = dupCache.get(row.project_no);
+            const hit = map.get(dupKey(row));
+            if (hit) hit.row = { ...hit.row, ...patch };
+          }
           overwritten++;
           for (const k of Object.keys(patch)) filledCount[k] = (filledCount[k] || 0) + 1;
           return;
@@ -1651,11 +1902,12 @@ function performImport(rows, user, action) {
         row.created_by = user.username;
         row.created_by_id = user.id;
         row.updated_by = user.username;
-        insert('project_data', row);
+        const info = insert('project_data', row);
+        remember(row, Number(info.lastInsertRowid));
         inserted++;
         for (const k of Object.keys(row)) filledCount[k] = (filledCount[k] || 0) + 1;
       } catch (e) {
-        errors.push(`第 ${i + 2} 行：${e.message}`);
+        errors.push(`第 ${line} 行：${e.message}`);
       }
     });
     // 命中重复且用户尚未选择处理方式 → 整体回滚，只回报冲突信息
@@ -1686,6 +1938,8 @@ function performImport(rows, user, action) {
       overwritten,
       failed: errors.length,
       errors: errors.slice(0, 20),
+      warnings: warnings.slice(0, 20),
+      warningCount: warnings.length,
       blankCells: blankTotal,
       blankFields,
     },
@@ -1718,17 +1972,16 @@ function finishImport(res, rows, action, user) {
 
 /* ---------- 统计 ---------- */
 function getStats(res, user) {
+  const cacheKey = `stats|${user.id}`;
+  const cached = cacheGet(dataCaches.stats, cacheKey, metaVersion);
+  if (cached) return ok(res, cached);
+
   const of = ownerFilter(user);
   const w = of ? ` WHERE ${of.sql} AND deleted_at IS NULL` : ' WHERE deleted_at IS NULL';
   const args = of ? [of.arg] : [];
 
   const projectCount = db.prepare('SELECT COUNT(*) AS c FROM projects WHERE deleted_at IS NULL').get().c;
   const dataCount = db.prepare(`SELECT COUNT(*) AS c FROM project_data${w}`).get(...args).c;
-  const typeCount = db.prepare(`SELECT COUNT(DISTINCT project_type) AS c FROM projects WHERE deleted_at IS NULL`).get().c;
-  const baseCount = db
-    .prepare(`SELECT COUNT(DISTINCT base) AS c FROM project_data${w} AND base IS NOT NULL AND base <> ''`)
-    .get(...args).c;
-  const qtySum = db.prepare(`SELECT IFNULL(SUM(quantity),0) AS s FROM project_data${w}`).get(...args).s;
   const byType = db.prepare(`SELECT project_type AS name, COUNT(*) AS value FROM projects WHERE deleted_at IS NULL GROUP BY project_type ORDER BY value DESC`).all();
   // 产品代码 / 统计日期（录入日期）数据量分布
   const byProduct = db
@@ -1749,7 +2002,9 @@ function getStats(res, user) {
   const recent = db
     .prepare(`SELECT id, project_no, product_code, work_order, entry_date, quantity FROM project_data${w} ORDER BY id DESC LIMIT 10`)
     .all(...args);
-  ok(res, { stats: { projectCount, dataCount, typeCount, baseCount, qtySum, byType, byProduct, byDate, byStatus, recent } });
+  const stats = { projectCount, dataCount, byType, byProduct, byDate, byStatus, recent };
+  cacheSet(dataCaches.stats, cacheKey, metaVersion, stats);
+  ok(res, { stats });
 }
 
 /* ---------- 审计日志查询（仅管理员） ---------- */
@@ -1836,9 +2091,16 @@ function localStamp(d = new Date()) {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
-/** 生成一份一致性快照（SQLite 原生 VACUUM INTO） */
-function vacuumInto(target) {
-  db.exec(`VACUUM INTO '${String(target).replace(/'/g, "''")}'`);
+/** 生成一份一致性快照（SQLite 原生 VACUUM INTO）。
+ *  放到子进程执行：大库备份 / 导出时不再阻塞主进程的请求处理。 */
+const execFileAsync = promisify(execFile);
+async function vacuumInto(target) {
+  const script = path.join(__dirname, 'vacuum.cjs');
+  await execFileAsync(process.execPath, [script, DB_FILE, target], {
+    timeout: 10 * 60 * 1000,
+    windowsHide: true,
+    maxBuffer: 1024 * 1024,
+  });
 }
 
 function uniqueBackupPath() {
@@ -1908,11 +2170,11 @@ function getDatabaseInfo(res) {
   });
 }
 
-function exportDatabase(res, user) {
+async function exportDatabase(res, user) {
   ensureDir(DB_TMP_DIR);
   const file = path.join(DB_TMP_DIR, `export-${crypto.randomBytes(8).toString('hex')}.db`);
   try {
-    vacuumInto(file);
+    await vacuumInto(file);
     const buf = fs.readFileSync(file);
     logAudit(user, 'export', 'database', null, `导出数据库（${(buf.length / 1024).toFixed(1)} KB）`);
     sendFile(res, buf, `stkj-${dbStamp()}.db`, 'application/x-sqlite3');
@@ -1921,9 +2183,9 @@ function exportDatabase(res, user) {
   }
 }
 
-function createBackup(res, user) {
+async function createBackup(res, user) {
   const target = uniqueBackupPath();
-  vacuumInto(target);
+  await vacuumInto(target);
   const size = fs.statSync(target).size;
   const pruned = pruneBackups();
   logAudit(user, 'backup', 'database', null, `手动备份数据库（${(size / 1024).toFixed(1)} KB）`, {
@@ -2013,7 +2275,7 @@ function inspectSourceDatabase(file) {
       .all()
       .map((u) => ({
         ...u,
-        role: u.username === 'admin' && u.role === 'admin'
+        role: String(u.username).toLowerCase() === 'admin' && u.role === 'admin'
           ? 'sys_admin'
           : ['sys_admin', 'admin', 'user'].includes(u.role) ? u.role : 'user',
       }));
@@ -2058,7 +2320,7 @@ async function previewDatabaseImport(res, req, user) {
 }
 
 /** 把源库逐表复制进当前库：按列名取交集，兼容旧版本缺列；整段事务，失败自动回滚 */
-function applyDatabaseImport(file, user, { keepAdmin = true } = {}) {
+async function applyDatabaseImport(file, user, { keepAdmin = true } = {}) {
   const summary = inspectSourceDatabase(file);
   const before = databaseCounts();
   // 当前操作人的完整账号行：keepAdmin 时用它保证导入后仍能登录
@@ -2081,9 +2343,24 @@ function applyDatabaseImport(file, user, { keepAdmin = true } = {}) {
       payload[t] = { cols, rows: sdb.prepare(`SELECT ${quoted} FROM ${t}`).all() };
     }
 
+    // 来源库可能有仅大小写不同的账号：当前库已有 NOCASE 唯一索引，插入前先改成唯一名称
+    if (payload.users && payload.users.rows.length && payload.users.cols.includes('username')) {
+      const seen = new Set();
+      for (const row of payload.users.rows) {
+        const original = String(row.username || '').trim() || 'user';
+        let candidate = original;
+        let n = 2;
+        while (seen.has(candidate.toLowerCase())) {
+          candidate = `${original.slice(0, 26)}_${n++}`;
+        }
+        row.username = candidate;
+        seen.add(candidate.toLowerCase());
+      }
+    }
+
     // 先备份当前数据，再动库：即使导入失败或回滚，也有可恢复的副本
     backupPath = uniqueBackupPath();
-    vacuumInto(backupPath);
+    await vacuumInto(backupPath);
 
     db.exec('BEGIN IMMEDIATE');
     try {
@@ -2102,8 +2379,10 @@ function applyDatabaseImport(file, user, { keepAdmin = true } = {}) {
           stmt.run(...cols.map((c) => (typeof row[c] === 'bigint' ? Number(row[c]) : row[c])));
         }
       }
-      // 与 db.js 启动时的规范化保持一致
-      db.exec(`UPDATE users SET role = 'sys_admin' WHERE username = 'admin' AND role = 'admin'`);
+      // 与 db.js 启动时的规范化保持一致：数值统一 2 位、回收站补批次、角色规范化
+      normalizeNumbers(db);
+      backfillDeleteBatches(db);
+      db.exec(`UPDATE users SET role = 'sys_admin' WHERE username = 'admin' COLLATE NOCASE AND role = 'admin'`);
       db.exec(`UPDATE users SET role = 'user' WHERE role NOT IN ('sys_admin','admin','user')`);
       // 旧库没有归属人的数据：挂到最早的管理员账号下（与 db.js 启动逻辑一致）
       const orphan = db.prepare('SELECT COUNT(*) AS c FROM project_data WHERE created_by_id IS NULL').get().c;
@@ -2118,7 +2397,7 @@ function applyDatabaseImport(file, user, { keepAdmin = true } = {}) {
       }
       // 保证导入后仍能用当前密码登录：保留导入操作人的账号（密码 / 盐 / 状态），并确保为系统管理员
       if (keepAdmin && currentAdmin) {
-        const existing = db.prepare('SELECT id FROM users WHERE username = ?').get(currentAdmin.username);
+        const existing = db.prepare('SELECT id FROM users WHERE username = ? COLLATE NOCASE').get(currentAdmin.username);
         if (existing) {
           db.prepare(
             `UPDATE users SET password_hash = ?, salt = ?, role = 'sys_admin', status = 1, pwd_changed = ? WHERE id = ?`
@@ -2161,7 +2440,7 @@ function applyDatabaseImport(file, user, { keepAdmin = true } = {}) {
   };
 }
 
-function confirmDatabaseImport(res, body, user) {
+async function confirmDatabaseImport(res, body, user) {
   const token = String(body.token || '');
   const item = dbImportBatches.get(token);
   if (!item) return fail(res, 400, '导入批次已过期，请重新选择数据库文件');
@@ -2170,7 +2449,7 @@ function confirmDatabaseImport(res, body, user) {
 
   let out;
   try {
-    out = applyDatabaseImport(item.file, user, { keepAdmin: body.keep_admin !== false });
+    out = await applyDatabaseImport(item.file, user, { keepAdmin: body.keep_admin !== false });
   } catch (e) {
     const status = Number(e && e.status) || 500;
     const msg = status >= 400 && status < 500 ? e.message : `导入失败：${e.message}`;
@@ -2248,15 +2527,20 @@ function validateUserRows(rows, allowAdmin, lines) {
       errors.push(`第 ${line} 行：仅系统管理员可导入管理员账号`);
       return;
     }
+    const status = parseStatus(raw.status);
+    if (status === null) {
+      errors.push(`第 ${line} 行：状态「${String(raw.status).trim()}」无法识别，请填写「启用」或「停用」`);
+      return;
+    }
 
     clean.push({
       line,
       username,
       roleGiven,
-      real_name: String(raw.real_name || '').trim() || null,
+      real_name: cleanText(raw.real_name, 50) || null,
       role,
-      status: parseStatus(raw.status),
-      remark: String(raw.remark || '').trim() || null,
+      status,
+      remark: cleanText(raw.remark, 200) || null,
     });
   });
   return { clean, errors };
@@ -2397,13 +2681,17 @@ function listUsers(res) {
 }
 
 /** 新增用户：密码默认为账号 */
-function createUser(res, body, user) {
-  const username = (body.username || '').trim();
+async function createUser(res, body, user) {
+  const username = cleanText(body.username, MAX_USERNAME_LEN);
   if (!username) return fail(res, 400, '账号不能为空');
   if (!/^[A-Za-z0-9_.@-]{2,32}$/.test(username)) {
     return fail(res, 400, '账号需为 2-32 位字母、数字或 _ . @ -');
   }
-  if (db.prepare('SELECT id FROM users WHERE username = ?').get(username)) return fail(res, 409, '账号已存在');
+  // 用户名统一不区分大小写：Admin 与 admin 视为同一账号
+  if (db.prepare('SELECT id FROM users WHERE username = ? COLLATE NOCASE').get(username)) return fail(res, 409, '账号已存在');
+  if (body.password && String(body.password).length > MAX_PASSWORD_LEN) {
+    return fail(res, 400, `密码不能超过 ${MAX_PASSWORD_LEN} 位`);
+  }
 
   // 角色：仅系统管理员可创建管理员；其他人只能创建普通用户
   let role = 'user';
@@ -2414,29 +2702,30 @@ function createUser(res, body, user) {
 
   const password = String(body.password || '').trim() || username; // 密码默认为账号
   const salt = makeSalt();
+  const password_hash = await hashPasswordAsync(password, salt);
   insert('users', {
     username,
     salt,
-    password_hash: hashPassword(password, salt),
-    real_name: (body.real_name || '').trim() || null,
+    password_hash,
+    real_name: cleanText(body.real_name, 50) || null,
     role,
     status: body.status === 0 ? 0 : 1,
-    remark: (body.remark || '').trim() || null,
+    remark: cleanText(body.remark, 200) || null,
     pwd_changed: body.password ? 1 : 0, // 未指定密码 → 记为初始密码
   });
   logAudit(user, 'create', 'user', null, `新增用户 ${username}（${role === 'admin' ? '管理员' : '普通用户'}）`);
   ok(res, { username, role, defaultPassword: !body.password });
 }
 
-function updateUser(res, id, body, actor) {
+async function updateUser(res, id, body, actor) {
   const cur = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
   if (!cur) return fail(res, 404, '用户不存在');
   if (cur.role === 'sys_admin') return fail(res, 403, '系统管理员账号不可修改');
   if (!isSysAdmin(actor) && cur.role === 'admin') return fail(res, 403, '仅系统管理员可修改管理员账号');
 
   const row = {};
-  if ('real_name' in body) row.real_name = (body.real_name || '').trim() || null;
-  if ('remark' in body) row.remark = (body.remark || '').trim() || null;
+  if ('real_name' in body) row.real_name = cleanText(body.real_name, 50) || null;
+  if ('remark' in body) row.remark = cleanText(body.remark, 200) || null;
   if ('status' in body) row.status = body.status === 0 ? 0 : 1;
   if ('role' in body) {
     const next = body.role === 'admin' ? 'admin' : 'user';
@@ -2446,12 +2735,13 @@ function updateUser(res, id, body, actor) {
   if (body.reset_password) {
     // 重置为账号（初始密码）
     row.salt = makeSalt();
-    row.password_hash = hashPassword(cur.username, row.salt);
+    row.password_hash = await hashPasswordAsync(cur.username, row.salt);
     row.pwd_changed = 0;
   } else if (body.password) {
     if (String(body.password).length < 4) return fail(res, 400, '密码至少 4 位');
+    if (String(body.password).length > MAX_PASSWORD_LEN) return fail(res, 400, `密码不能超过 ${MAX_PASSWORD_LEN} 位`);
     row.salt = makeSalt();
-    row.password_hash = hashPassword(body.password, row.salt);
+    row.password_hash = await hashPasswordAsync(body.password, row.salt);
     row.pwd_changed = 1;
   }
   // 只有「停用 / 变更角色 / 改密」才需要强制下线；
@@ -2479,52 +2769,89 @@ function deleteUser(res, id, actor) {
   if (cur.id === actor.id) return fail(res, 400, '不能删除当前登录的账号');
 
   const dataCount = db.prepare('SELECT COUNT(*) AS c FROM project_data WHERE created_by_id = ?').get(id).c;
-  db.prepare('DELETE FROM users WHERE id = ?').run(id);
+  // 删除账号但保留其数据：把归属转给最早的管理员，避免 created_by_id 悬空后普通用户看不到
+  const owner = db
+    .prepare(
+      `SELECT id, username FROM users
+       WHERE id <> ? AND role IN ('sys_admin','admin')
+       ORDER BY CASE role WHEN 'sys_admin' THEN 0 ELSE 1 END, id LIMIT 1`
+    )
+    .get(id);
+  db.exec('BEGIN');
+  try {
+    if (owner && dataCount > 0) {
+      db.prepare('UPDATE project_data SET created_by = ?, created_by_id = ? WHERE created_by_id = ?')
+        .run(owner.username, owner.id, id);
+    }
+    db.prepare('DELETE FROM users WHERE id = ?').run(id);
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
   destroyUserSessions(id);
-  logAudit(actor, 'soft_delete', 'user', id, `删除用户 ${cur.username}（其名下 ${dataCount} 条数据保留）`);
-  ok(res, { removedUser: true, dataCount });
+  logAudit(actor, 'purge', 'user', id,
+    `删除用户 ${cur.username}（其名下 ${dataCount} 条数据转归 ${owner ? owner.username : '无'}）`);
+  ok(res, { removedUser: true, dataCount, transferredTo: owner ? owner.username : null });
 }
 
 /* ============================================================ 路由分发 */
 
 /* ---------- 登录相关（无需鉴权） ---------- */
-/** 登录失败计数，防止暴力猜解：同一账号连续失败 5 次锁定 5 分钟 */
+/** 登录失败计数：同时按「IP + 账号」和「IP」限流，避免只换账号绕过锁定 */
 const MAX_FAILS = 5;
+const IP_MAX_FAILS = 20;
 const LOCK_MS = 5 * 60 * 1000;
-const loginFails = new Map(); // username -> { count, firstAt, lockedUntil }
+const loginFails = new Map(); // "ip|username" -> { count, firstAt, lockedUntil }
+const ipFails = new Map();    // ip -> { count, firstAt, lockedUntil }
 
-function login(res, body, req) {
-  const username = (body.username || '').trim();
+function bumpFail(map, key, max) {
+  const now = Date.now();
+  const cur = map.get(key);
+  const next = !cur || now - cur.firstAt > LOCK_MS
+    ? { count: 1, firstAt: now, lockedUntil: 0 }
+    : { ...cur, count: cur.count + 1 };
+  if (next.count >= max) next.lockedUntil = now + LOCK_MS;
+  map.set(key, next);
+  // 兜底清理，避免长期运行后 Map 无限增长
+  if (map.size > 1000) {
+    for (const [k, v] of map) {
+      if (now - v.firstAt > LOCK_MS && (!v.lockedUntil || now > v.lockedUntil)) map.delete(k);
+    }
+  }
+  return next;
+}
+function lockedMessage(rec) {
+  if (!rec || !rec.lockedUntil || Date.now() >= rec.lockedUntil) return null;
+  const mins = Math.ceil((rec.lockedUntil - Date.now()) / 60000);
+  return `密码错误次数过多，请 ${mins} 分钟后再试`;
+}
+
+async function login(res, body, req) {
+  const username = cleanText(body.username, MAX_USERNAME_LEN);
   const password = String(body.password || '');
   if (!username || !password) return fail(res, 400, '请输入账号和密码');
-
-  const rec = loginFails.get(username);
-  if (rec && rec.lockedUntil && Date.now() < rec.lockedUntil) {
-    const mins = Math.ceil((rec.lockedUntil - Date.now()) / 60000);
-    return fail(res, 429, `密码错误次数过多，请 ${mins} 分钟后再试`);
+  if (password.length > MAX_PASSWORD_LEN) {
+    return fail(res, 400, `密码不能超过 ${MAX_PASSWORD_LEN} 位`);
   }
 
-  const u = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
-  // 账号不存在与密码错误返回同一提示，避免账号枚举
-  if (!u || !safeEqual(hashPassword(password, u.salt), u.password_hash)) {
-    const now = Date.now();
-    const cur = loginFails.get(username);
-    // 超过统计窗口（5 分钟）则重新计数
-    const next = !cur || now - cur.firstAt > LOCK_MS
-      ? { count: 1, firstAt: now, lockedUntil: 0 }
-      : { ...cur, count: cur.count + 1 };
-    if (next.count >= MAX_FAILS) next.lockedUntil = now + LOCK_MS;
-    loginFails.set(username, next);
-    // 兜底：清理已过统计窗口的旧记录，避免长期运行后 Map 无限增长
-    if (loginFails.size > 1000) {
-      for (const [k, v] of loginFails) {
-        if (now - v.firstAt > LOCK_MS && (!v.lockedUntil || now > v.lockedUntil)) loginFails.delete(k);
-      }
-    }
+  const ip = (req.socket && req.socket.remoteAddress) || '';
+  const key = `${ip}|${username.toLowerCase()}`;
+  const locked = lockedMessage(loginFails.get(key)) || lockedMessage(ipFails.get(ip));
+  if (locked) return fail(res, 429, locked);
+
+  // 用户名不区分大小写
+  const u = db.prepare('SELECT * FROM users WHERE username = ? COLLATE NOCASE').get(username);
+  // 账号不存在时也跑一次 scrypt，避免通过响应时间枚举账号
+  const passed = await verifyPassword(password, u && u.salt, u && u.password_hash);
+  if (!u || !passed) {
+    const next = bumpFail(loginFails, key, MAX_FAILS);
+    bumpFail(ipFails, ip, IP_MAX_FAILS);
     const left = MAX_FAILS - next.count;
     return fail(res, 401, left > 0 ? `账号或密码错误，还可尝试 ${left} 次` : '密码错误次数过多，请 5 分钟后再试');
   }
-  loginFails.delete(username);
+  loginFails.delete(key);
+  ipFails.delete(ip);
   if (u.status !== 1) return fail(res, 403, '该账号已停用，请联系管理员');
 
   db.prepare('UPDATE users SET last_login = ? WHERE id = ?').run(nowStr(), u.id);
@@ -2557,20 +2884,22 @@ function me(res, user) {
 }
 
 /** 自助修改密码 */
-function changePassword(res, body, user, req) {
+async function changePassword(res, body, user, req) {
   const oldPwd = String(body.old_password || '');
   const newPwd = String(body.new_password || '');
   if (!oldPwd || !newPwd) return fail(res, 400, '请填写原密码与新密码');
   if (newPwd.length < 4) return fail(res, 400, '新密码至少 4 位');
+  if (newPwd.length > MAX_PASSWORD_LEN) return fail(res, 400, `新密码不能超过 ${MAX_PASSWORD_LEN} 位`);
   if (newPwd === oldPwd) return fail(res, 400, '新密码不能与原密码相同');
 
   const u = db.prepare('SELECT * FROM users WHERE id = ?').get(user.id);
-  if (!u || !safeEqual(hashPassword(oldPwd, u.salt), u.password_hash)) {
+  if (!u || !(await verifyPassword(oldPwd, u.salt, u.password_hash))) {
     return fail(res, 400, '原密码不正确');
   }
   const salt = makeSalt();
+  const hash = await hashPasswordAsync(newPwd, salt);
   db.prepare('UPDATE users SET password_hash = ?, salt = ?, pwd_changed = 1 WHERE id = ?').run(
-    hashPassword(newPwd, salt), salt, user.id
+    hash, salt, user.id
   );
   // 改密后使该账号已有的全部会话失效（防止密码泄露期间被他人长期持有登录态），
   // 再为当前设备补发一个新会话，避免本机也被踢下线
@@ -2588,6 +2917,10 @@ async function handleApi(req, res, url) {
   const seg = p.replace(/^\/api\/?/, '').split('/').filter(Boolean);
 
   /* ---- 免登录接口 ---- */
+  if (p === '/api/health' && m === 'GET') {
+    try { db.prepare('SELECT 1').get(); return ok(res, { status: 'ok', uptime: Math.round(process.uptime()) }); }
+    catch { return fail(res, 500, '数据库不可用'); }
+  }
   if (p === '/api/auth/login' && m === 'POST') return login(res, await readBody(req), req);
   if (p === '/api/auth/logout' && m === 'POST') return logout(req, res);
 
@@ -2714,6 +3047,10 @@ async function handleApi(req, res, url) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   try {
+    if (url.pathname === '/healthz') {
+      try { db.prepare('SELECT 1').get(); return ok(res, { status: 'ok', uptime: Math.round(process.uptime()) }); }
+      catch { return fail(res, 500, '数据库不可用'); }
+    }
     if (url.pathname.startsWith('/api/')) {
       await handleApi(req, res, url);
       // 写操作后让 /api/meta 缓存失效，保证筛选下拉及时反映新增的项目 / 公司 / 工单

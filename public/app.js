@@ -94,6 +94,11 @@ function fmtNum(v, digits) {
   const s = Math.abs(n) >= 1000 ? n.toLocaleString('zh-CN', { maximumFractionDigits: 2 }) : String(Number(n.toPrecision(8)));
   return s;
 }
+/** 本地日期（YYYY-MM-DD）；toISOString 是 UTC，东八区 0–8 点会变成前一天 */
+function localDate(d = new Date()) {
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
 function toast(msg, type = '') {
   const root = el('#toastRoot');
   const t = document.createElement('div');
@@ -231,7 +236,7 @@ async function renderDashboard() {
                     <span class="recent-code">${esc(r.product_code)}</span>
                     ${r.work_order ? `<span class="meta recent-wo">工单 ${esc(r.work_order)}</span>` : ''}
                   </div>
-                  <div class="meta recent-side">${esc(r.entry_date || '')} · ${fmtNum(r.quantity)}</div>
+                  <div class="meta recent-side">${esc(r.entry_date || '')} · ${fmtNum(r.quantity, 2)}</div>
                 </div>`).join('')}
             </div>`
             : `<div class="empty" style="padding:32px"><p>暂无数据记录</p><span>前往「项目数据」新增第一条记录</span></div>`}
@@ -343,6 +348,7 @@ async function loadProjects() {
   state.projects.rows = allRows;
 
   const box = el('#projectTable');
+  if (!box) return; // 视图已切换（例如点了别的导航），本次响应不再渲染
   if (!rows.length) {
     box.innerHTML = `<div class="empty">
       <div class="ico"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></div>
@@ -945,7 +951,7 @@ function openDataModal(id, opts = {}) {
   const copyFrom = opts.copyFrom || null;
   const load = editing
     ? API.get('/api/data/' + id).then((r) => r.row)
-    : Promise.resolve(copyFrom ? { ...copyFrom } : { entry_date: new Date().toISOString().slice(0, 10) });
+    : Promise.resolve(copyFrom ? { ...copyFrom } : { entry_date: localDate() });
   load.then((row) => {
     const groups = [
       { title: '基础信息', keys: ['project_no', 'product_code', 'base', 'process_code', 'work_order'] },
@@ -1391,11 +1397,19 @@ function openImport() {
       return `导入完成：${parts.join('、')}`;
     },
     after: async (r) => {
+      const lines = [];
+      if (r.warningCount) {
+        lines.push(`有 ${r.warningCount} 个单元格的原始写法被转换（比较符 / 区间 / 百分号）：\n` +
+          (r.warnings || []).join('\n'));
+      }
       if (r.blankFields && r.blankFields.length) {
+        lines.push(`以下 ${r.blankFields.length} 个字段在所有记录中均未提供，已自动留空：\n` +
+          r.blankFields.join('、'));
+      }
+      if (lines.length) {
         setTimeout(() => alert(
           `导入完成：成功 ${r.inserted} 条${r.overwritten ? `，覆盖 ${r.overwritten} 条` : ''}${r.failed ? `，失败 ${r.failed} 条` : ''}\n\n` +
-          `以下 ${r.blankFields.length} 个字段在所有记录中均未提供，已自动留空：\n` +
-          r.blankFields.join('、')
+          lines.join('\n\n')
         ), 300);
       }
       await refreshMeta();
@@ -1673,7 +1687,7 @@ function confirmDeleteUser(id, name, dataCount) {
   openModal({
     title: '删除用户', narrow: true,
     body: `<p style="margin:0 0 8px;color:var(--text-2)">确定删除账号 <b>${esc(name)}</b> 吗？</p>
-      ${dataCount ? `<p style="margin:0;font-size:12.5px;color:var(--warn)">该用户名下有 <b>${dataCount}</b> 条数据记录，删除后将失去归属人，仅管理员仍可见。</p>`
+      ${dataCount ? `<p style="margin:0;font-size:12.5px;color:var(--warn)">该用户名下有 <b>${dataCount}</b> 条数据记录，删除后会自动转归最早的管理员账号，不会丢失。</p>`
         : `<p style="margin:0;font-size:12.5px;color:var(--text-3)">该用户暂无数据记录。</p>`}`,
     footer: `<button class="btn" onclick="closeModal()">取消</button><button class="btn btn-danger" id="okDel">确认删除</button>`,
   });

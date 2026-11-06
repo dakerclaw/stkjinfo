@@ -23,7 +23,7 @@ function seedUsers() {
   const count = db.prepare('SELECT COUNT(*) AS c FROM users').get().c;
   if (count > 0) {
     // 已有账号：仅确保 admin 是系统管理员
-    db.exec(`UPDATE users SET role = 'sys_admin' WHERE username = 'admin'`);
+    db.exec(`UPDATE users SET role = 'sys_admin' WHERE username = 'admin' COLLATE NOCASE`);
     console.log(`  用户表已有 ${count} 个账号，跳过创建（已确保 admin 为系统管理员）`);
     return;
   }
@@ -63,6 +63,12 @@ const COKES = ['针状焦', '石油焦', '沥青焦', '混合焦'];
 const rnd = (min, max, d = 2) => Number((min + Math.random() * (max - min)).toFixed(d));
 let woSeq = 1;
 
+/** 本地日期（YYYY-MM-DD），避免 toISOString 的 UTC 偏移 */
+function localDate(d = new Date()) {
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
 function makeRow(pno, pcode, i) {
   const base = BASES[i % BASES.length];
   const proc = PROCS[i % PROCS.length];
@@ -71,41 +77,41 @@ function makeRow(pno, pcode, i) {
   const dx10 = rnd(4, 9);
   const dx50 = rnd(12, 20);
   const dx90 = rnd(28, 42);
-  const date = new Date(Date.now() - Math.floor(Math.random() * 120) * 86400000).toISOString().slice(0, 10);
+  const date = localDate(new Date(Date.now() - Math.floor(Math.random() * 120) * 86400000));
   return {
     project_no: pno, product_code: pcode, base, process_code: proc, work_order: wo,
     coke_type: coke,
     dx0: rnd(1.2, 2.5), dx1: rnd(2.2, 3.6), dx10, dx50, dx90,
     dx99: rnd(55, 75), dx100: rnd(90, 120),
     k_value: rnd(0.8, 2.4),
-    tap_density: rnd(0.85, 1.15, 3),
-    ssa_domestic: rnd(0.8, 2.6, 3),
-    ssa_mic: rnd(0.9, 2.8, 3),
+    tap_density: rnd(0.85, 1.15, 2),
+    ssa_domestic: rnd(0.8, 2.6, 2),
+    ssa_mic: rnd(0.9, 2.8, 2),
     graphitization: rnd(88, 96),
     capacity: rnd(330, 365),
     lithium_inter: rnd(355, 385),
     lithium_deint: rnd(330, 362),
     first_eff: rnd(89, 94),
-    magnetic: rnd(0.02, 0.15, 3),
+    magnetic: rnd(0.02, 0.15, 2),
     ph_value: rnd(6.5, 8.5),
-    press_0_5t: rnd(1.55, 1.75, 3), press_1t: rnd(1.6, 1.8, 3),
-    press_1_5t: rnd(1.62, 1.84, 3), press_2t: rnd(1.65, 1.88, 3),
-    press_5t: rnd(1.70, 1.95, 3),
-    true_density: rnd(2.18, 2.28, 3),
-    oversize: rnd(0.01, 0.08, 3),
-    moisture_fp: rnd(0.01, 0.06, 3),
-    ash: rnd(0.01, 0.05, 3),
-    volatile: rnd(0.3, 1.2, 3),
-    moisture: rnd(0.05, 0.25, 3),
-    sulfur: rnd(0.005, 0.03, 4),
-    caking_index: rnd(60, 85, 1),
-    oil_absorption: rnd(45, 75, 1),
+    press_0_5t: rnd(1.55, 1.75, 2), press_1t: rnd(1.6, 1.8, 2),
+    press_1_5t: rnd(1.62, 1.84, 2), press_2t: rnd(1.65, 1.88, 2),
+    press_5t: rnd(1.70, 1.95, 2),
+    true_density: rnd(2.18, 2.28, 2),
+    oversize: rnd(0.01, 0.08, 2),
+    moisture_fp: rnd(0.01, 0.06, 2),
+    ash: rnd(0.01, 0.05, 2),
+    volatile: rnd(0.3, 1.2, 2),
+    moisture: rnd(0.05, 0.25, 2),
+    sulfur: rnd(0.005, 0.03, 2),
+    caking_index: rnd(60, 85, 2),
+    oil_absorption: rnd(45, 75, 2),
     coking_value: rnd(6, 12),
     hgi: rnd(55, 80),
     efficiency: rnd(92, 98.5),
     yield_rate: rnd(86, 96),
-    energy: rnd(3200, 5600, 1),
-    quantity: rnd(12, 180, 1),
+    energy: rnd(3200, 5600, 2),
+    quantity: rnd(12, 180, 2),
     entry_date: date,
     remark: i % 5 === 0 ? '抽检复测，数据正常' : null,
   };
@@ -131,7 +137,7 @@ function seedData() {
     `INSERT INTO project_data (${keys.join(',')}) VALUES (${keys.map(() => '?').join(',')})`
   );
   // 示例数据归属到 admin 账号，便于管理员直接查看
-  const owner = db.prepare(`SELECT id, username FROM users WHERE username = 'admin'`).get() || { id: null, username: 'admin' };
+  const owner = db.prepare(`SELECT id, username FROM users WHERE username = 'admin' COLLATE NOCASE`).get() || { id: null, username: 'admin' };
   let n = 0;
   for (const [pno, pcode] of PROJECTS) {
     const cnt = 2 + Math.floor(Math.random() * 4);
