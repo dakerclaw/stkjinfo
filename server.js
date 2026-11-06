@@ -2053,8 +2053,11 @@ function getStats(res, user) {
     .prepare(`SELECT id, project_no, product_code, work_order, entry_date, quantity FROM project_data${w} ORDER BY id DESC LIMIT 10`)
     .all(...args);
   const stats = { projectCount, dataCount, byType, byProduct, byDate, byStatus, recent };
-  cacheSet(dataCaches.stats, cacheKey, metaVersion, stats);
-  ok(res, { stats });
+  // 缓存里存「完整响应对象」，与未命中时的 ok(res, { stats }) 保持同一结构；
+  // 否则命中缓存会返回被摊平的字段，前端 const { stats } 拿到 undefined。
+  const data = { stats };
+  cacheSet(dataCaches.stats, cacheKey, metaVersion, data);
+  ok(res, data);
 }
 
 /* ---------- 审计日志查询（仅管理员） ---------- */
