@@ -121,18 +121,41 @@ say "[5/6] nginx + TLS（$DOMAIN）"
 # ------------------------------------------------------------
 if [ "$WITH_NGINX" = 1 ]; then
   NGX_CFG="/etc/nginx/sites-available/$DOMAIN"
-  if [ -f "$NGX_CFG" ]; then
-    say "  nginx 站点配置已存在，跳过（如需重写请先删除 $NGX_CFG）"
-  else
-    say "  写入站点配置 $NGX_CFG"
-    CERT_DIR="/etc/letsencrypt/live/$DOMAIN"
+  CERT_DIR="/etc/letsencrypt/live/$DOMAIN"
+  WEBROOT="/var/www/html"
+  mkdir -p "$WEBROOT"
+
+  # 生成配置：80 只做 ACME 校验 + 跳转；443 独立 server 块直接反代。
+  # 不要把 443 和 80 写进同一个块，也不要在 443 的 location 里放
+  # X-Forwarded-Proto 判断，否则浏览器直连 443 会 301 到自身形成死循环。
+  write_nginx_cfg() {
+    cat > "$NGX_CFG" <<EOF
+# stkj 项目管理系统 — $DOMAIN（root 一键安装脚本生成）
+# 80 只做 ACME 校验与跳转，443 独立反代 127.0.0.1:$APP_PORT
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $DOMAIN www.$DOMAIN;
+
+    client_max_body_size 20m;
+    server_tokens off;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root $WEBROOT;
+        default_type text/plain;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+EOF
     if [ -f "$CERT_DIR/fullchain.pem" ]; then
-      say "  检测到已有证书，直接启用 443"
-      TLS_BLOCK=$(cat <<EOF
+      cat >> "$NGX_CFG" <<EOF
+
 server {
     listen 443 ssl;
     listen [::]:443 ssl;
-    http2 on;
     server_name $DOMAIN www.$DOMAIN;
 
     ssl_certificate     $CERT_DIR/fullchain.pem;
@@ -161,67 +184,39 @@ server {
     }
 }
 EOF
-)
-    else
-      say "  无证书：先起 80（ACME 校验 + 跳转），稍后用 certbot 签发"
-      TLS_BLOCK=$(cat <<EOF
-# certbot 签发后自动注入 443 server 块
-EOF
-)
     fi
+  }
 
-    cat > "$NGX_CFG" <<EOF
-# stkj 项目管理系统 — $DOMAIN（root 一键安装脚本生成）
-server {
-    listen 80;
-    listen [::]:80;
-    server_name $DOMAIN www.$DOMAIN;
-
-    client_max_body_size 20m;
-    server_tokens off;
-
-    location ^~ /.well-known/acme-challenge/ {
-        root /var/www/html;
-        default_type text/plain;
-    }
-
-    location / {
-        if (\$http_x_forwarded_proto != "https") {
-            return 301 https://\$host\$request_uri;
-        }
-        proxy_pass http://127.0.0.1:$APP_PORT;
-        proxy_http_version 1.1;
-        proxy_set_header Host              \$host;
-        proxy_set_header X-Real-IP         \$remote_addr;
-        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$http_x_forwarded_proto;
-        proxy_set_header X-Forwarded-Host  \$host;
-        proxy_buffering off;
-        proxy_request_buffering off;
-        proxy_connect_timeout 30s;
-        proxy_send_timeout    300s;
-        proxy_read_timeout    300s;
-    }
-}
-
-$TLS_BLOCK
-EOF
-    ln -sfn "$NGX_CFG" "/etc/nginx/sites-enabled/$DOMAIN"
+  if [ -f "$NGX_CFG" ] && grep -q 'x_forwarded_proto' "$NGX_CFG"; then
+    say "  检测到旧版含 X-Forwarded-Proto 判断的配置，重写（避免 443 自跳死循环）"
+    cp -a "$NGX_CFG" "$NGX_CFG.bak-$(date +%Y%m%d-%H%M%S)"
+    write_nginx_cfg
+  elif [ -f "$NGX_CFG" ]; then
+    say "  nginx 站点配置已存在，跳过（如需重写请先删除 $NGX_CFG）"
+  else
+    say "  写入站点配置 $NGX_CFG"
+    write_nginx_cfg
   fi
+  ln -sfn "$NGX_CFG" "/etc/nginx/sites-enabled/$DOMAIN"
 
   nginx -t || die "nginx 配置校验失败"
   systemctl reload nginx 2>/dev/null || systemctl restart nginx
   say "  nginx 已加载"
 
-  # 没证书时尝试 certbot 自动签发（需要域名已解析到本机 + 80 可达）
-  if [ ! -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
+  # 没证书：用 webroot 方式签发（certonly 不改 nginx 配置，避免 certbot
+  # 把 443 混进 80 的块里造成重定向死循环）
+  if [ ! -f "$CERT_DIR/fullchain.pem" ]; then
     say "  尝试 certbot 签发 $DOMAIN ..."
-    if certbot --nginx -d "$DOMAIN" -d "www.$DOMAIN" --non-interactive --agree-tos --register-unsafely-without-email 2>/dev/null ||
-       certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --register-unsafely-without-email; then
-      say "  证书签发成功，443 已启用"
+    if certbot certonly --webroot -w "$WEBROOT" -d "$DOMAIN" -d "www.$DOMAIN" \
+         --non-interactive --agree-tos --register-unsafely-without-email ||
+       certbot certonly --webroot -w "$WEBROOT" -d "$DOMAIN" \
+         --non-interactive --agree-tos --register-unsafely-without-email; then
+      say "  证书签发成功，启用 443"
+      write_nginx_cfg
+      nginx -t && systemctl reload nginx
     else
-      warn "  certbot 签发失败（域名未解析 / 80 不可达）。应用仍可通过 http://服务器IP:$APP_PORT 访问"
-      warn "  解析就绪后重跑：certbot --nginx -d $DOMAIN"
+      warn "  certbot 签发失败（域名未解析 / 80 不可达）"
+      warn "  解析就绪后重跑：certbot certonly --webroot -w $WEBROOT -d $DOMAIN"
     fi
   fi
 else

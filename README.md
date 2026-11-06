@@ -342,6 +342,7 @@ data/app.db          SQLite 数据库（本机默认 ./data；部署时用 DATA_
 全程**无需 root**：Node.js 装在用户目录，服务以 systemd **用户服务**运行，代码、数据库、备份都在 `~/apps/stkj` 下。
 
 以下命令都用**普通用户** SSH 登录服务器后执行，`~` 指该用户home目录。
+如果只有 root 登录、想一条命令把系统依赖 / 运行用户 / 应用 / nginx HTTPS 全部装好，见文末「五、root 用户一键安装」。
 
 ### 一、安装（一条命令，不需要 git）
 
@@ -428,6 +429,65 @@ bash ~/apps/stkj/deploy/stkj.sh status
 ```
 
 输出：代码版本、服务状态与开机自启、监听端口、首页 HTTP 码、项目/数据/账号数量、最近备份、备份份数、磁盘占用。
+
+### 五、root 用户一键安装
+
+> 适用场景：刚重装 / 重置的服务器，只有 root 登录，希望一条命令完成「系统依赖 + 运行用户 + 应用 + nginx HTTPS 反代」。
+> 官方 `deploy/stkj.sh` 禁止 root 直接运行（服务是 systemd 用户服务，必须挂在普通用户名下），所以 root 脚本只负责准备环境、创建用户并降权调用官方脚本，应用层逻辑仍由官方脚本承担。
+
+**root 执行（一条命令）：**
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/stkjinfo/main/deploy/stkj-root-install.sh)
+```
+
+或先下载再执行：
+
+```bash
+curl -fsSL -o stkj-root-install.sh https://raw.githubusercontent.com/dakerclaw/stkjinfo/main/deploy/stkj-root-install.sh
+bash stkj-root-install.sh
+```
+
+适用系统：Debian 13 / Ubuntu 24.04+（用 apt 装依赖）。
+
+脚本按顺序做六件事：
+
+| 步骤 | 说明 |
+|---|---|
+| 1. 系统依赖 | apt 装 `curl` `tar` `xz` `nginx` `certbot`（缺啥装啥，已有不动） |
+| 2. 运行用户 | 创建用户 `--user`（默认 `stkj`），`loginctl enable-linger` 开机免登录自启 |
+| 3. 安装应用 | 以该用户身份执行官方 `install`（Node v22 + 代码 + 数据库 + systemd 用户服务），应用只监听 `127.0.0.1:<port>`，不直接暴露公网 |
+| 4. 账号初始化 | 数据库为空时跑 `seed.js`（`admin / admin123`）；**库已存在则跳过，不覆盖数据** |
+| 5. nginx + TLS | 80 只做 ACME 校验与跳转，443 独立 server 块反代 `127.0.0.1:<port>`；证书已存在直接复用，没有则用 `certbot certonly --webroot` 自动签发（**不改 nginx 配置**，避免 443 重定向死循环） |
+| 6. 自检 | 请求本地应用与 443，打印访问地址、管理命令与默认账号 |
+
+可选参数（写在脚本名后，可组合）：
+
+| 参数 | 说明 |
+|---|---|
+| `--domain=xxx.com` | 域名（默认 `300750.xyz`），用于 nginx server_name 与证书签发 |
+| `--user=xxx` | 运行用户（默认 `stkj`） |
+| `--port=5173` | 应用监听端口（默认 `5173`） |
+| `--no-nginx` | 只装应用，不配 nginx / 证书（应用仍可用 `http://127.0.0.1:5173` 或 SSH 隧道访问） |
+| `--no-seed` | 不初始化演示账号（随后手动执行 `seed.js`） |
+
+前提：
+
+1. 域名已解析到本机，且 80 端口可从公网访问（certbot 签发证书需要）；未解析 / 80 不可达时脚本不阻塞，会打印警告并跳过签发，应用仍可访问，解析就绪后重跑脚本或手动 `certbot certonly --webroot -w /var/www/html -d <域名>` 即可。
+2. 服务器能访问 GitHub（脚本要从 `raw.githubusercontent.com` 下载官方安装脚本与代码）。
+
+安装完成后：
+
+- 访问 `https://<域名>/`（默认 `https://300750.xyz/`），用 `admin / admin123` 登录，**登录后立即在左下角修改密码**；
+- 脚本**幂等**：重复执行安全（用户已存在就跳过、数据库非空不 seed、nginx 配置已在则按规则处理），不会覆盖已有数据；
+- 之后的应用升级 / 卸载 / 状态查看仍用官方脚本，但要**以运行用户身份**执行：
+
+```bash
+su - stkj -c 'bash ~/apps/stkj/deploy/stkj.sh status'
+su - stkj -c 'bash ~/apps/stkj/deploy/stkj.sh upgrade'
+```
+
+> 只装应用、不配域名和 HTTPS 时，用 `--no-nginx`；此时按「一、安装」的普通用户方式访问 `http://<服务器IP>:5173`（需把官方脚本的 `--host` 设为 `0.0.0.0` 或走 SSH 隧道）。
 
 ### 常见问题
 
