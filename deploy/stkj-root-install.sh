@@ -3,27 +3,28 @@
 # stkj root 一键安装（Debian 13 / Ubuntu 24.04+ 适用）
 #
 # 用法（root 执行）：
-#   bash stkj-root-install.sh                    # 全新安装（创建 stkj 用户 + 应用 + nginx 443 反代）
-#   bash stkj-root-install.sh --no-nginx         # 只装应用，不动 nginx
-#   bash stkj-root-install.sh --domain=xxx.com   # 指定域名（默认 300750.xyz）
-#   bash stkj-root-install.sh --user=xxx         # 指定运行用户（默认 stkj）
-#   bash stkj-root-install.sh --port=5173        # 应用监听端口（默认 5173，仅本机反代用 127.0.0.1）
+#   bash stkj-root-install.sh                 # 全新安装（创建运行用户 + 应用）
+#   bash stkj-root-install.sh --user=xxx      # 指定运行用户（默认 stkj）
+#   bash stkj-root-install.sh --port=5173     # 应用监听端口（默认 5173）
+#   bash stkj-root-install.sh --no-seed       # 不初始化演示账号
 #
 # 行为：
-#   1. apt 安装 curl/tar/xz/nginx/certbot（缺啥装啥）
+#   1. apt 安装 curl/tar/xz/coreutils（缺啥装啥）
 #   2. 创建运行用户（若不存在）并 enable-linger（开机自启）
-#   3. 以该用户身份执行官方 install 脚本（Node/代码/数据库/服务全自动）
+#   3. 以该用户身份执行官方 install 脚本（Node/代码/数据库/用户服务全自动），
+#      应用监听 0.0.0.0:<端口>
 #   4. 可选：seed 初始化演示账号（admin/admin123）
-#   5. 可选：nginx 80→443 + TLS 反代 5173（证书已有则复用，没有则 certbot 签发）
+#   5. 自检首页 HTTP 200
+#
+# 访问方式：安装后通过 http://<服务器IP>:<端口>/ 访问。
+# 本项目不配置域名、证书或反向代理；应用不带 HTTPS，仅建议在受信任网络使用。
 #
 # 幂等：重复执行安全；已有数据不会被覆盖。
 # ============================================================
 set -euo pipefail
 
 RUN_USER="stkj"
-DOMAIN="300750.xyz"
 APP_PORT="5173"
-WITH_NGINX=1
 SEED=1
 APP_DIR_BASE="apps/stkj"          # 相对运行用户 HOME
 NODE_BIN_REL="apps/node/bin/node"
@@ -36,11 +37,9 @@ die()  { printf '%b\n' "${C_RED}错误：$*${C_OFF}" >&2; exit 1; }
 for arg in "$@"; do
   case "$arg" in
     --user=*)     RUN_USER="${arg#*=}" ;;
-    --domain=*)   DOMAIN="${arg#*=}" ;;
     --port=*)     APP_PORT="${arg#*=}" ;;
-    --no-nginx)   WITH_NGINX=0 ;;
     --no-seed)    SEED=0 ;;
-    --help|-h)    sed -n '2,30p' "$0"; exit 0 ;;
+    --help|-h)    sed -n '2,26p' "$0"; exit 0 ;;
     *) die "未知参数：$arg（--help 查看用法）" ;;
   esac
 done
@@ -48,17 +47,13 @@ done
 [ "$(id -u)" -eq 0 ] || die "请用 root 执行：sudo bash $0"
 
 # ------------------------------------------------------------
-say "[1/6] 系统依赖"
+say "[1/5] 系统依赖"
 # ------------------------------------------------------------
 export DEBIAN_FRONTEND=noninteractive
 NEED=""
 for p in curl tar xz sha256sum; do command -v "$p" >/dev/null 2>&1 || NEED="$NEED coreutils"; done
 command -v curl >/dev/null 2>&1 || NEED="$NEED curl"
 command -v xz   >/dev/null 2>&1 || NEED="$NEED xz-utils"
-if [ "$WITH_NGINX" = 1 ]; then
-  command -v nginx >/dev/null 2>&1 || NEED="$NEED nginx"
-  command -v certbot >/dev/null 2>&1 || NEED="$NEED certbot python3-certbot-nginx"
-fi
 if [ -n "${NEED// /}" ]; then
   say "  apt 安装：$NEED"
   apt-get update -qq
@@ -68,7 +63,7 @@ else
 fi
 
 # ------------------------------------------------------------
-say "[2/6] 运行用户：$RUN_USER"
+say "[2/5] 运行用户：$RUN_USER"
 # ------------------------------------------------------------
 if id "$RUN_USER" >/dev/null 2>&1; then
   say "  用户已存在"
@@ -87,24 +82,25 @@ USER_HOME="$(getent passwd "$RUN_USER" | cut -d: -f6)"
 APP_DIR="$USER_HOME/$APP_DIR_BASE"
 
 # ------------------------------------------------------------
-say "[3/6] 以 $RUN_USER 身份安装应用"
+say "[3/5] 以 $RUN_USER 身份安装应用"
 # ------------------------------------------------------------
+# 监听 0.0.0.0，安装后即可通过 http://<服务器IP>:<端口>/ 直接访问
 if [ -f "$APP_DIR/deploy/stkj.sh" ]; then
-  say "  已有安装，执行 upgrade 逻辑（幂等）"
-  su - "$RUN_USER" -c "bash '$APP_DIR/deploy/stkj.sh' install" || true
+  say "  已有安装，沿用现有代码与数据（幂等）"
+  su - "$RUN_USER" -c "bash '$APP_DIR/deploy/stkj.sh' install --port=$APP_PORT --host=0.0.0.0" || true
 else
   say "  全新安装（官方脚本：Node v22 + 代码 + 数据库 + 用户服务）"
-  su - "$RUN_USER" -c "curl -fsSL https://raw.githubusercontent.com/dakerclaw/stkjinfo/main/deploy/stkj.sh | bash -s -- install --port=$APP_PORT --host=127.0.0.1"
+  su - "$RUN_USER" -c "curl -fsSL https://raw.githubusercontent.com/dakerclaw/stkjinfo/main/deploy/stkj.sh | bash -s -- install --port=$APP_PORT --host=0.0.0.0"
 fi
 
 # 官方脚本装完后再确保服务在跑
 su - "$RUN_USER" -c "XDG_RUNTIME_DIR=/run/user/\$(id -u) systemctl --user enable --now stkj.service" 2>/dev/null || true
 su - "$RUN_USER" -c "XDG_RUNTIME_DIR=/run/user/\$(id -u) systemctl --user is-active stkj.service" | grep -q active ||
   die "stkj 服务未起来，请查看：journalctl --user -u stkj（用 $RUN_USER 登录）"
-say "  服务 active：http://127.0.0.1:$APP_PORT"
+say "  服务 active：http://0.0.0.0:$APP_PORT"
 
 # ------------------------------------------------------------
-say "[4/6] 账号初始化"
+say "[4/5] 账号初始化"
 # ------------------------------------------------------------
 DB_FILE="$APP_DIR/data/app.db"
 if [ -f "$DB_FILE" ] && [ "$(stat -c%s "$DB_FILE")" -gt 5000 ]; then
@@ -117,122 +113,14 @@ else
 fi
 
 # ------------------------------------------------------------
-say "[5/6] nginx + TLS（$DOMAIN）"
-# ------------------------------------------------------------
-if [ "$WITH_NGINX" = 1 ]; then
-  NGX_CFG="/etc/nginx/sites-available/$DOMAIN"
-  CERT_DIR="/etc/letsencrypt/live/$DOMAIN"
-  WEBROOT="/var/www/html"
-  mkdir -p "$WEBROOT"
-
-  # 生成配置：80 只做 ACME 校验 + 跳转；443 独立 server 块直接反代。
-  # 不要把 443 和 80 写进同一个块，也不要在 443 的 location 里放
-  # X-Forwarded-Proto 判断，否则浏览器直连 443 会 301 到自身形成死循环。
-  write_nginx_cfg() {
-    cat > "$NGX_CFG" <<EOF
-# stkj 项目管理系统 — $DOMAIN（root 一键安装脚本生成）
-# 80 只做 ACME 校验与跳转，443 独立反代 127.0.0.1:$APP_PORT
-server {
-    listen 80;
-    listen [::]:80;
-    server_name $DOMAIN www.$DOMAIN;
-
-    client_max_body_size 20m;
-    server_tokens off;
-
-    location ^~ /.well-known/acme-challenge/ {
-        root $WEBROOT;
-        default_type text/plain;
-    }
-
-    location / {
-        return 301 https://\$host\$request_uri;
-    }
-}
-EOF
-    if [ -f "$CERT_DIR/fullchain.pem" ]; then
-      cat >> "$NGX_CFG" <<EOF
-
-server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
-    server_name $DOMAIN www.$DOMAIN;
-
-    ssl_certificate     $CERT_DIR/fullchain.pem;
-    ssl_certificate_key $CERT_DIR/privkey.pem;
-    ssl_protocols       TLSv1.2 TLSv1.3;
-    ssl_session_cache   shared:SSL:10m;
-    ssl_session_timeout 1d;
-    ssl_session_tickets off;
-
-    client_max_body_size 20m;
-    server_tokens off;
-
-    location / {
-        proxy_pass http://127.0.0.1:$APP_PORT;
-        proxy_http_version 1.1;
-        proxy_set_header Host              \$host;
-        proxy_set_header X-Real-IP         \$remote_addr;
-        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
-        proxy_set_header X-Forwarded-Host  \$host;
-        proxy_buffering off;
-        proxy_request_buffering off;
-        proxy_connect_timeout 30s;
-        proxy_send_timeout    300s;
-        proxy_read_timeout    300s;
-    }
-}
-EOF
-    fi
-  }
-
-  if [ -f "$NGX_CFG" ] && grep -q 'x_forwarded_proto' "$NGX_CFG"; then
-    say "  检测到旧版含 X-Forwarded-Proto 判断的配置，重写（避免 443 自跳死循环）"
-    cp -a "$NGX_CFG" "$NGX_CFG.bak-$(date +%Y%m%d-%H%M%S)"
-    write_nginx_cfg
-  elif [ -f "$NGX_CFG" ]; then
-    say "  nginx 站点配置已存在，跳过（如需重写请先删除 $NGX_CFG）"
-  else
-    say "  写入站点配置 $NGX_CFG"
-    write_nginx_cfg
-  fi
-  ln -sfn "$NGX_CFG" "/etc/nginx/sites-enabled/$DOMAIN"
-
-  nginx -t || die "nginx 配置校验失败"
-  systemctl reload nginx 2>/dev/null || systemctl restart nginx
-  say "  nginx 已加载"
-
-  # 没证书：用 webroot 方式签发（certonly 不改 nginx 配置，避免 certbot
-  # 把 443 混进 80 的块里造成重定向死循环）
-  if [ ! -f "$CERT_DIR/fullchain.pem" ]; then
-    say "  尝试 certbot 签发 $DOMAIN ..."
-    if certbot certonly --webroot -w "$WEBROOT" -d "$DOMAIN" -d "www.$DOMAIN" \
-         --non-interactive --agree-tos --register-unsafely-without-email ||
-       certbot certonly --webroot -w "$WEBROOT" -d "$DOMAIN" \
-         --non-interactive --agree-tos --register-unsafely-without-email; then
-      say "  证书签发成功，启用 443"
-      write_nginx_cfg
-      nginx -t && systemctl reload nginx
-    else
-      warn "  certbot 签发失败（域名未解析 / 80 不可达）"
-      warn "  解析就绪后重跑：certbot certonly --webroot -w $WEBROOT -d $DOMAIN"
-    fi
-  fi
-else
-  say "  跳过 nginx（--no-nginx）"
-fi
-
-# ------------------------------------------------------------
-say "[6/6] 自检"
+say "[5/5] 自检"
 # ------------------------------------------------------------
 sleep 1
 HOME_CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "http://127.0.0.1:$APP_PORT/" || true)
-say "  应用本地：http://127.0.0.1:$APP_PORT/ -> $HOME_CODE"
-if [ "$WITH_NGINX" = 1 ]; then
-  HTTPS_CODE=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 8 "https://127.0.0.1/" -H "Host: $DOMAIN" --resolve "$DOMAIN:443:127.0.0.1" || true)
-  say "  nginx 443：https://$DOMAIN/ -> $HTTPS_CODE"
-fi
+say "  首页：http://127.0.0.1:$APP_PORT/ -> $HOME_CODE"
+[ "$HOME_CODE" = "200" ] || warn "  首页自检未返回 200，请检查服务日志：su - $RUN_USER -c 'journalctl --user -u stkj -n 50'"
+
+SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 
 say ""
 say "============================================"
@@ -241,6 +129,8 @@ say "   运行用户：$RUN_USER（linger 已开）"
 say "   应用目录：$APP_DIR"
 say "   服务管理：su - $RUN_USER -c 'bash ~/apps/stkj/deploy/stkj.sh status'"
 say "   升级：    su - $RUN_USER -c 'bash ~/apps/stkj/deploy/stkj.sh upgrade'"
-say "   访问：    https://$DOMAIN/ （或 http://服务器IP:$APP_PORT）"
+say "   访问：    http://<服务器IP>:$APP_PORT/"
+[ -n "$SERVER_IP" ] && say "   例如：    http://$SERVER_IP:$APP_PORT/"
 say "   默认账号：admin / admin123（登录后立即修改密码，入口在左下角）"
+say "   提示：    本项目不配置域名与 HTTPS；外网暴露请自行限制来源或做加固"
 say "============================================"
