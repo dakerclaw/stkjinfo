@@ -61,7 +61,7 @@ const state = {
   view: 'dashboard',
   user: null,
   meta: null,
-  projects: { filters: {}, sort: '', dir: 'asc', selected: new Set(), onlySelected: false, rows: [] },
+  projects: { filters: {}, sort: '', dir: 'asc', page: 1, pageSize: 20, total: 0, selected: new Set(), onlySelected: false, rows: [] },
   data: { filters: {}, sort: '', dir: 'asc', page: 1, pageSize: 20, selected: new Set(), facets: null, facetsSeq: 0 },
   users: { rows: [] },
   audit: { filters: {}, page: 1, pageSize: 50 },
@@ -308,6 +308,7 @@ async function renderProjects() {
   const bind = () => {
     const applyFilters = () => {
       collectProjectFilters();
+      state.projects.page = 1;
       // 条件变化后，旧勾选可能已不在结果里：不清空会让「删除选中」误伤当前不可见的行
       clearProjectSelection();
       loadProjects();
@@ -340,7 +341,10 @@ async function loadProjects() {
   const qs = new URLSearchParams();
   Object.entries(f).forEach(([k, v]) => { if (v) qs.set(k, v); });
   if (state.projects.sort) { qs.set('sort', state.projects.sort); qs.set('dir', state.projects.dir); }
-  const { rows: allRows, total } = await API.get('/api/projects?' + qs.toString());
+  qs.set('page', state.projects.page);
+  qs.set('pageSize', state.projects.pageSize);
+  const { rows: allRows, total, page, pageSize } = await API.get('/api/projects?' + qs.toString());
+  state.projects.total = total;
   // 仅显示已选：客户端过滤当前勾选的项目
   const rows = state.projects.onlySelected && state.projects.selected.size
     ? allRows.filter((r) => state.projects.selected.has(r.id))
@@ -395,7 +399,7 @@ async function loadProjects() {
         </tbody>
       </table>
     </div>
-    <div class="pagination"><span>共 <b>${total}</b> 个项目</span></div>`;
+    ${renderProjectPagination(total, page, pageSize)}`;
 
   // 勾选（批量操作用）
   box.querySelectorAll('.rowChkP').forEach((cb) => {
@@ -415,6 +419,7 @@ async function loadProjects() {
   });
   el('#onlySelP')?.addEventListener('change', (e) => {
     state.projects.onlySelected = e.target.checked;
+    state.projects.page = 1;
     loadProjects();
   });
   updateProjSelCount();
@@ -429,9 +434,39 @@ async function loadProjects() {
         // 文本列首次点击按升序（A→Z、编号从小到大），数值/日期列按降序（多的、近的在前）
         state.projects.dir = /^(project_no|product_code)$/.test(k) ? 'asc' : 'desc';
       }
+      state.projects.page = 1;
       loadProjects();
     });
   });
+
+  // 分页
+  box.querySelectorAll('.page-btn[data-page]').forEach((b) => {
+    b.addEventListener('click', () => { state.projects.page = Number(b.dataset.page); loadProjects(); });
+  });
+}
+
+/** 项目列表分页控件（与数据页 renderPagination 同结构，独立状态） */
+function renderProjectPagination(total, page, pageSize) {
+  const pages = Math.max(1, Math.ceil(total / pageSize));
+  const nums = [];
+  const push = (n) => { if (!nums.includes(n) && n >= 1 && n <= pages) nums.push(n); };
+  push(1); push(page - 1); push(page); push(page + 1); push(pages);
+  const list = [...new Set(nums)].sort((a, b) => a - b);
+  let html = '';
+  let prev = 0;
+  for (const n of list) {
+    if (prev && n - prev > 1) html += `<span style="color:var(--text-3);padding:0 2px">…</span>`;
+    html += `<button class="page-btn ${n === page ? 'active' : ''}" data-page="${n}">${n}</button>`;
+    prev = n;
+  }
+  return `<div class="pagination">
+    <span>共 <b>${total}</b> 个项目 · 第 ${page}/${pages} 页</span>
+    <div class="page-btns">
+      <button class="page-btn" data-page="${page - 1}" ${page <= 1 ? 'disabled' : ''}>上一页</button>
+      ${html}
+      <button class="page-btn" data-page="${page + 1}" ${page >= pages ? 'disabled' : ''}>下一页</button>
+    </div>
+  </div>`;
 }
 
 /** 从项目列表跳到「项目数据」，并按该项目编号筛选 */

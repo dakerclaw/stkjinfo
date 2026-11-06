@@ -9,6 +9,7 @@
  * 解析时同时支持 inlineStr、sharedStrings、数值、布尔。
  */
 const zlib = require('node:zlib');
+const { Readable } = require('node:stream');
 
 /* ============================================================ 解压上限（防解压炸弹） */
 /** 单个 ZIP 条目解压后上限：32 MB */
@@ -424,4 +425,163 @@ function build(rows, sheetName = 'Sheet1') {
   });
 }
 
-module.exports = { build, parse, crc32 };
+/* ============================================================ 流式生成（大数据导出不占内存） */
+
+/** 把一行数据编成工作表 XML（与 sheetXml 的单行片段一致） */
+function rowXml(row, r) {
+  const out = [`<row r="${r}">`];
+  row.forEach((val, ci) => {
+    if (val === null || val === undefined || val === '') return;
+    const ref = colName(ci) + r;
+    if (typeof val === 'number' && isFinite(val)) {
+      out.push(`<c r="${ref}"><v>${val}</v></c>`);
+    } else {
+      out.push(`<c r="${ref}" t="inlineStr"><is><t xml:space="preserve">${escXml(val)}</t></is></c>`);
+    }
+  });
+  out.push('</row>');
+  return out.join('');
+}
+
+const SHEET_NAME = 'xl/worksheets/sheet1.xml';
+
+/**
+ * 流式生成 xlsx：返回 Readable（Buffer 流），逐行从 rowSource 取数据写工作表，
+ * 不在内存里累积全部行，也不缓存完整 XML / 完整 zip。
+ *
+ *   rowSource: 可迭代对象（string[][] 或生成器），第一项为表头；每项是一行的各单元格。
+ *   压缩用 deflate 流式处理，ZIP 用 data descriptor 让「压缩后大小 / CRC」延后写入；
+ *   中央目录在结束时用真实值补齐，因此生成的文件是标准的、可被 parse() 读回的 xlsx。
+ *
+ * 说明：除 worksheet 外几个小 XML 用 zipWrite 的写法直接生成（体积固定且很小）。
+ */
+function buildStream(rowSource, sheetName = 'Sheet1') {
+  const sheet = String(sheetName || 'Sheet1').slice(0, 31);
+  const small = {
+    '[Content_Types].xml': CONTENT_TYPES,
+    '_rels/.rels': ROOT_RELS,
+    'xl/workbook.xml': workbookXml(sheet),
+    'xl/_rels/workbook.xml.rels': WORKBOOK_RELS,
+  };
+
+  async function* generate() {
+    const entries = []; // { name, crc, compSize, rawSize, offset }
+    let offset = 0;
+    const nameBuf = (n) => Buffer.from(n, 'utf8');
+
+    // ---- 先写几个小的 XML 条目（deflate 压缩，标准本地头 + 中央目录记录） ----
+    for (const [name, text] of Object.entries(small)) {
+      const data = Buffer.from(text, 'utf8');
+      const comp = zlib.deflateRawSync(data, { level: 9 });
+      const crc = crc32(data);
+      const nb = nameBuf(name);
+      const lh = Buffer.alloc(30);
+      lh.writeUInt32LE(0x04034b50, 0);
+      lh.writeUInt16LE(20, 4);
+      lh.writeUInt16LE(0x800, 6);
+      lh.writeUInt16LE(8, 8);
+      lh.writeUInt32LE(crc, 14);
+      lh.writeUInt32LE(comp.length, 18);
+      lh.writeUInt32LE(data.length, 22);
+      lh.writeUInt16LE(nb.length, 26);
+      yield Buffer.concat([lh, nb, comp]);
+      entries.push({ name: nb, crc, compSize: comp.length, rawSize: data.length, offset });
+      offset += 30 + nb.length + comp.length;
+    }
+
+    // ---- 工作表：流式 deflate + data descriptor ----
+    const nb = nameBuf(SHEET_NAME);
+    const wsOffset = offset;
+    const lh = Buffer.alloc(30);
+    lh.writeUInt32LE(0x04034b50, 0);
+    lh.writeUInt16LE(20, 4);
+    lh.writeUInt16LE(0x800, 6);     // bit 3 = data descriptor 延后写 CRC/大小
+    lh.writeUInt16LE(8, 8);         // method: deflate
+    lh.writeUInt32LE(0, 14);        // CRC（稍后由 descriptor 给出）
+    lh.writeUInt32LE(0, 18);
+    lh.writeUInt32LE(0, 22);
+    lh.writeUInt16LE(nb.length, 26);
+    yield Buffer.concat([lh, nb]);
+
+    const def = zlib.createDeflateRaw({ level: 6 });
+    let crc = 0xffffffff;
+    let rawSize = 0;
+    let compSize = 0;
+    const updateCrc = (buf) => {
+      for (let i = 0; i < buf.length; i++) {
+        crc = CRC_TABLE[(crc ^ buf[i]) & 0xff] ^ (crc >>> 8);
+      }
+      crc >>>= 0;
+      rawSize += buf.length;
+    };
+    const writeChunk = (text) => {
+      const b = Buffer.from(text, 'utf8');
+      updateCrc(b);
+      def.write(b);
+    };
+
+    // 让消费者先订阅 def（否则首个 chunk 可能丢），随后逐行写入
+    const producer = (async () => {
+      await new Promise((r) => setImmediate(r));
+      try {
+        writeChunk('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>');
+        writeChunk('<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>');
+        let r = 1;
+        for (const row of rowSource) {
+          writeChunk(rowXml(Array.isArray(row) ? row : [...row], r++));
+          // 每 200 行让出一次事件循环，避免大导出长期霸占主线程
+          if (r % 200 === 0) await new Promise((res) => setImmediate(res));
+        }
+        writeChunk('</sheetData></worksheet>');
+      } finally {
+        def.end();
+      }
+    })();
+
+    for await (const c of def) {
+      compSize += c.length;
+      yield c;
+    }
+    await producer;
+    const finalCrc = (crc ^ 0xffffffff) >>> 0;
+
+    // data descriptor（签名 + CRC + 压缩后大小 + 原始大小）
+    const dd = Buffer.alloc(16);
+    dd.writeUInt32LE(0x08074b50, 0);
+    dd.writeUInt32LE(finalCrc, 4);
+    dd.writeUInt32LE(compSize, 8);
+    dd.writeUInt32LE(rawSize, 12);
+    yield dd;
+    entries.push({ name: nb, crc: finalCrc, compSize, rawSize, offset: wsOffset });
+    offset += 30 + nb.length + compSize + 16;
+
+    // ---- 中央目录 + EOCD（用真实 CRC / 大小） ----
+    const central = [];
+    for (const e of entries) {
+      const ch = Buffer.alloc(46);
+      ch.writeUInt32LE(0x02014b50, 0);
+      ch.writeUInt16LE(20, 4);
+      ch.writeUInt16LE(20, 6);
+      ch.writeUInt16LE(0x800, 8);
+      ch.writeUInt16LE(8, 10);
+      ch.writeUInt32LE(e.crc, 16);
+      ch.writeUInt32LE(e.compSize, 20);
+      ch.writeUInt32LE(e.rawSize, 24);
+      ch.writeUInt16LE(e.name.length, 28);
+      ch.writeUInt32LE(e.offset, 42);
+      central.push(ch, e.name);
+    }
+    const centralBuf = Buffer.concat(central);
+    const eocd = Buffer.alloc(22);
+    eocd.writeUInt32LE(0x06054b50, 0);
+    eocd.writeUInt16LE(entries.length, 8);
+    eocd.writeUInt16LE(entries.length, 10);
+    eocd.writeUInt32LE(centralBuf.length, 12);
+    eocd.writeUInt32LE(offset, 16);
+    yield Buffer.concat([centralBuf, eocd]);
+  }
+
+  return Readable.from(generate());
+}
+
+module.exports = { build, buildStream, parse, crc32 };

@@ -131,8 +131,12 @@ function seedData() {
     'INSERT INTO projects (project_no, product_code, project_type, description, status) VALUES (?,?,?,?,?)'
   );
   for (const p of PROJECTS) insP.run(...p);
+  // 权威外键：project_data.project_id 指向 projects.id
+  const pidByNo = new Map(
+    db.prepare('SELECT id, project_no FROM projects').all().map((r) => [r.project_no, r.id])
+  );
 
-  const keys = FIELDS.map((f) => f.key).concat(['created_by', 'created_by_id', 'updated_by']);
+  const keys = FIELDS.map((f) => f.key).concat(['project_id', 'created_by', 'created_by_id', 'updated_by']);
   const insD = db.prepare(
     `INSERT INTO project_data (${keys.join(',')}) VALUES (${keys.map(() => '?').join(',')})`
   );
@@ -143,6 +147,7 @@ function seedData() {
     const cnt = 2 + Math.floor(Math.random() * 4);
     for (let i = 0; i < cnt; i++) {
       const row = makeRow(pno, pcode, i);
+      row.project_id = pidByNo.get(pno) ?? null;
       row.created_by = owner.username;
       row.created_by_id = owner.id;
       row.updated_by = owner.username;

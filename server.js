@@ -10,7 +10,7 @@ const crypto = require('node:crypto');
 const zlib = require('node:zlib');
 const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
-const { db, DB_FILE, DATA_DIR, FIELDS, normalizeNumbers, backfillDeleteBatches } = require('./db');
+const { db, DB_FILE, DATA_DIR, FIELDS, normalizeNumbers, backfillDeleteBatches, backfillProjectIds } = require('./db');
 const { DatabaseSync } = require('node:sqlite');
 const xlsx = require('./xlsx');
 const { normHeader, buildHeaderMap, isBlank, USER_IMPORT_FIELDS } = require('./import-map');
@@ -411,7 +411,27 @@ function parseIdParam(raw, cap) {
   return ids;
 }
 
-/** 导出检测数据为 Excel（按当前筛选条件，或指定的已勾选 ids） */
+/** 流式输出 Excel 文件（不设 Content-Length，用 chunked 逐段发送） */
+function sendXlsxStream(res, stream, filename) {
+  res.writeHead(200, {
+    'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'Content-Disposition':
+      `attachment; filename="stkj.xlsx"; filename*=UTF-8''${encodeURIComponent(filename)}`,
+    'Cache-Control': 'no-store',
+    'Transfer-Encoding': 'chunked',
+    ...SECURITY_HEADERS,
+  });
+  stream.on('error', (e) => {
+    console.error('[export] 生成 Excel 失败：', e.message);
+    if (!res.writableEnded) res.end(); // 已发头，只能提前终止，客户端会得到不完整文件
+  });
+  stream.pipe(res);
+}
+
+/**
+ * 导出检测数据为 Excel（按当前筛选条件，或指定的已勾选 ids）。
+ * 用「语句迭代器 + 流式 xlsx 生成」，5 万行也不会把全部结果读进内存。
+ */
 function exportDataXlsx(res, params, user) {
   const { w, args } = buildDataWhere(params, user);
   const ids = parseIdParam(params.get('ids'), 2000);
@@ -423,9 +443,18 @@ function exportDataXlsx(res, params, user) {
     idArgs.push(...ids);
   }
   const full = cond ? (w ? `${w} AND${cond}` : ` WHERE${cond}`) : w;
-  const rows = db.prepare(`SELECT * FROM project_data${full} ORDER BY id DESC`).all(...args, ...idArgs);
-  const table = [FIELDS.map((f) => f.label), ...rows.map((r) => FIELDS.map((f) => cell(r[f.key])))];
-  sendXlsx(res, xlsx.build(table, '项目数据'), `项目数据_${todayStr()}.xlsx`);
+  // 只 SELECT 导出需要的列，减少行对象体积
+  const colList = FIELDS.map((f) => f.key).join(', ');
+  const stmt = db.prepare(`SELECT ${colList} FROM project_data${full} ORDER BY id DESC`);
+  const allArgs = [...args, ...idArgs];
+
+  function* rowSource() {
+    yield FIELDS.map((f) => f.label); // 表头
+    for (const r of stmt.iterate(...allArgs)) {
+      yield FIELDS.map((f) => cell(r[f.key]));
+    }
+  }
+  sendXlsxStream(res, xlsx.buildStream(rowSource(), '项目数据'), `项目数据_${todayStr()}.xlsx`);
 }
 
 /**
@@ -433,8 +462,8 @@ function exportDataXlsx(res, params, user) {
  * 数据条数与最近录入日期用 LEFT JOIN + GROUP BY 一次算完（替代每行两个相关子查询），
  * 并对普通用户按 created_by_id 过滤，避免导出时泄露他人数据的数量与时间。
  */
-function queryProjects(params, user) {
-  const cacheKey = `projects|${user.id}|${paramsKey(params)}`;
+function queryProjects(params, user, { paginate = false } = {}) {
+  const cacheKey = `projects|${user.id}|${paginate ? 'p' : 'a'}|${paramsKey(params)}`;
   const cached = cacheGet(dataCaches.projects, cacheKey, metaVersion);
   if (cached) return cached;
 
@@ -467,7 +496,8 @@ function queryProjects(params, user) {
   const where = parts.filter(Boolean).length ? ` WHERE ${parts.filter(Boolean).join(' AND ')}` : '';
 
   const of = ownerFilter(user, 'd.');
-  const join = ` LEFT JOIN project_data d ON d.project_no = p.project_no AND d.deleted_at IS NULL${of ? ` AND ${of.sql}` : ''}`;
+  // 用权威外键关联（而非 project_no 字符串），索引更优且不受编号变更影响
+  const join = ` LEFT JOIN project_data d ON d.project_id = p.id AND d.deleted_at IS NULL${of ? ` AND ${of.sql}` : ''}`;
   const ownArgs = of ? [of.arg] : [];
 
   const sortable = new Set([
@@ -477,31 +507,44 @@ function queryProjects(params, user) {
   const aliasKeys = new Set(['data_count', 'last_entry']);
   const order = buildOrder(params, ' ORDER BY p.id DESC', sortable, 'p.', aliasKeys);
 
-  const rows = db
-    .prepare(
-      `SELECT p.*, COUNT(d.id) AS data_count, MAX(d.entry_date) AS last_entry
+  let rows;
+  let total;
+  let page = 1;
+  let pageSize;
+  // 同一套聚合子查询，列表（分页）与导出（全量）口径完全一致
+  const aggSql = `SELECT p.*, COUNT(d.id) AS data_count, MAX(d.entry_date) AS last_entry
        FROM projects p${join}${where}
-       GROUP BY p.id${order}`
-    )
-    .all(...ownArgs, ...allArgs);
-  const result = { rows };
+       GROUP BY p.id${order}`;
+  if (paginate) {
+    page = Math.max(1, Number(params.get('page') || 1));
+    pageSize = Math.min(500, Math.max(10, Number(params.get('pageSize') || 20)));
+    total = db.prepare(`SELECT COUNT(*) AS c FROM (${aggSql})`).get(...ownArgs, ...allArgs).c;
+    rows = db.prepare(`${aggSql} LIMIT ? OFFSET ?`)
+      .all(...ownArgs, ...allArgs, pageSize, (page - 1) * pageSize);
+  } else {
+    rows = db.prepare(aggSql).all(...ownArgs, ...allArgs);
+    total = rows.length;
+  }
+  const result = { rows, total, page, pageSize };
   cacheSet(dataCaches.projects, cacheKey, metaVersion, result);
   return result;
 }
 
-/** 导出项目档案为 Excel（与列表同口径：同样的筛选、排序与归属统计） */
+/** 导出项目档案为 Excel（与列表同口径：同样的筛选、排序与归属统计；全量，不分页） */
 function exportProjectsXlsx(res, params, user) {
-  const { rows, error } = queryProjects(params, user);
+  const { rows, error } = queryProjects(params, user, { paginate: false });
   if (error) return fail(res, 400, error);
   const header = ['项目编号', '产品代码', '项目类型', '项目简介', '数据量', '最新录入日期', '状态'];
-  const table = [
-    header,
-    ...rows.map((r) => [
-      cell(r.project_no), cell(r.product_code), cell(r.project_type), cell(r.description),
-      Number(r.data_count || 0), cell(r.last_entry), r.status === 0 ? '已归档' : '进行中',
-    ]),
-  ];
-  sendXlsx(res, xlsx.build(table, '项目列表'), `项目列表_${todayStr()}.xlsx`);
+  function* rowSource() {
+    yield header;
+    for (const r of rows) {
+      yield [
+        cell(r.project_no), cell(r.product_code), cell(r.project_type), cell(r.description),
+        Number(r.data_count || 0), cell(r.last_entry), r.status === 0 ? '已归档' : '进行中',
+      ];
+    }
+  }
+  sendXlsxStream(res, xlsx.buildStream(rowSource(), '项目列表'), `项目列表_${todayStr()}.xlsx`);
 }
 
 /** 按勾选字段生成导入模板（Excel） */
@@ -819,12 +862,8 @@ function performProjectImport(rows, action, actor = null) {
         // 覆盖到回收站里的同名项目时顺带复活（从回收站移回）
         if (exist.deleted_at) { patch.deleted_at = null; patch.deleted_batch = null; }
         if (Object.keys(patch).length > (exist.deleted_at ? 1 : 0)) {
+          // 产品代码变更由 trg_project_sync 自动同步到子表，无需手工维护
           update('projects', exist.id, patch, { touch: false });
-          // 产品代码以项目档案为准：同步到已有数据，避免数据页继续显示旧代码
-          if (patch.product_code && patch.product_code !== exist.product_code) {
-            db.prepare('UPDATE project_data SET product_code = ?, updated_at = ? WHERE project_no = ?')
-              .run(patch.product_code, nowStr(), project_no);
-          }
           overwritten++;
         } else {
           skipped++;
@@ -945,7 +984,16 @@ function pickData(body, { requireNo = true } = {}) {
   return row;
 }
 
+/** project_no → projects.id（含回收站项目），用于写入时补齐权威外键 */
+const stmtProjectIdByNo = db.prepare('SELECT id FROM projects WHERE project_no = ? LIMIT 1');
+
 function insert(table, row, conflictNoop = false) {
+  // project_data 的权威关联统一在此补齐：调用方只需给 project_no，
+  // 不必（也不应）各自维护 project_id，避免漏写造成外键悬空。
+  if (table === 'project_data' && row.project_id == null && row.project_no != null) {
+    const p = stmtProjectIdByNo.get(row.project_no);
+    if (p) row = { ...row, project_id: p.id };
+  }
   const keys = Object.keys(row);
   const sql = `INSERT ${conflictNoop ? 'OR IGNORE ' : ''}INTO ${table} (${keys.join(',')}) VALUES (${keys
     .map(() => '?')
@@ -1243,9 +1291,9 @@ function getMeta(res, user) {
 
 /* ---------- 项目列表 ---------- */
 function listProjects(res, params, user) {
-  const { rows, error } = queryProjects(params, user);
+  const { rows, total, page, pageSize, error } = queryProjects(params, user, { paginate: true });
   if (error) return fail(res, 400, error);
-  ok(res, { rows, total: rows.length });
+  ok(res, { rows, total, page, pageSize });
 }
 
 function getProject(res, id) {
@@ -1296,16 +1344,10 @@ function updateProject(res, id, body, user) {
   }
   if ('product_code' in row && !row.product_code) return fail(res, 400, '产品代码不能为空');
   if ('project_type' in row && !row.project_type) return fail(res, 400, '项目类型不能为空');
-  // 改项目编号 / 产品代码需要同时改写子表，放在同一事务里：任一失败则整体回滚，避免项目与数据脱钩
+  // 项目档案更新与子表快照同步必须原子：触发器 trg_project_sync 会在同一事务内
+  // 自动把新的 project_no / product_code 写到 project_data（无需再手工 UPDATE 子表）。
   db.exec('BEGIN');
   try {
-    const nextNo = row.project_no || cur.project_no;
-    const nextPc = row.product_code || cur.product_code;
-    if (nextNo !== cur.project_no || nextPc !== cur.product_code) {
-      db.prepare(
-        'UPDATE project_data SET project_no = ?, product_code = ?, updated_at = ? WHERE project_no = ?'
-      ).run(nextNo, nextPc, nowStr(), cur.project_no);
-    }
     update('projects', id, row);
     db.exec('COMMIT');
   } catch (e) {
@@ -1356,9 +1398,11 @@ function bulkDeleteProjects(res, body, user) {
     const now = nowStr();
     for (const p of pros) {
       const batch = newBatchId();
-      removedData += db.prepare('SELECT COUNT(*) AS c FROM project_data WHERE project_no = ? AND deleted_at IS NULL').get(p.project_no).c;
-      db.prepare('UPDATE project_data SET deleted_at = ?, deleted_batch = ? WHERE project_no = ? AND deleted_at IS NULL')
-        .run(now, batch, p.project_no);
+      const match = '(project_id = ? OR (project_id IS NULL AND project_no = ?))';
+      removedData += db.prepare(`SELECT COUNT(*) AS c FROM project_data WHERE ${match} AND deleted_at IS NULL`)
+        .get(p.id, p.project_no).c;
+      db.prepare(`UPDATE project_data SET deleted_at = ?, deleted_batch = ? WHERE ${match} AND deleted_at IS NULL`)
+        .run(now, batch, p.id, p.project_no);
       removed += db.prepare('UPDATE projects SET deleted_at = ?, deleted_batch = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL')
         .run(now, batch, now, p.id).changes;
     }
@@ -1375,13 +1419,15 @@ function bulkDeleteProjects(res, body, user) {
 function deleteProject(res, id, user) {
   const cur = db.prepare('SELECT * FROM projects WHERE id = ? AND deleted_at IS NULL').get(id);
   if (!cur) return fail(res, 404, '项目不存在');
-  const cnt = db.prepare('SELECT COUNT(*) AS c FROM project_data WHERE project_no = ? AND deleted_at IS NULL').get(cur.project_no).c;
+  const match = '(project_id = ? OR (project_id IS NULL AND project_no = ?))';
+  const cnt = db.prepare(`SELECT COUNT(*) AS c FROM project_data WHERE ${match} AND deleted_at IS NULL`).get(id, cur.project_no).c;
   const now = nowStr();
   const batch = newBatchId();
   db.exec('BEGIN');
   try {
     db.prepare('UPDATE projects SET deleted_at = ?, deleted_batch = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL').run(now, batch, now, id);
-    db.prepare('UPDATE project_data SET deleted_at = ?, deleted_batch = ? WHERE project_no = ? AND deleted_at IS NULL').run(now, batch, cur.project_no);
+    db.prepare(`UPDATE project_data SET deleted_at = ?, deleted_batch = ? WHERE ${match} AND deleted_at IS NULL`)
+      .run(now, batch, id, cur.project_no);
     db.exec('COMMIT');
   } catch (e) {
     db.exec('ROLLBACK');
@@ -1573,6 +1619,7 @@ function updateData(res, id, body, user) {
     const proj = requireProject(row.project_no);
     if (!proj) return fail(res, 400, `项目编号 ${row.project_no} 不存在`);
     row.product_code = proj.product_code;
+    row.project_id = proj.id; // 换项目时同步权威外键
   }
   row.updated_by = user.username;
   update('project_data', id, row);
@@ -1624,7 +1671,7 @@ function listRecycle(res, user) {
     .prepare(
       `SELECT p.id, p.project_no, p.product_code, p.project_type, p.status, p.deleted_at, p.deleted_batch,
               (SELECT COUNT(*) FROM project_data d
-               WHERE d.project_no = p.project_no AND d.deleted_at IS NOT NULL
+               WHERE d.project_id = p.id AND d.deleted_at IS NOT NULL
                  AND (p.deleted_batch IS NULL OR d.deleted_batch = p.deleted_batch)) AS data_count
        FROM projects p WHERE p.deleted_at IS NOT NULL ORDER BY p.deleted_at DESC`
     )
@@ -1636,7 +1683,7 @@ function listRecycle(res, user) {
        WHERE d.deleted_at IS NOT NULL
          AND NOT EXISTS (
            SELECT 1 FROM projects p
-           WHERE p.deleted_at IS NOT NULL AND p.project_no = d.project_no
+           WHERE p.deleted_at IS NOT NULL AND p.id = d.project_id
              AND (p.deleted_batch IS NULL OR d.deleted_batch = p.deleted_batch)
          )
        ORDER BY d.deleted_at DESC LIMIT 1000`
@@ -1667,16 +1714,18 @@ function restoreRecycle(res, body, user) {
         'UPDATE projects SET deleted_at = NULL, deleted_batch = NULL, updated_at = ? WHERE id = ? AND deleted_at IS NOT NULL'
       );
       for (const p of pros) {
-        // 有批次：只恢复随该项目一起删除的数据；更早单独删除的数据保持原状
+        // 有批次：只恢复随该项目一起删除的数据；更早单独删除的数据保持原状。
+        // 按权威外键 project_id 关联，兼容极老数据（project_id 为空时退回 project_no）。
+        const match = '(project_id = ? OR (project_id IS NULL AND project_no = ?))';
         const d = p.deleted_batch
           ? db.prepare(
             `UPDATE project_data SET deleted_at = NULL, deleted_batch = NULL, updated_at = ?
-             WHERE project_no = ? AND deleted_at IS NOT NULL AND deleted_batch = ?`
-          ).run(now, p.project_no, p.deleted_batch)
+             WHERE ${match} AND deleted_at IS NOT NULL AND deleted_batch = ?`
+          ).run(now, p.id, p.project_no, p.deleted_batch)
           : db.prepare(
             `UPDATE project_data SET deleted_at = NULL, deleted_batch = NULL, updated_at = ?
-             WHERE project_no = ? AND deleted_at IS NOT NULL`
-          ).run(now, p.project_no);
+             WHERE ${match} AND deleted_at IS NOT NULL`
+          ).run(now, p.id, p.project_no);
         restoredData += d.changes;
         restored += stmtP.run(now, p.id).changes;
       }
@@ -1718,11 +1767,12 @@ function purgeRecycle(res, body, user) {
       let purgedData = 0;
       const stmtP = db.prepare(`DELETE FROM projects WHERE id = ? AND deleted_at IS NOT NULL`);
       for (const p of pros) {
+        const match = '(project_id = ? OR (project_id IS NULL AND project_no = ?))';
         const d = p.deleted_batch
-          ? db.prepare(`DELETE FROM project_data WHERE project_no = ? AND deleted_at IS NOT NULL AND deleted_batch = ?`)
-            .run(p.project_no, p.deleted_batch)
-          : db.prepare(`DELETE FROM project_data WHERE project_no = ? AND deleted_at IS NOT NULL`)
-            .run(p.project_no);
+          ? db.prepare(`DELETE FROM project_data WHERE ${match} AND deleted_at IS NOT NULL AND deleted_batch = ?`)
+            .run(p.id, p.project_no, p.deleted_batch)
+          : db.prepare(`DELETE FROM project_data WHERE ${match} AND deleted_at IS NOT NULL`)
+            .run(p.id, p.project_no);
         purgedData += d.changes;
         purged += stmtP.run(p.id).changes;
       }
@@ -2337,8 +2387,11 @@ async function applyDatabaseImport(file, user, { keepAdmin = true } = {}) {
         payload[t] = { cols: [], rows: [] };
         continue;
       }
-      const cols = dstCols.filter((c) => srcCols.includes(c));
+      let cols = dstCols.filter((c) => srcCols.includes(c));
       if (!cols.length) throw new HttpError(400, `数据表 ${t} 与当前版本结构不兼容`);
+      // 来源库的 project_id 指向它自己的 projects.id，导入到本库后 id 可能不同，
+      // 直接照搬会违反外键；统一丢弃，插入完成后按 project_no 回填（backfillProjectIds）。
+      if (t === 'project_data') cols = cols.filter((c) => c !== 'project_id');
       const quoted = cols.map((c) => `"${c}"`).join(', ');
       payload[t] = { cols, rows: sdb.prepare(`SELECT ${quoted} FROM ${t}`).all() };
     }
@@ -2382,6 +2435,8 @@ async function applyDatabaseImport(file, user, { keepAdmin = true } = {}) {
       // 与 db.js 启动时的规范化保持一致：数值统一 2 位、回收站补批次、角色规范化
       normalizeNumbers(db);
       backfillDeleteBatches(db);
+      // 来源旧库没有 project_id 列时，按 project_no 回填权威外键（幂等）
+      backfillProjectIds(db);
       db.exec(`UPDATE users SET role = 'sys_admin' WHERE username = 'admin' COLLATE NOCASE AND role = 'admin'`);
       db.exec(`UPDATE users SET role = 'user' WHERE role NOT IN ('sys_admin','admin','user')`);
       // 旧库没有归属人的数据：挂到最早的管理员账号下（与 db.js 启动逻辑一致）

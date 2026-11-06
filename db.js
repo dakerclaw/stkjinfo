@@ -85,7 +85,8 @@ CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_logs(entity, entity_id);
 
 CREATE TABLE IF NOT EXISTS project_data (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
-  project_no   TEXT NOT NULL,                         -- 项目编号
+  project_id   INTEGER REFERENCES projects(id) ON DELETE SET NULL,  -- 权威关联（项目档案 id）
+  project_no   TEXT NOT NULL,                         -- 项目编号（由 project_id 自动同步的展示快照）
   product_code TEXT NOT NULL,                         -- 产品代码
   base         TEXT,                                  -- 所属公司
   process_code TEXT,                                  -- 工序
@@ -161,6 +162,26 @@ ensureColumn('project_data', 'deleted_at', 'TEXT');
 // 不会把「更早单独删除」的数据一并复活。
 ensureColumn('projects', 'deleted_batch', 'TEXT');
 ensureColumn('project_data', 'deleted_batch', 'TEXT');
+// 权威关联：project_data.project_id → projects.id（ON DELETE RESTRICT 防止误删仍带数据的项目）。
+// project_no / product_code 保留为「展示快照」，由下方触发器随项目档案自动同步，杜绝手工维护导致的不一致。
+ensureColumn('project_data', 'project_id', 'INTEGER REFERENCES projects(id) ON DELETE SET NULL');
+db.exec('CREATE INDEX IF NOT EXISTS idx_data_project_id ON project_data(project_id)');
+// 只覆盖「尚未回填」的少量行，让启动兜底回填与完整性检查都走极小的部分索引
+db.exec('CREATE INDEX IF NOT EXISTS idx_data_pid_null ON project_data(project_no) WHERE project_id IS NULL');
+// 项目档案的编号 / 产品代码变更后，自动同步其全部数据的展示快照（含回收站里的数据）。
+// 只在这两列出现在 UPDATE 的 SET 中时触发，状态变更 / 软删除不会误触发。
+db.exec(`
+CREATE TRIGGER IF NOT EXISTS trg_project_sync
+AFTER UPDATE OF project_no, product_code ON projects
+BEGIN
+  UPDATE project_data
+     SET project_id = NEW.id,
+         project_no = NEW.project_no,
+         product_code = NEW.product_code
+   WHERE project_id = NEW.id
+      OR (project_id IS NULL AND project_no = OLD.project_no);
+END;
+`);
 db.exec('CREATE INDEX IF NOT EXISTS idx_data_owner ON project_data(created_by_id)');
 db.exec('CREATE INDEX IF NOT EXISTS idx_data_coke ON project_data(coke_type)');
 // 会话按用户检索（踢下线、清理过期）与按最后活跃时间清理
@@ -256,9 +277,10 @@ for (const f of FIELDS) if (ROUND2_KEYS.has(f.key)) f.round2 = true;
 /**
  * 版本号只用于「结构性 / 历史数据一次性整理」，不参与每次启动。
  *   1：所有数值字段归一到 2 位小数；回收站补删除批次；用户名大小写唯一。
+ *   2：project_data 增加 project_id + 外键 + 同步触发器，按项目编号回填。
  * 之后新增/导入时的精度处理在 server.js 的写入路径完成，不再全表改写。
  */
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 /** 把指定数值列一次性四舍五入到 2 位；Where 排除已合规行，避免无意义写入撑大 WAL */
 function normalizeNumbers(handle = db) {
@@ -329,13 +351,39 @@ function migrateUsernames(handle = db) {
   handle.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_nocase ON users(username COLLATE NOCASE)');
 }
 
+/**
+ * 回填 project_data.project_id（版本 2 迁移 / 数据库导入后都要跑）：
+ *   - 按 project_no 关联到 projects.id（含软删除在回收站里的项目）；
+ *   - 只处理 project_id IS NULL 的行，幂等、可重复执行；
+ *   - 找不到对应项目的孤儿行保持 NULL（SQLite 外键不约束 NULL，不会破坏旧数据）。
+ */
+function backfillProjectIds(handle = db) {
+  // 快速短路：用部分索引 idx_data_pid_null 判断有没有孤儿行。
+  // 正常启动（所有行都已回填）这一步只走索引取 1 行，几乎零成本，
+  // 不会像全表 UPDATE 那样扫描 5 万行、撑大 WAL。
+  const hasOrphan = handle
+    .prepare('SELECT 1 FROM project_data WHERE project_id IS NULL LIMIT 1')
+    .get();
+  if (!hasOrphan) return 0;
+  return handle
+    .prepare(
+      `UPDATE project_data
+          SET project_id = (SELECT p.id FROM projects p WHERE p.project_no = project_data.project_no LIMIT 1)
+        WHERE project_id IS NULL
+          AND EXISTS (SELECT 1 FROM projects p WHERE p.project_no = project_data.project_no)`
+    )
+    .run().changes;
+}
+
 const currentVersion = Number((db.prepare('PRAGMA user_version').get() || {}).user_version || 0);
 if (currentVersion < SCHEMA_VERSION) {
   db.exec('BEGIN IMMEDIATE');
   try {
+    // 这些步骤都幂等，从 0 / 1 升到 2 都安全；版本 1 已有结构不会被重复改动
     normalizeNumbers(db);
     backfillDeleteBatches(db);
     migrateUsernames(db);
+    backfillProjectIds(db); // 版本 2：按项目编号回填权威外键
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     db.exec('COMMIT');
     console.log(`[db] 已完成数据结构升级（user_version ${currentVersion} → ${SCHEMA_VERSION}）`);
@@ -343,6 +391,13 @@ if (currentVersion < SCHEMA_VERSION) {
     try { db.exec('ROLLBACK'); } catch { /* ignore */ }
     throw e;
   }
+}
+
+// 每次启动都兜底回填 project_id：兼容「外部写入 / 数据库导入 / 老版本残留」的孤儿行。
+// 该 UPDATE 只命中 project_id IS NULL 且能匹配到项目的行，靠 idx_data_pno 走索引，成本极低；
+// 已回填的行不会被改写，不会撑大 WAL。
+try { backfillProjectIds(db); } catch (e) {
+  console.warn('[db] project_id 回填跳过（不影响启动）：', e.message);
 }
 
 // 让查询计划拿到统计信息；PRAGMA optimize 本身很轻，不做全库 ANALYZE
@@ -355,4 +410,5 @@ module.exports = {
   normalizeNumbers,
   backfillDeleteBatches,
   migrateUsernames,
+  backfillProjectIds,
 };
