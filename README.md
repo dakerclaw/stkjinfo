@@ -268,6 +268,9 @@ node seed.js --reset   # 清空项目与数据后重新灌入示例（保留用�
 
 ## API
 
+<details>
+<summary>点击展开：全部 API 接口</summary>
+
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | /api/auth/login | 登录 `{username,password}`，成功后下发 HttpOnly Cookie（用户名不区分大小写） |
@@ -313,6 +316,8 @@ node seed.js --reset   # 清空项目与数据后重新灌入示例（保留用�
 
 除 `/api/auth/login`、`/api/auth/logout` 外，所有接口均需登录，未登录返回 401。
 权限不足返回 403，响应体 `{success:false, message}`；数据重复返回 409，`code` 为 `DUPLICATE_KEY`。
+
+</details>
 
 ## 目录结构
 
