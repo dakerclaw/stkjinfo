@@ -1185,14 +1185,69 @@ function serveIndex(req, res) {
     if (err || !stat.isFile()) return fail(res, 404, '页面不存在');
     const cached = staticCache.get(filePath);
     if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
-      return sendStaticEntry(req, res, cached);
+      return sendHtmlEntry(req, res, cached);
     }
     fs.readFile(filePath, (e2, html) => {
       if (e2) return fail(res, 404, '页面不存在');
       const body = Buffer.from(injectAssetVersion(html.toString('utf8')), 'utf8');
-      sendStaticEntry(req, res, buildStaticEntry(filePath, body, stat));
+      sendHtmlEntry(req, res, buildStaticEntry(filePath, body, stat));
     });
   });
+}
+
+/* ------------------------------------------------------ 地址栏明文凭证防护 */
+// 形如 ?username=xxx&password=yyy 的查询参数会留在地址栏，被浏览器历史、书签、
+// 代理与服务器访问日志（含 Referer）记录，等于明文泄露密码。
+const CRED_KEYS = {
+  password: ['password', 'passwd', 'pwd', 'pass'],
+  username: ['username', 'user', 'account', 'login', 'u'],
+};
+const isCredKey = (kind, k) => CRED_KEYS[kind].includes(String(k).toLowerCase());
+
+/**
+ * 查询串里同时带了账号与密码两类参数时，返回丢弃凭证参数后的相对地址；否则返回 null。
+ * 其余参数原样保留，保证应用本身的功能不受影响。
+ */
+function stripCredentialQuery(rawUrl) {
+  let url;
+  try {
+    url = new URL(rawUrl, 'http://localhost');
+  } catch {
+    return null;
+  }
+  const keys = [...url.searchParams.keys()];
+  const hasUser = keys.some((k) => isCredKey('username', k));
+  const hasPwd = keys.some((k) => isCredKey('password', k));
+  if (!hasUser || !hasPwd) return null;
+
+  const kept = new URLSearchParams();
+  for (const [k, v] of url.searchParams) {
+    if (isCredKey('username', k) || isCredKey('password', k)) continue;
+    kept.append(k, v);
+  }
+  const qs = kept.toString();
+  return url.pathname + (qs ? `?${qs}` : '') + url.hash;
+}
+
+/**
+ * 输出 index.html。页面（或其引用的资源）带着明文账号密码时，
+ * 先 302 跳到清理后的地址，让地址栏、浏览器历史与后续请求的 Referer 都不再含密码。
+ */
+function sendHtmlEntry(req, res, entry) {
+  const safe = stripCredentialQuery(req.url);
+  if (safe) {
+    // Referrer-Policy 必须放在 SECURITY_HEADERS 之后：它需要覆盖全局的 same-origin，
+    // 否则同源请求仍会把带密码的地址作为 Referer 传给服务器。
+    const headers = {
+      ...SECURITY_HEADERS,
+      Location: safe,
+      'Cache-Control': 'no-store',
+      'Referrer-Policy': 'no-referrer',
+    };
+    res.writeHead(302, headers);
+    return res.end();
+  }
+  sendStaticEntry(req, res, entry);
 }
 
 function serveStatic(req, res, pathname) {
@@ -1209,16 +1264,18 @@ function serveStatic(req, res, pathname) {
   if (filePath !== PUBLIC_DIR && !filePath.startsWith(PUBLIC_DIR + path.sep)) {
     return fail(res, 403, '禁止访问');
   }
+  const isHtml = filePath === INDEX_FILE;
   fs.stat(filePath, (err, stat) => {
     if (err || !stat.isFile()) return serveIndex(req, res);
     const cached = staticCache.get(filePath);
     if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
-      return sendStaticEntry(req, res, cached);
+      return isHtml ? sendHtmlEntry(req, res, cached) : sendStaticEntry(req, res, cached);
     }
     fs.readFile(filePath, (e2, data) => {
       if (e2) return serveIndex(req, res);
-      const body = filePath === INDEX_FILE ? Buffer.from(injectAssetVersion(data.toString('utf8')), 'utf8') : data;
-      sendStaticEntry(req, res, buildStaticEntry(filePath, body, stat));
+      const body = isHtml ? Buffer.from(injectAssetVersion(data.toString('utf8')), 'utf8') : data;
+      const entry = buildStaticEntry(filePath, body, stat);
+      return isHtml ? sendHtmlEntry(req, res, entry) : sendStaticEntry(req, res, entry);
     });
   });
 }
