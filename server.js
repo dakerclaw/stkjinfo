@@ -443,15 +443,28 @@ function exportDataXlsx(res, params, user) {
     idArgs.push(...ids);
   }
   const full = cond ? (w ? `${w} AND${cond}` : ` WHERE${cond}`) : w;
-  // 只 SELECT 导出需要的列，减少行对象体积
-  const colList = FIELDS.map((f) => f.key).join(', ');
-  const stmt = db.prepare(`SELECT ${colList} FROM project_data${full} ORDER BY id DESC`);
   const allArgs = [...args, ...idArgs];
 
+  // 全空的列不输出：先在同样的筛选范围内做一次聚合，统计每列的非空行数。
+  // 数值 0 视为「有数据」（CAST 成文本后为 '0'）；需要保留全部列时传 allColumns=1。
+  let cols = FIELDS;
+  if (params.get('allColumns') !== '1') {
+    const probe = FIELDS
+      .map((f) => `SUM(CASE WHEN TRIM(CAST(${f.key} AS TEXT)) <> '' THEN 1 ELSE 0 END) AS c_${f.key}`)
+      .join(', ');
+    const stat = db.prepare(`SELECT COUNT(*) AS n, ${probe} FROM project_data${full}`).get(...allArgs);
+    // 没有命中任何行时无从判断哪些列有意义，保持全部列
+    if (stat.n > 0) cols = FIELDS.filter((f) => stat[`c_${f.key}`] > 0);
+  }
+
+  // 只 SELECT 导出需要的列，减少行对象体积
+  const colList = cols.map((f) => f.key).join(', ');
+  const stmt = db.prepare(`SELECT ${colList} FROM project_data${full} ORDER BY id DESC`);
+
   function* rowSource() {
-    yield FIELDS.map((f) => f.label); // 表头
+    yield cols.map((f) => f.label); // 表头（已剔除全空列）
     for (const r of stmt.iterate(...allArgs)) {
-      yield FIELDS.map((f) => cell(r[f.key]));
+      yield cols.map((f) => cell(r[f.key]));
     }
   }
   sendXlsxStream(res, xlsx.buildStream(rowSource(), '项目数据'), `项目数据_${todayStr()}.xlsx`);
