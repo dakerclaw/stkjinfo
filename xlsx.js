@@ -104,12 +104,26 @@ function zipRead(buf) {
 
 /* ============================================================ ZIP 写入 */
 
+/**
+ * 当前时间转 ZIP 的 DOS 时间 / 日期。
+ * 不能留 0：0 表示 1980-00-00（月份/日期都非法），Excel 打开会提示「检测到错误，已修复」。
+ */
+function dosDateTime(d = new Date()) {
+  const time = (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
+  const date = ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
+  return { time, date };
+}
+
+const FLAG_UTF8 = 0x800; // 文件名使用 UTF-8
+const FLAG_DESC = 0x0008; // CRC / 大小写在压缩数据之后的 data descriptor 里
+
 /** 把 { 文件名: 文本内容 } 打包成 xlsx（deflate 压缩） */
 function zipWrite(files) {
   const names = Object.keys(files);
   const locals = [];
   const central = [];
   let offset = 0;
+  const { time: dosTime, date: dosDate } = dosDateTime();
 
   for (const name of names) {
     const data = Buffer.from(files[name], 'utf8');
@@ -120,10 +134,10 @@ function zipWrite(files) {
     const lh = Buffer.alloc(30);
     lh.writeUInt32LE(0x04034b50, 0); // 本地文件头签名
     lh.writeUInt16LE(20, 4); // version needed
-    lh.writeUInt16LE(0x800, 6); // flags: UTF-8 文件名
+    lh.writeUInt16LE(FLAG_UTF8, 6); // flags: UTF-8 文件名
     lh.writeUInt16LE(8, 8); // method: deflate
-    lh.writeUInt16LE(0, 10); // 修改时间
-    lh.writeUInt16LE(0, 12); // 修改日期
+    lh.writeUInt16LE(dosTime, 10); // 修改时间
+    lh.writeUInt16LE(dosDate, 12); // 修改日期
     lh.writeUInt32LE(crc, 14);
     lh.writeUInt32LE(comp.length, 18);
     lh.writeUInt32LE(data.length, 22);
@@ -135,10 +149,10 @@ function zipWrite(files) {
     ch.writeUInt32LE(0x02014b50, 0); // 中央目录签名
     ch.writeUInt16LE(20, 4); // version made by
     ch.writeUInt16LE(20, 6); // version needed
-    ch.writeUInt16LE(0x800, 8); // flags
+    ch.writeUInt16LE(FLAG_UTF8, 8); // flags
     ch.writeUInt16LE(8, 10); // method
-    ch.writeUInt16LE(0, 12); // time
-    ch.writeUInt16LE(0, 14); // date
+    ch.writeUInt16LE(dosTime, 12); // time
+    ch.writeUInt16LE(dosDate, 14); // date
     ch.writeUInt32LE(crc, 16);
     ch.writeUInt32LE(comp.length, 20);
     ch.writeUInt32LE(data.length, 24);
@@ -185,6 +199,9 @@ function decodeXml(s) {
 
 function escXml(s) {
   return String(s)
+    // XML 1.0 不允许的控制字符（0x00-0x08、0x0B、0x0C、0x0E-0x1F）会让工作簿变成非法 XML，
+    // Excel 打开时会提示「检测到错误，已修复」。这里统一剔除。
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
@@ -465,9 +482,10 @@ function buildStream(rowSource, sheetName = 'Sheet1') {
   };
 
   async function* generate() {
-    const entries = []; // { name, crc, compSize, rawSize, offset }
+    const entries = []; // { name, crc, compSize, rawSize, offset, flags }
     let offset = 0;
     const nameBuf = (n) => Buffer.from(n, 'utf8');
+    const { time: dosTime, date: dosDate } = dosDateTime();
 
     // ---- 先写几个小的 XML 条目（deflate 压缩，标准本地头 + 中央目录记录） ----
     for (const [name, text] of Object.entries(small)) {
@@ -478,25 +496,30 @@ function buildStream(rowSource, sheetName = 'Sheet1') {
       const lh = Buffer.alloc(30);
       lh.writeUInt32LE(0x04034b50, 0);
       lh.writeUInt16LE(20, 4);
-      lh.writeUInt16LE(0x800, 6);
+      lh.writeUInt16LE(FLAG_UTF8, 6);
       lh.writeUInt16LE(8, 8);
+      lh.writeUInt16LE(dosTime, 10);
+      lh.writeUInt16LE(dosDate, 12);
       lh.writeUInt32LE(crc, 14);
       lh.writeUInt32LE(comp.length, 18);
       lh.writeUInt32LE(data.length, 22);
       lh.writeUInt16LE(nb.length, 26);
       yield Buffer.concat([lh, nb, comp]);
-      entries.push({ name: nb, crc, compSize: comp.length, rawSize: data.length, offset });
+      entries.push({ name: nb, crc, compSize: comp.length, rawSize: data.length, offset, flags: FLAG_UTF8 });
       offset += 30 + nb.length + comp.length;
     }
 
     // ---- 工作表：流式 deflate + data descriptor ----
     const nb = nameBuf(SHEET_NAME);
     const wsOffset = offset;
+    const wsFlags = FLAG_UTF8 | FLAG_DESC;
     const lh = Buffer.alloc(30);
     lh.writeUInt32LE(0x04034b50, 0);
     lh.writeUInt16LE(20, 4);
-    lh.writeUInt16LE(0x800, 6);     // bit 3 = data descriptor 延后写 CRC/大小
+    lh.writeUInt16LE(wsFlags, 6);   // bit 3 = CRC/大小为 0，真实值写在压缩数据之后的 data descriptor
     lh.writeUInt16LE(8, 8);         // method: deflate
+    lh.writeUInt16LE(dosTime, 10);
+    lh.writeUInt16LE(dosDate, 12);
     lh.writeUInt32LE(0, 14);        // CRC（稍后由 descriptor 给出）
     lh.writeUInt32LE(0, 18);
     lh.writeUInt32LE(0, 22);
@@ -552,7 +575,7 @@ function buildStream(rowSource, sheetName = 'Sheet1') {
     dd.writeUInt32LE(compSize, 8);
     dd.writeUInt32LE(rawSize, 12);
     yield dd;
-    entries.push({ name: nb, crc: finalCrc, compSize, rawSize, offset: wsOffset });
+    entries.push({ name: nb, crc: finalCrc, compSize, rawSize, offset: wsOffset, flags: wsFlags });
     offset += 30 + nb.length + compSize + 16;
 
     // ---- 中央目录 + EOCD（用真实 CRC / 大小） ----
@@ -562,8 +585,10 @@ function buildStream(rowSource, sheetName = 'Sheet1') {
       ch.writeUInt32LE(0x02014b50, 0);
       ch.writeUInt16LE(20, 4);
       ch.writeUInt16LE(20, 6);
-      ch.writeUInt16LE(0x800, 8);
+      ch.writeUInt16LE(e.flags, 8); // 必须与本地头一致（工作表含 bit3）
       ch.writeUInt16LE(8, 10);
+      ch.writeUInt16LE(dosTime, 12);
+      ch.writeUInt16LE(dosDate, 14);
       ch.writeUInt32LE(e.crc, 16);
       ch.writeUInt32LE(e.compSize, 20);
       ch.writeUInt32LE(e.rawSize, 24);
