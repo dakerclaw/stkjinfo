@@ -81,7 +81,7 @@ function cachedStmt(sql) {
 
 /* ---------- 读缓存：写操作后由 invalidateMeta() 统一失效 ---------- */
 const CACHE_TTL = 30 * 1000;
-const dataCaches = { projects: new Map(), stats: new Map(), facets: new Map() };
+const dataCaches = { projects: new Map(), stats: new Map(), facets: new Map(), filled: new Map() };
 
 function paramsKey(params) {
   return [...params.entries()]
@@ -1451,6 +1451,29 @@ function deleteProject(res, id, user) {
 }
 
 /* ---------- 项目数据 ---------- */
+
+/**
+ * 当前筛选范围内「至少有一条非空值」的字段列表，供表格隐藏全空列。
+ * 判定口径与导出完全一致（数值 0 算有数据）；按筛选条件缓存，写操作后随 metaVersion 失效。
+ * 返回 null 表示范围内没有数据，前端应按“无需隐藏”处理。
+ */
+function filledColumns(params, user) {
+  const p = new URLSearchParams(params);
+  ['page', 'pageSize', 'sort', 'dir', 'ids', 'onlySelected'].forEach((k) => p.delete(k));
+  const key = `filled|${user.id}|${paramsKey(p)}`;
+  const cached = cacheGet(dataCaches.filled, key, metaVersion);
+  if (cached !== undefined) return cached;
+
+  const { w, args } = buildDataWhere(p, user);
+  const probe = FIELDS
+    .map((f) => `SUM(CASE WHEN TRIM(CAST(${f.key} AS TEXT)) <> '' THEN 1 ELSE 0 END) AS c_${f.key}`)
+    .join(', ');
+  const stat = db.prepare(`SELECT COUNT(*) AS n, ${probe} FROM project_data${w}`).get(...args);
+  const data = stat.n > 0 ? FIELDS.filter((f) => stat[`c_${f.key}`] > 0).map((f) => f.key) : null;
+  cacheSet(dataCaches.filled, key, metaVersion, data);
+  return data;
+}
+
 function listData(res, params, user) {
   const { w, args } = buildDataWhere(params, user);
 
@@ -1462,7 +1485,7 @@ function listData(res, params, user) {
   const rows = db
     .prepare(`SELECT * FROM project_data${w}${buildOrder(params, ' ORDER BY id DESC')} LIMIT ? OFFSET ?`)
     .all(...args, pageSize, offset);
-  ok(res, { rows, total, page, pageSize });
+  ok(res, { rows, total, page, pageSize, ...(params.get('meta') === '0' ? {} : { filled: filledColumns(params, user) }) });
 }
 
 /**

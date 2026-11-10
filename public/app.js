@@ -62,7 +62,7 @@ const state = {
   user: null,
   meta: null,
   projects: { filters: {}, sort: '', dir: 'asc', page: 1, pageSize: 20, total: 0, selected: new Set(), onlySelected: false, rows: [] },
-  data: { filters: {}, sort: '', dir: 'asc', page: 1, pageSize: 20, selected: new Set(), facets: null, facetsSeq: 0 },
+  data: { filters: {}, sort: '', dir: 'asc', page: 1, pageSize: 20, selected: new Set(), facets: null, facetsSeq: 0, filled: null, filledDirty: true, showEmptyCols: false },
   users: { rows: [] },
   audit: { filters: {}, page: 1, pageSize: 50 },
 };
@@ -476,6 +476,7 @@ function gotoDataForProject(pno) {
   state.data.page = 1;
   state.data.selected.clear();
   state.data.onlySelected = false;
+  state.data.filledDirty = true; // 换了筛选条件，重算「有数据列」
   navigate('data');
 }
 
@@ -752,6 +753,10 @@ async function renderData() {
       <label style="display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--text-2);cursor:pointer">
         <input type="checkbox" id="onlySel" style="accent-color:var(--primary)" ${state.data.onlySelected ? 'checked' : ''}/> 仅显示已选
       </label>
+      <label style="display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--text-2);cursor:pointer"
+             title="默认只显示当前筛选结果中有数据的列；勾选后显示全部指标列">
+        <input type="checkbox" id="showEmptyCols" style="accent-color:var(--primary)" ${state.data.showEmptyCols ? 'checked' : ''}/> 显示空列
+      </label>
       <button class="btn btn-sm" id="copyRow" style="display:none" onclick="copySelectedData()" title="勾选一行后，可基于它复制出一条新记录">复制为新行</button>
       <button class="btn btn-sm btn-danger" id="bulkDel" style="display:none" onclick="bulkDelete()">删除选中 (<span id="selCount">0</span>)</button>
     </div>
@@ -770,6 +775,7 @@ async function renderData() {
       date_to: el('#dTo').value,
     };
     state.data.page = 1;
+    state.data.filledDirty = true; // 筛选变了，需要重算「有数据列」
   };
   const reload = () => {
     collect();
@@ -782,6 +788,7 @@ async function renderData() {
   ['dPno', 'dPc', 'dBase', 'dProc', 'dWo', 'dCoke', 'dFrom', 'dTo'].forEach((id) => el('#' + id).addEventListener('change', reload));
   el('#dKw').addEventListener('input', debounce(reload, 240));
   el('#onlySel').addEventListener('change', (e) => { state.data.onlySelected = e.target.checked; loadData(); });
+  el('#showEmptyCols').addEventListener('change', (e) => { state.data.showEmptyCols = e.target.checked; loadData(); });
 
   loadData();
   refreshDataOptions();
@@ -792,6 +799,7 @@ function clearDataFilters() {
   state.data.page = 1;
   state.data.selected.clear();
   state.data.facets = null;
+  state.data.filledDirty = true;
   renderData();
 }
 
@@ -842,9 +850,14 @@ async function loadData() {
   qs.set('page', state.data.page);
   qs.set('pageSize', state.data.pageSize);
   if (state.data.sort) { qs.set('sort', state.data.sort); qs.set('dir', state.data.dir); }
+  // 筛选条件变化才需要重新判断「哪些列有数据」；翻页 / 排序 / 仅显示已选沿用上次结果
+  if (!state.data.filledDirty && Array.isArray(state.data.filled)) qs.set('meta', '0');
 
-  const { rows: allRows, total, page, pageSize } = await API.get('/api/data?' + qs.toString());
+  const { rows: allRows, total, page, pageSize, filled } = await API.get('/api/data?' + qs.toString());
+  state.data.filledDirty = false;
   state.data.rows = allRows; // 供「复制为新行」等操作按 id 取原始记录
+  // 带 meta=0 时后端不回 filled，沿用上次结果；首次加载或筛选变化时更新
+  if (filled !== undefined) state.data.filled = Array.isArray(filled) ? filled : null;
   const rows = state.data.onlySelected && state.data.selected.size
     ? allRows.filter((r) => state.data.selected.has(r.id))
     : allRows;
@@ -858,7 +871,13 @@ async function loadData() {
     return;
   }
 
-  const cols = NUM_FIELDS().map((f) => f.key);
+  // 只显示当前筛选结果里有数据的列（可在工具栏勾选「显示空列」看全部）
+  const shown = (!state.data.filled || state.data.showEmptyCols)
+    ? F()
+    : F().filter((f) => state.data.filled.includes(f.key));
+  // 录入人单独成列，永远显示（不受“有数据列”影响）
+  const cols = [...shown, { key: 'created_by', label: '录入人', type: 'text' }];
+  const hiddenCount = F().length - shown.length;
   const sorted = state.data.sort;
   const arrow = (k) => sorted === k ? (state.data.dir === 'asc' ? '▲' : '▼') : '↕';
 
@@ -868,9 +887,7 @@ async function loadData() {
         <thead>
           <tr>
             <th class="col-sticky" style="width:40px"><input type="checkbox" id="checkAll" style="accent-color:var(--primary)" /></th>
-            ${F().map((f) => `<th class="sortable ${sorted === f.key ? 'sorted' : ''}" data-sort="${f.key}">${esc(f.label)}<span class="arrow">${arrow(f.key)}</span></th>${
-              f.key === 'entry_date' ? `<th class="sortable ${sorted === 'created_by' ? 'sorted' : ''}" data-sort="created_by">录入人<span class="arrow">${arrow('created_by')}</span></th>` : ''
-            }`).join('')}
+            ${cols.map((f) => `<th class="sortable ${sorted === f.key ? 'sorted' : ''}" data-sort="${f.key}">${esc(f.label)}<span class="arrow">${arrow(f.key)}</span></th>`).join('')}
             <th style="position:sticky;right:0;background:var(--surface-2);z-index:3">操作</th>
           </tr>
         </thead>
@@ -879,17 +896,16 @@ async function loadData() {
             const mine = r.created_by_id === state.user.id;
             return `<tr>
             <td class="col-sticky"><input type="checkbox" class="rowChk" data-id="${r.id}" style="accent-color:var(--primary)" ${state.data.selected.has(r.id) ? 'checked' : ''} /></td>
-            ${F().map((f) => {
+            ${cols.map((f) => {
+              if (f.key === 'created_by') {
+                return `<td><span class="owner-chip ${mine ? 'me' : ''}">${esc(r.created_by || '—')}${mine ? '（我）' : ''}</span></td>`;
+              }
               const v = r[f.key];
-              const sticky = '';
-              const ownerCell = f.key === 'entry_date'
-                ? `<td><span class="owner-chip ${mine ? 'me' : ''}">${esc(r.created_by || '—')}${mine ? '（我）' : ''}</span></td>`
-                : '';
-              if (f.key === 'project_no') return `<td class="${sticky}"><span class="code-chip">${esc(v)}</span></td>${ownerCell}`;
-              if (f.key === 'remark') return `<td class="wrap dim">${esc(v || '')}</td>${ownerCell}`;
-              if (f.key === 'entry_date') return `<td class="dim">${esc(v || '—')}</td>${ownerCell}`;
-              if (f.type === 'number') return `<td class="num">${fmtNum(v, f.round2 ? 2 : undefined)}</td>${ownerCell}`;
-              return `<td>${esc(v || '—')}</td>${ownerCell}`;
+              if (f.key === 'project_no') return `<td><span class="code-chip">${esc(v)}</span></td>`;
+              if (f.key === 'remark') return `<td class="wrap dim">${esc(v || '')}</td>`;
+              if (f.key === 'entry_date') return `<td class="dim">${esc(v || '—')}</td>`;
+              if (f.type === 'number') return `<td class="num">${fmtNum(v, f.round2 ? 2 : undefined)}</td>`;
+              return `<td>${esc(v || '—')}</td>`;
             }).join('')}
             <td style="position:sticky;right:0;background:var(--surface);border-left:1px solid var(--border)">
               <div class="row-actions">
@@ -902,7 +918,11 @@ async function loadData() {
       </table>
     </div>
     ${renderPagination(total, page, pageSize)}
-    <div style="padding:0 16px 12px"><span class="scroll-hint">↔ 表格可横向滚动查看全部 ${F().length} 个指标字段</span></div>`;
+    <div style="padding:0 16px 12px"><span class="scroll-hint">↔ 表格可横向滚动；${
+      hiddenCount > 0
+        ? `已隐藏 <b>${hiddenCount}</b> 个无数据列（勾选「显示空列」可查看全部 ${F().length} 列）`
+        : `共 ${shown.length} 个指标列`
+    }</span></div>`;
 
   // 排序
   box.querySelectorAll('th.sortable').forEach((th) => {
