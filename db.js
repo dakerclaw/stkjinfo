@@ -281,8 +281,7 @@ for (const f of FIELDS) if (ROUND2_KEYS.has(f.key)) f.round2 = true;
 
 /**
  * 百分数字段（type: 'percent'）：库里存 0–100 的百分数值本身（87.1 表示 87.1%），
- * 写入/导入时保留 1 位小数，显示与导出统一带「%」。
- * 不改存 0–1 小数，是为了直接兼容已录入的数据和 Excel 里的「87.1%」写法。
+ * 写入 / 导入时保留 1 位小数，显示与导出统一带「%」。
  */
 const PERCENT_KEYS = new Set(FIELDS.filter((f) => f.type === 'percent').map((f) => f.key));
 for (const f of FIELDS) if (PERCENT_KEYS.has(f.key)) f.round1 = true;
@@ -404,7 +403,7 @@ if (currentVersion < SCHEMA_VERSION) {
   try {
     // 这些步骤都幂等，从 0 / 1 升到 2 都安全；版本 1 已有结构不会被重复改动
     normalizeNumbers(db);
-    normalizePercents(db);  // 百分数按 1 位小数（幂等，同样不受版本约束）
+    normalizePercents(db);  // 百分数按 1 位小数
     backfillDeleteBatches(db);
     migrateUsernames(db);
     backfillProjectIds(db); // 版本 2：按项目编号回填权威外键
