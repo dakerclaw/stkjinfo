@@ -120,7 +120,7 @@ class HttpError extends Error {
 /** 各文本字段的长度上限：防止超长内容撑爆列表 / 导出 / 审计日志 */
 const TEXT_LIMITS = {
   project_no: 100, product_code: 100, project_type: 100,
-  base: 100, process_code: 100, work_order: 100, coke_type: 100,
+  base: 100, process_code: 100, work_order: 100, coke_type: 100, location: 100,
   description: 1000, remark: 2000,
 };
 

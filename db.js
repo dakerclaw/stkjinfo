@@ -92,6 +92,7 @@ CREATE TABLE IF NOT EXISTS project_data (
   process_code TEXT,                                  -- 工序
   work_order   TEXT,                                  -- 工单号
   coke_type    TEXT,                                  -- 焦种
+  location     TEXT,                                  -- 位置
   -- 粒度分布
   dx0   REAL, dx1   REAL, dx10  REAL, dx50  REAL,
   dx90  REAL, dx99  REAL, dx100 REAL,
@@ -123,6 +124,7 @@ CREATE TABLE IF NOT EXISTS project_data (
   yield_rate    REAL,                                 -- 收率
   energy        REAL,                                 -- 能耗
   quantity      REAL,                                 -- 生产数量
+  sieve_rate    REAL,                                 -- 过筛率
   remark        TEXT,                                 -- 备注
   entry_date    TEXT,                                 -- 录入日期
   created_by    TEXT,                                 -- 录入人账号（数据归属）
@@ -155,6 +157,8 @@ ensureColumn('project_data', 'created_by_id', 'INTEGER');
 ensureColumn('project_data', 'updated_by', 'TEXT');
 ensureColumn('project_data', 'coke_type', 'TEXT');
 ensureColumn('project_data', 'energy', 'REAL'); // 能耗：加在收率与生产数量之间（显示顺序由 FIELDS 决定）
+ensureColumn('project_data', 'location', 'TEXT'); // 位置：显示在焦种之后
+ensureColumn('project_data', 'sieve_rate', 'REAL'); // 过筛率：显示在生产数量之后
 // 软删除：删除仅打标记，30 天内可在回收站恢复，超期由服务端定时物理清理
 ensureColumn('projects', 'deleted_at', 'TEXT');
 ensureColumn('project_data', 'deleted_at', 'TEXT');
@@ -227,6 +231,7 @@ const FIELDS = [
   { key: 'process_code', label: '工序',       type: 'text' },
   { key: 'work_order',   label: '工单号',     type: 'text' },
   { key: 'coke_type',    label: '焦种',       type: 'text' },
+  { key: 'location',     label: '位置',       type: 'text' },
   { key: 'dx0',   label: 'Dx(0)',   type: 'number' },
   { key: 'dx1',   label: 'Dx(1)',   type: 'number' },
   { key: 'dx10',  label: 'Dx(10)',  type: 'number' },
@@ -265,6 +270,7 @@ const FIELDS = [
   { key: 'yield_rate',     label: '收率',       type: 'number' },
   { key: 'energy',         label: '能耗',       type: 'number' },
   { key: 'quantity',       label: '生产数量',   type: 'number' },
+  { key: 'sieve_rate',     label: '过筛率',     type: 'number' },
   { key: 'remark',         label: '备注',       type: 'text' },
   { key: 'entry_date',     label: '录入日期',   type: 'date' },
 ];
