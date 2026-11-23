@@ -680,8 +680,8 @@ function openProjectModal(id) {
    项目数据
    ============================================================ */
 const F = () => state.meta.fields;
-const NUM_FIELDS = () => F().filter((f) => f.type === 'number');
-const TEXT_FIELDS = () => F().filter((f) => f.type !== 'number');
+const NUM_FIELDS = () => F().filter((f) => f.type === 'number' || f.type === 'percent');
+const TEXT_FIELDS = () => F().filter((f) => f.type !== 'number' && f.type !== 'percent');
 
 async function renderData() {
   const f = state.data.filters;
@@ -904,6 +904,12 @@ async function loadData() {
               if (f.key === 'project_no') return `<td><span class="code-chip">${esc(v)}</span></td>`;
               if (f.key === 'remark') return `<td class="wrap dim">${esc(v || '')}</td>`;
               if (f.key === 'entry_date') return `<td class="dim">${esc(v || '—')}</td>`;
+              if (f.type === 'percent') {
+                const n = Number(v);
+                return `<td class="num">${v === null || v === undefined || v === '' || !Number.isFinite(n)
+                  ? '<span class="empty-num">—</span>'
+                  : `${n.toFixed(1)}%`}</td>`;
+              }
               if (f.type === 'number') return `<td class="num">${fmtNum(v, f.round2 ? 2 : undefined)}</td>`;
               return `<td>${esc(v || '—')}</td>`;
             }).join('')}
@@ -1049,10 +1055,12 @@ function openDataModal(id, opts = {}) {
       const listOpts = listId
         ? `<datalist id="${listId}">${(state.meta.options[{ base: 'bases', process_code: 'processes', work_order: 'workOrders', coke_type: 'cokeTypes' }[key]] || []).map((o) => `<option value="${esc(o)}">`).join('')}</datalist>`
         : '';
-      const type = f.type === 'number' ? 'number' : f.type === 'date' ? 'date' : 'text';
-      const step = f.type === 'number' ? ' step="any"' : '';
-      return `<div class="field"><label class="${required.trim()}">${f.label}</label>
-        <input class="input" type="${type}"${step} id="d_${key}" value="${esc(val)}" placeholder="${f.type === 'number' ? '数值' : ''}" />${listOpts}</div>`;
+      const isNum = f.type === 'number' || f.type === 'percent';
+      const type = isNum ? 'number' : f.type === 'date' ? 'date' : 'text';
+      const step = f.type === 'percent' ? ' step="0.1"' : isNum ? ' step="any"' : '';
+      const ph = f.type === 'percent' ? '百分数，如 87.1' : f.type === 'number' ? '数值' : '';
+      return `<div class="field"><label class="${required.trim()}">${f.label}${f.type === 'percent' ? ' (%)' : ''}</label>
+        <input class="input" type="${type}"${step} id="d_${key}" value="${esc(val)}" placeholder="${ph}" />${listOpts}</div>`;
     };
 
     openModal({

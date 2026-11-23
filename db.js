@@ -270,7 +270,7 @@ const FIELDS = [
   { key: 'yield_rate',     label: '收率',       type: 'number' },
   { key: 'energy',         label: '能耗',       type: 'number' },
   { key: 'quantity',       label: '生产数量',   type: 'number' },
-  { key: 'sieve_rate',     label: '过筛率',     type: 'number' },
+  { key: 'sieve_rate',     label: '过筛率',     type: 'percent' },
   { key: 'remark',         label: '备注',       type: 'text' },
   { key: 'entry_date',     label: '录入日期',   type: 'date' },
 ];
@@ -278,6 +278,14 @@ const FIELDS = [
 // 指标字段统一保留 2 位小数（写入/导入时四舍五入）；生产数量同样保留 2 位
 const ROUND2_KEYS = new Set(FIELDS.filter((f) => f.type === 'number').map((f) => f.key));
 for (const f of FIELDS) if (ROUND2_KEYS.has(f.key)) f.round2 = true;
+
+/**
+ * 百分数字段（type: 'percent'）：库里存 0–100 的百分数值本身（87.1 表示 87.1%），
+ * 写入/导入时保留 1 位小数，显示与导出统一带「%」。
+ * 不改存 0–1 小数，是为了直接兼容已录入的数据和 Excel 里的「87.1%」写法。
+ */
+const PERCENT_KEYS = new Set(FIELDS.filter((f) => f.type === 'percent').map((f) => f.key));
+for (const f of FIELDS) if (PERCENT_KEYS.has(f.key)) f.round1 = true;
 
 /* --------------------------------------------------------------- 迁移 */
 /**
@@ -294,6 +302,15 @@ function normalizeNumbers(handle = db) {
   if (keys.length === 0) return 0;
   const setSql = keys.map((k) => `${k} = round(${k}, 2)`).join(', ');
   const whereSql = keys.map((k) => `(${k} IS NOT NULL AND ${k} != round(${k}, 2))`).join(' OR ');
+  return handle.prepare(`UPDATE project_data SET ${setSql} WHERE ${whereSql}`).run().changes;
+}
+
+/** 百分数列一次性归一到 1 位小数（同样只更新不合规的行） */
+function normalizePercents(handle = db) {
+  const keys = [...PERCENT_KEYS];
+  if (keys.length === 0) return 0;
+  const setSql = keys.map((k) => `${k} = round(${k}, 1)`).join(', ');
+  const whereSql = keys.map((k) => `(${k} IS NOT NULL AND ${k} != round(${k}, 1))`).join(' OR ');
   return handle.prepare(`UPDATE project_data SET ${setSql} WHERE ${whereSql}`).run().changes;
 }
 
@@ -387,6 +404,7 @@ if (currentVersion < SCHEMA_VERSION) {
   try {
     // 这些步骤都幂等，从 0 / 1 升到 2 都安全；版本 1 已有结构不会被重复改动
     normalizeNumbers(db);
+    normalizePercents(db);  // 百分数按 1 位小数（幂等，同样不受版本约束）
     backfillDeleteBatches(db);
     migrateUsernames(db);
     backfillProjectIds(db); // 版本 2：按项目编号回填权威外键
@@ -413,7 +431,9 @@ module.exports = {
   db, DB_FILE, DATA_DIR, FIELDS,
   SCHEMA_VERSION,
   ROUND2_KEYS,
+  PERCENT_KEYS,
   normalizeNumbers,
+  normalizePercents,
   backfillDeleteBatches,
   migrateUsernames,
   backfillProjectIds,

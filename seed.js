@@ -112,6 +112,8 @@ function makeRow(pno, pcode, i) {
     yield_rate: rnd(86, 96),
     energy: rnd(3200, 5600, 2),
     quantity: rnd(12, 180, 2),
+    sieve_rate: rnd(85, 99.9, 1),
+    location: i % 3 === 0 ? '一号库 A 区' : i % 3 === 1 ? '二号库 B 区' : '三号库 C 区',
     entry_date: date,
     remark: i % 5 === 0 ? '抽检复测，数据正常' : null,
   };

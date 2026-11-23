@@ -343,6 +343,8 @@ function sendXlsx(res, buffer, filename) {
 }
 
 const cell = (v) => (v === null || v === undefined ? '' : v);
+/** 百分数字段导出为带「%」的文本（87.1 → "87.1%"），保证 Excel 里看到的就是百分数 */
+const percentCell = (v) => (v === null || v === undefined || v === '' ? '' : `${Number(v).toFixed(1)}%`);
 
 /** 把各种日期写法归一成 YYYY-MM-DD；无法识别返回 null */
 function normalizeDate(v) {
@@ -464,7 +466,7 @@ function exportDataXlsx(res, params, user) {
   function* rowSource() {
     yield cols.map((f) => f.label); // 表头（已剔除全空列）
     for (const r of stmt.iterate(...allArgs)) {
-      yield cols.map((f) => cell(r[f.key]));
+      yield cols.map((f) => (f.type === 'percent' ? percentCell(r[f.key]) : cell(r[f.key])));
     }
   }
   sendXlsxStream(res, xlsx.buildStream(rowSource(), '项目数据'), `项目数据_${todayStr()}.xlsx`);
@@ -957,7 +959,7 @@ function buildOrder(params, defaultOrder, allowed, prefix = '', aliasKeys = null
 
   // 数值型列：status 是整型，其余按 FIELDS 声明判断
   const numericKeys = new Set(['status', 'id']);
-  for (const f of FIELDS) if (f.type === 'number') numericKeys.add(f.key);
+  for (const f of FIELDS) if (f.type === 'number' || f.type === 'percent') numericKeys.add(f.key);
   // 查询里定义的别名不能加表前缀（p.data_count 会找不到列）
   const isAlias = !!(aliasKeys && aliasKeys.has(sort));
   const col = isAlias ? sort : `${prefix}${sort}`;
@@ -983,6 +985,10 @@ function pickData(body, { requireNo = true } = {}) {
       const n = Number(v);
       // 所有数值指标统一保留 2 位小数（四舍五入）
       row[key] = Number.isFinite(n) ? Math.round((n + Number.EPSILON) * 100) / 100 : null;
+    } else if (meta.type === 'percent') {
+      // 百分数：存 0–100 的数值本身，保留 1 位小数（87.1 表示 87.1%）
+      const n = Number(String(v).replace(/[,，\s%]/g, ''));
+      row[key] = Number.isFinite(n) ? Math.round((n + Number.EPSILON) * 10) / 10 : null;
     } else if (meta.type === 'date') {
       const d = normalizeDate(v);
       if (!d) throw new Error('录入日期格式不正确，请使用 YYYY-MM-DD');
@@ -1899,18 +1905,21 @@ function normalizeImportValue(key, value) {
   const s = String(value).trim();
   if (BLANK_RE.test(s)) return { value: undefined };
 
-  if (meta && meta.type === 'number') {
+  if (meta && (meta.type === 'number' || meta.type === 'percent')) {
     // 去掉千分位、百分号、空白与比较符，保留数字、小数点、负号、科学计数
     const cleaned = s.replace(/[,，\s%]/g, '').replace(/^[<>≤≥约~]+/, '');
     const m = cleaned.match(/-?\d+(\.\d+)?(e[-+]?\d+)?/i);
     if (!m) return { value: undefined, warning: `无法识别为数字，已留空` };
     const n = Number(m[0]);
     if (!Number.isFinite(n)) return { value: undefined, warning: `无法识别为数字，已留空` };
+    // 百分数字段按 1 位小数入库（与手工录入保持一致）
+    const val = meta.type === 'percent' ? Math.round((n + Number.EPSILON) * 10) / 10 : n;
     let warning = '';
-    if (/^[<>≤≥]/.test(s)) warning = `原始值「${s}」含比较符，已按 ${n} 写入`;
-    else if (/^\s*-?\d+(\.\d+)?\s*(?:~|～|至|-)\s*-?\d/.test(s)) warning = `原始值「${s}」为区间，已取第一个数 ${n}`;
-    else if (s.includes('%')) warning = `原始值「${s}」含百分号，按 ${n} 保存（不除以 100）`;
-    return { value: n, warning };
+    if (/^[<>≤≥]/.test(s)) warning = `原始值「${s}」含比较符，已按 ${val} 写入`;
+    else if (/^\s*-?\d+(\.\d+)?\s*(?:~|～|至|-)\s*-?\d/.test(s)) warning = `原始值「${s}」为区间，已取第一个数 ${val}`;
+    // 百分数字段本身就按百分数保存，含「%」是正常写法，不提示
+    else if (s.includes('%') && meta.type !== 'percent') warning = `原始值「${s}」含百分号，按 ${val} 保存（不除以 100）`;
+    return { value: val, warning };
   }
   return { value: s };
 }
@@ -3255,4 +3264,4 @@ function shutdown(signal) {
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
-module.exports = { server, db, hashPassword, makeSalt };
+module.exports = { server, db, hashPassword, makeSalt, normalizeImportValue };
