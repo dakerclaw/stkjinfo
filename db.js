@@ -205,6 +205,8 @@ db.exec(
                    IFNULL(coke_type,''), IFNULL(location,''))
    WHERE deleted_at IS NULL`
 );
+// 旧的五项索引已被七项索引覆盖（前缀相同），删除以省去多余的写入成本
+db.exec('DROP INDEX IF EXISTS idx_data_key5');
 
 // 角色规范化：用户名 admin 固定为系统管理员（用户名统一不区分大小写）
 db.exec(`UPDATE users SET role = 'sys_admin' WHERE username = 'admin' COLLATE NOCASE AND role = 'admin'`);
