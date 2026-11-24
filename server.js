@@ -1595,37 +1595,54 @@ function requireProject(projectNo) {
   return p || null;
 }
 
-/* ---------- 唯一键：项目编号 + 产品代码 + 所属公司 + 工序 + 工单号 ---------- */
-const DUP_KEYS = ['project_no', 'product_code', 'base', 'process_code', 'work_order'];
+/* ---------- 重复判定：七元组 ----------
+ * 「项目编号 + 产品代码 + 所属公司 + 工序 + 工单号 + 焦种 + 位置」完全一致 = 重复。
+ * 加焦种、位置两项，是因为同一工单下会有多种焦种、上下两条位置的检测数据，
+ * 只看前五项会把同工单的正常多条记录误判为重复。
+ *
+ * 焦种、位置允许为空：为空时按空字符串参与比对（两条都没填的仍算同一条记录）。
+ */
+const DUP_KEYS = ['project_no', 'product_code', 'base', 'process_code', 'work_order', 'coke_type', 'location'];
 const DUP_LABELS = {
   project_no: '项目编号', product_code: '产品代码',
   base: '所属公司', process_code: '工序', work_order: '工单号',
+  coke_type: '焦种', location: '位置',
 };
+/** 这五项任一为空就不参与判重；焦种、位置可空，按空串比对 */
+const DUP_REQUIRED_KEYS = ['project_no', 'product_code', 'base', 'process_code', 'work_order'];
 
-/** 五个字段是否全部有值（缺任意一项则不参与重复判定） */
+/** 必填的五项是否都有值 */
 function hasFullKey(row) {
-  return DUP_KEYS.every((k) => {
+  return DUP_REQUIRED_KEYS.every((k) => {
     const v = row[k];
     return v !== null && v !== undefined && String(v).trim() !== '';
   });
 }
 
-/** 查找五元组已存在的记录，并顺带带回总条数（一条 SQL 完成 count + 取样） */
-function findDuplicate(key) {
+/** 七元组的稳定字符串键，用于判重 */
+function dupKey(row) {
+  return DUP_KEYS.map((k) => {
+    const v = row[k];
+    return v === null || v === undefined ? '' : String(v).trim();
+  }).join('\u0001');
+}
+
+/** 查找七元组完全一致的已有记录，并带回相同条数 */
+function findDuplicate(row) {
+  if (!hasFullKey(row)) return null;
   return cachedStmt(
     `SELECT *, COUNT(*) OVER () AS dup_count FROM project_data
-     WHERE deleted_at IS NULL AND project_no = ? AND product_code = ? AND IFNULL(base,'') = ?
-       AND IFNULL(process_code,'') = ? AND IFNULL(work_order,'') = ?
-     ORDER BY id DESC LIMIT 1`
-  ).get(key.project_no, key.product_code, key.base || '', key.process_code || '', key.work_order || '');
+      WHERE deleted_at IS NULL AND project_no = ? AND product_code = ? AND IFNULL(base,'') = ?
+        AND IFNULL(process_code,'') = ? AND IFNULL(work_order,'') = ?
+        AND IFNULL(coke_type,'') = ? AND IFNULL(location,'') = ?
+      ORDER BY id DESC LIMIT 1`
+  ).get(
+    row.project_no, row.product_code, row.base || '', row.process_code || '', row.work_order || '',
+    row.coke_type || '', row.location || '',
+  );
 }
 
-/** 五元组的稳定字符串键，用于导入时在内存里判重 */
-function dupKey(row) {
-  return [row.project_no || '', row.product_code || '', row.base || '', row.process_code || '', row.work_order || ''].join('\u0001');
-}
-
-/** 拼出五元组的可读描述 */
+/** 拼出七元组的可读描述 */
 function describeKey(key) {
   return DUP_KEYS.map((k) => `${DUP_LABELS[k]}「${key[k] || '空'}」`).join(' · ');
 }
@@ -1634,7 +1651,7 @@ function describeKey(key) {
  * 新增数据：
  *   duplicateAction = 'overwrite' 覆盖已有记录（保留原 id 与录入人）
  *                   = 'append'    作为新记录追加
- *                   未指定时，如五元组重复则返回 409 让前端询问
+ *                   未指定时，如七元组重复则返回 409 让前端询问
  */
 function createData(res, body, user) {
   let row;
@@ -1650,12 +1667,12 @@ function createData(res, body, user) {
   row.product_code = proj.product_code; // 以项目档案为准，避免不一致
   if (!('entry_date' in row) || !row.entry_date) row.entry_date = localDate();
 
-  // 五项齐全才做重复判定
+  // 必需的五项齐全才判重，焦种、位置按空串参与比对
   const action = String(body.duplicate_action || '').toLowerCase();
   let existing = null;
   if (hasFullKey(row)) existing = findDuplicate(row);
   if (existing && !action) {
-    // 让前端确认：覆盖 or 追加
+    // 七项完全相同的记录已存在 → 让前端确认是否仍然新增
     return send(res, 409, {
       success: false,
       code: 'DUPLICATE_KEY',
@@ -1927,13 +1944,18 @@ function normalizeImportValue(key, value) {
 /**
  * CSV 导入：body.rows = [{...}, ...]，按表头中文名或字段名匹配；允许只提供部分指标字段
  * duplicate_action：
- *   'overwrite' 覆盖已有记录；'append' 全部追加；未指定时若命中重复则返回 409 让前端询问
+ *   'skip' 跳过与已有记录完全相同的行；'overwrite' 覆盖已有记录；'append' 全部追加；
+ *   未指定时若命中重复则返回 409 让前端询问
+ *
+ * 重复判定看**七元组**（项目编号 + 产品代码 + 所属公司 + 工序 + 工单号 + 焦种 + 位置），
+ * 焦种、位置不同即视为不同记录；两者为空时按空串比对。
  */
 function performImport(rows, user, action, lines = null) {
   const labelMap = new Map(FIELDS.map((f) => [f.label, f.key]));
   const keySet = new Set(DATA_KEYS);
   let inserted = 0;
   let overwritten = 0;
+  let skipped = 0;
   const errors = [];
   const warnings = [];      // 语义被转换的单元格（比较符 / 区间 / 百分号等），导入后提示
   const dupRows = [];       // 命中的重复行（供前端确认）
@@ -1945,17 +1967,20 @@ function performImport(rows, user, action, lines = null) {
     db.prepare('SELECT project_no, product_code FROM projects').all().map((p) => [p.project_no, p.product_code])
   );
 
-  // 五元组判重按项目惰性预取：每个项目只查一次，导入 5 万行不再逐行回表
-  const dupCache = new Map(); // project_no -> Map(key -> { row, count })
+  // 判重缓存按项目惰性预取：每个项目只查一次，导入 5 万行不再逐行回表。
+  // 键是七元组（含焦种、位置），同工单不同焦种/位置的正常数据不会互相命中。
+  const dupCache = new Map(); // project_no -> Map(key -> { row, count, fromFile })
+  const batchIds = new Set(); // 本批次刚插入的行 id，用于区分「文件内重复」和「库内重复」
   function loadDup(projectNo) {
     const map = new Map();
     const rs = db.prepare(
-      `SELECT *, COUNT(*) OVER (PARTITION BY IFNULL(base,''), IFNULL(process_code,''), IFNULL(work_order,'')) AS dup_count
-       FROM project_data WHERE deleted_at IS NULL AND project_no = ? ORDER BY id DESC`
+      `SELECT * FROM project_data WHERE deleted_at IS NULL AND project_no = ? ORDER BY id DESC`
     ).all(projectNo);
     for (const r of rs) {
       const k = dupKey(r);
-      if (!map.has(k)) map.set(k, { row: r, count: Number(r.dup_count) || 1 });
+      const hit = map.get(k);
+      if (hit) hit.count += 1;
+      else map.set(k, { row: r, count: 1, fromFile: false });
     }
     dupCache.set(projectNo, map);
     return map;
@@ -1963,7 +1988,10 @@ function performImport(rows, user, action, lines = null) {
   function lookupDup(row) {
     const map = dupCache.get(row.project_no) || loadDup(row.project_no);
     const hit = map.get(dupKey(row));
-    return hit ? { ...hit.row, dup_count: hit.count } : null;
+    if (!hit) return null;
+    // 命中的是本批次刚插入的行 → 说明是文件自身有完全相同的两行
+    const fromFile = batchIds.has(Number(hit.row.id));
+    return { ...hit.row, dup_count: hit.count, from_file: fromFile };
   }
   function remember(row, id) {
     const map = dupCache.get(row.project_no);
@@ -1974,7 +2002,7 @@ function performImport(rows, user, action, lines = null) {
       hit.count += 1;
       hit.row = { ...hit.row, ...row, id };
     } else {
-      map.set(k, { row: { ...row, id }, count: 1 });
+      map.set(k, { row: { ...row, id }, count: 1, fromFile: true });
     }
   }
 
@@ -2009,7 +2037,7 @@ function performImport(rows, user, action, lines = null) {
         row.product_code = projectMap.get(row.project_no); // 以项目档案为准
         if (!row.entry_date) row.entry_date = localDate();
 
-        // 五项齐全且已存在同键记录 → 视 duplicate_action 决定
+        // 七项完全相同的记录已存在 → 视 duplicate_action 决定
         let existing = null;
         if (hasFullKey(row)) existing = lookupDup(row);
 
@@ -2027,11 +2055,20 @@ function performImport(rows, user, action, lines = null) {
             base: row.base,
             process_code: row.process_code,
             work_order: row.work_order,
+            coke_type: row.coke_type,
+            location: row.location,
             existingId: existing.id,
             existingOwner: existing.created_by,
             own: existing.created_by_id === user.id,
+            fromFile: !!existing.from_file,
             key: describeKey(row),
           });
+          return;
+        }
+
+        // 完全相同的行：按用户选择跳过（幂等）或仍然追加一份
+        if (existing && action === 'skip') {
+          skipped++;
           return;
         }
 
@@ -2055,7 +2092,9 @@ function performImport(rows, user, action, lines = null) {
         row.created_by_id = user.id;
         row.updated_by = user.username;
         const info = insert('project_data', row);
-        remember(row, Number(info.lastInsertRowid));
+        const newId = Number(info.lastInsertRowid);
+        batchIds.add(newId);
+        remember(row, newId);
         inserted++;
         for (const k of Object.keys(row)) filledCount[k] = (filledCount[k] || 0) + 1;
       } catch (e) {
@@ -2073,6 +2112,9 @@ function performImport(rows, user, action, lines = null) {
           rows: dupRows.slice(0, 50),
           key: dupRows[0].key,
           sample: dupRows[0].key,
+          // 区分重复来源：库内已有记录 / 本文件内自身重复
+          inDb: dupRows.filter((r) => !r.fromFile).length,
+          inFile: dupRows.filter((r) => r.fromFile).length,
         },
       };
     }
@@ -2083,11 +2125,13 @@ function performImport(rows, user, action, lines = null) {
   }
 
   const blankFields = FIELDS.filter((f) => !filledCount[f.key]).map((f) => f.label);
-  logAudit(user, 'import', 'data', null, `Excel 导入数据：新增 ${inserted}、覆盖 ${overwritten}、失败 ${errors.length}`);
+  logAudit(user, 'import', 'data', null,
+    `Excel 导入数据：新增 ${inserted}、覆盖 ${overwritten}、跳过 ${skipped}、失败 ${errors.length}`);
   return {
     result: {
       inserted,
       overwritten,
+      skipped,
       failed: errors.length,
       errors: errors.slice(0, 20),
       warnings: warnings.slice(0, 20),

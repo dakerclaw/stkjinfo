@@ -198,10 +198,11 @@ db.exec('CREATE INDEX IF NOT EXISTS idx_data_delete_batch ON project_data(delete
 // 日期筛选 / 归属 + 日期组合（去掉 IFNULL 包裹后可以真正命中索引）
 db.exec('CREATE INDEX IF NOT EXISTS idx_data_entry_date ON project_data(entry_date) WHERE deleted_at IS NULL');
 db.exec('CREATE INDEX IF NOT EXISTS idx_data_owner_date ON project_data(created_by_id, entry_date) WHERE deleted_at IS NULL');
-// 导入查重五元组：普通复合索引会被 IFNULL(base,'') 阻断，必须用同样的表达式建索引
+// 导入查重七元组：普通复合索引会被 IFNULL(base,'') 阻断，必须用同样的表达式建索引
 db.exec(
-  `CREATE INDEX IF NOT EXISTS idx_data_key5
-   ON project_data(project_no, product_code, IFNULL(base,''), IFNULL(process_code,''), IFNULL(work_order,''))
+  `CREATE INDEX IF NOT EXISTS idx_data_key7
+   ON project_data(project_no, product_code, IFNULL(base,''), IFNULL(process_code,''), IFNULL(work_order,''),
+                   IFNULL(coke_type,''), IFNULL(location,''))
    WHERE deleted_at IS NULL`
 );
 

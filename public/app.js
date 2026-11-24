@@ -1125,9 +1125,9 @@ function openDataModal(id, opts = {}) {
         loadData();
       } catch (e) {
         if (e.status === 409 && e.code === 'DUPLICATE_KEY') {
-          // 复制场景：五项与被复制的那条完全相同，不提供「覆盖」，避免误改原记录
-          if (copyFrom) return toast('与原有记录五项完全相同，请先修改工单号或录入日期再保存', 'err');
-          // 五项全部相同 → 询问覆盖还是追加
+          // 复制场景：七项与被复制的那条完全相同，不提供「覆盖」，避免误改原记录
+          if (copyFrom) return toast('与原有记录七项完全相同，请先修改工单号、焦种或位置再保存', 'err');
+          // 七项全部相同 → 询问是否仍然新增
           const info = e.payload.duplicate || {};
           askDuplicateAction({
             title: '系统已有相同数据',
@@ -1164,27 +1164,23 @@ function askDuplicateAction({ title, key, count, extra, rowsHtml, onChoice }) {
       <div class="dup-box">
         <div class="dup-icon">!</div>
         <div class="dup-text">
-          <p class="dup-lead">项目编号 + 产品代码 + 所属公司 + 工序 + 工单号 五项完全相同，系统中已存在 ${count || 1} 条此类数据。</p>
+          <p class="dup-lead">这条记录的项目编号、产品代码、所属公司、工序、工单号、焦种、位置七项，与系统中已有数据完全相同（已存在 ${count || 1} 条）。</p>
           ${key ? `<p class="dup-key">${esc(key)}</p>` : ''}
           ${extra ? `<p class="dup-extra">${esc(extra)}</p>` : ''}
           ${rowsHtml || ''}
         </div>
       </div>
       <p class="dup-hint">
-        <b>覆盖导入</b>：用本次填写的数据更新已有记录（保留原录入人与记录编号）<br />
-        <b>追加导入</b>：作为一条新记录保存，已有记录不变
+        <b>仍然新增</b>：把它作为一条新记录再存一份（内容重复）
       </p>`,
     footer: `<button class="btn" onclick="closeModal()">取消</button>
-      <button class="btn" id="dupAppend">追加导入</button>
-      <button class="btn btn-primary" id="dupOverwrite">覆盖导入</button>`,
+      <button class="btn btn-primary" id="dupAppend">仍然新增</button>`,
   });
 
-  const pick = (choice) => {
+  el('#dupAppend').addEventListener('click', () => {
     closeModal();
-    onChoice(choice);
-  };
-  el('#dupOverwrite').addEventListener('click', () => pick('overwrite'));
-  el('#dupAppend').addEventListener('click', () => pick('append'));
+    onChoice('append');
+  });
 }
 
 function bulkDelete() {
@@ -1334,12 +1330,12 @@ function openExcelImport(cfg) {
 function openImportDuplicate(cfg, info, onChoice) {
   openModal({
     title: cfg.dupTitle(info),
-    narrow: true,
     body: `
       <div class="dup-box">
         <div class="dup-icon">!</div>
         <div class="dup-text">
-          <p class="dup-lead">${esc(cfg.dupLead(info))}</p>
+          <p class="dup-lead">${esc(cfg.dupLead(info))}
+            <span style="color:var(--text-3)">判重七项：项目编号、产品代码、所属公司、工序、工单号、焦种、位置。</span></p>
           ${cfg.dupRows(info)}
         </div>
       </div>
@@ -1441,21 +1437,38 @@ function openImport() {
     ]) + importWarnings(info, `<div><b style="color:var(--text)">将留空的指标（${info.blankLabels.length} 项）：</b>
         <span style="color:var(--text-3)">${info.blankLabels.map(esc).join('、') || '无'}</span></div>`),
     dupTitle: (info) => `有 ${info.count || 0} 行数据重复`,
-    dupLead: (info) => `${info.count || 0} 行的「项目编号 + 产品代码 + 所属公司 + 工序 + 工单号」与系统已有记录完全相同（本次共 ${info.total || info.count || 0} 行待导入）。`,
-    dupRows: (info) => importDupRows(info.rows, [
-      { key: 'line', label: 'Excel 行号' }, { key: 'project_no', label: '项目编号' },
-      { key: 'base', label: '所属公司' }, { key: 'process_code', label: '工序' },
-      { key: 'work_order', label: '工单号' },
-    ], info.count),
-    dupHint: `<b>覆盖导入</b>：用本次文件的数据更新已有记录（保留原录入人与记录编号）<br />
-      <b>追加导入</b>：作为新记录保存，已有记录不变`,
+    dupLead: (info) => {
+      const total = info.total || info.count || 0;
+      const parts = [];
+      if (info.inDb) parts.push(`${info.inDb} 行与系统已有记录的七项完全相同`);
+      if (info.inFile) parts.push(`${info.inFile} 行与本文件内更早的行七项完全相同`);
+      return `本次共 ${total} 行待导入：${parts.join('；') || '七项完全相同'}。`;
+    },
+    dupRows: (info) => importDupRows(
+      (info.rows || []).map((r) => ({
+        ...r,
+        sourceLabel: r.fromFile ? '本文件内' : '系统已有',
+        cokeShow: r.coke_type || '—',
+        locShow: r.location || '—',
+      })),
+      [
+        { key: 'line', label: '行号' }, { key: 'project_no', label: '项目编号' },
+        { key: 'process_code', label: '工序' }, { key: 'work_order', label: '工单号' },
+        { key: 'cokeShow', label: '焦种' }, { key: 'locShow', label: '位置' },
+        { key: 'sourceLabel', label: '来源' },
+      ],
+      info.count,
+    ),
+    dupHint: `<b>跳过重复行</b>：只导入新增数据，重复行不写入（推荐）<br />
+      <b>仍然追加</b>：把重复行也作为新记录再存一份`,
     dupChoices: [
-      { value: 'append', label: '追加导入' },
-      { value: 'overwrite', label: '覆盖导入', primary: true },
+      { value: 'skip', label: '跳过重复行', primary: true },
+      { value: 'append', label: '仍然追加' },
     ],
     summarize: (r) => {
       const parts = [`新增 ${r.inserted} 条`];
       if (r.overwritten) parts.push(`覆盖 ${r.overwritten} 条`);
+      if (r.skipped) parts.push(`跳过 ${r.skipped} 条`);
       if (r.failed) parts.push(`失败 ${r.failed} 条`);
       return `导入完成：${parts.join('、')}`;
     },
@@ -1471,7 +1484,7 @@ function openImport() {
       }
       if (lines.length) {
         setTimeout(() => alert(
-          `导入完成：成功 ${r.inserted} 条${r.overwritten ? `，覆盖 ${r.overwritten} 条` : ''}${r.failed ? `，失败 ${r.failed} 条` : ''}\n\n` +
+          `导入完成：成功 ${r.inserted} 条${r.overwritten ? `，覆盖 ${r.overwritten} 条` : ''}${r.skipped ? `，跳过 ${r.skipped} 条` : ''}${r.failed ? `，失败 ${r.failed} 条` : ''}\n\n` +
           lines.join('\n\n')
         ), 300);
       }
